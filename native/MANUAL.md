@@ -194,29 +194,53 @@ keyboard that has them do the same as the keys above.
 ## 6. Television (DVB-T2)
 
 Open it with **Super+T** or the screen icon on the panel. An antenna must be connected to the box.
+The TV window opens:
+- **left:** the channels, with what's on now and a bar showing how far into it they are;
+- **right:** the programme guide of the selected channel, by day. **NOW** marks what's on.
 
-**The first time**, choose **⟳ Scan channels** at the end of the list. The scan checks 40
-frequencies, about 3 minutes in all. The panel shows the progress, for example "Scan 12/40: 570 MHz…
-(found 6)". When it finishes, the panel shows "Scan finished: N channels", and the channel list
-opens again. "Nothing found" means no signal on any frequency: check the antenna and its cable.
-Scan again if you move the antenna or channels change.
+**The first time**, click **Scan channels** at the top right. The scan checks 40 frequencies,
+about 3 minutes in all. The top of the window and the panel show the progress, for example
+"Scan 12/40: 570 MHz… (found 6)". "Nothing found" means no signal on any frequency: check the
+antenna and its cable. Scan again if you move the antenna or channels change.
+
+**The programme guide** comes from the broadcast itself. It fills in by itself while you watch
+and while the scan runs. **Update guide** visits every multiplex for about 25 s each, a minute or
+so in all, to fill in the rest. Some channels broadcast no guide at all ("no programme
+information").
+
+| Keys in the TV window | Action |
+|---|---|
+| **↑ / ↓** | choose a channel |
+| **Enter** or a click | watch it |
+| **→** | into the guide (↑ / ↓ there shows each programme's full description) |
+| **←** | back to the channels |
+| **Esc** | close the window |
+
+**Watching.** At the top: the channel, what's on now (with its times) and what's next. When you
+stop watching, the TV window comes back.
+
+| Keys in the player | Action |
+|---|---|
+| **Enter** | the channel list on the left, with what's on every channel |
+| **↑ / ↓**, **PgUp / PgDn** (in the list) | choose |
+| **Enter** or **→** (in the list), or a click | switch to it |
+| **Esc** or **←** (in the list) | close the list |
+| **→** or **PgUp** | next channel |
+| **←** or **PgDn** | previous channel |
+| **↑ / ↓**, **M** | volume, mute |
+| **Space** | pause the picture |
+| **Q** / **Esc** | stop watching |
+
+Clicking **Enter: channels** in the bottom bar also opens the list. It closes by itself after 15 s
+without a key.
 
 Only one TV window can run at a time. If you open TV again during a scan, the panel says "TV is
 busy: a channel scan is running".
 
-**Watching:** choose a channel in the list (type part of the name to filter it) and press Enter.
+A channel gets a 🔒 if it turns out to be encrypted when you try to watch it. "No signal" on the
+panel means that frequency isn't received, so check the antenna.
 
-| Keys | Action |
-|---|---|
-| **→** or **PgUp** | next channel |
-| **←** or **PgDn** | previous channel |
-| **↑ / ↓**, **M** | volume, mute |
-| **Q** / **Esc** | stop watching |
-
-Channels marked 🔒 are encrypted and won't play. "No signal" on the panel means that frequency
-isn't received, so check the antenna.
-
-What isn't available: programme guide (EPG), teletext and subtitles, recording, radio.
+What isn't available: teletext and subtitles, recording, radio.
 
 ## 7. The browser
 
@@ -326,12 +350,20 @@ Sound comes out of the TV over HDMI.
 ### Player
 | Keys | Action |
 |---|---|
-| Space / Enter / P | pause |
+| Space / Enter / P | pause (TV: Enter opens the channel list) |
 | ← / → | −10 s / +10 s (TV: previous / next channel) |
 | PgDn / PgUp | −1 min / +1 min (TV: previous / next channel) |
 | ↑ / ↓ | volume |
 | M | mute |
 | Q / Esc / Backspace | quit |
+
+### TV window
+| Keys | Action |
+|---|---|
+| ↑ / ↓ | choose a channel |
+| Enter | watch |
+| → / ← | into the guide / back to the channels |
+| Esc | close |
 
 ### Browser
 | Keys | Action |

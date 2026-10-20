@@ -14,13 +14,16 @@
  * grabbed).
  *
  *   amplay [--audio URL] [--start SECONDS] [--title TEXT] URL     URL: a file or anything FFmpeg opens
- *   amplay --live [--program N] [--title TEXT] URL       broadcast TS, e.g. pipe:0 from ozone-tv
+ *   amplay --live [--program N] [--title TEXT] [--channels FILE --channel N] URL
+ *                                                  broadcast TS, e.g. pipe:0 from ozone-tv
  *   amplay --reset                                 put the desktop back after a crash
  *
  * Keys: Space/P pause, Left/Right -/+10 s, PgDn/PgUp -/+60 s, Up/Down volume, M mute, Q/Esc quit.
  * Mouse (under X): click the progress bar to seek, the picture to pause, the wheel for volume.
  * Live: Left/Right and PgDn/PgUp (and the remote's channel keys) ask for the previous/next channel:
- * amplay exits with status 11/10 and the caller retunes.
+ * amplay exits with status 11/10 and the caller retunes. With --channels FILE (lines of
+ * "number<TAB>name<TAB>now on") Enter opens a channel list on the left; choosing one prints
+ * "channel N" (N its line, from 0) to stdout and exits with status 12.
  * Exit status 3 means the video codec has no hardware decoder (the caller can fall back to mpv).
  */
 #define _GNU_SOURCE
@@ -238,6 +241,8 @@ static struct {
     double last_pos;
     const char *title;
     int live, program;        /* --live, --program (-1: any) */
+    const char *channels;     /* --channels: the list for the OSD, and --channel, the one playing */
+    int channel;
     int exit_status;
     int x11;                  /* controls drawn under X, or evdev without */
 
@@ -934,6 +939,12 @@ static void do_action(const struct osd_event *e)
     case OSD_VOLUME: volume_change((int)e->value); break;
     case OSD_MUTE: mute_toggle(); break;
     case OSD_QUIT: P.quit = 1; break;
+    case OSD_CHANNEL:   /* the caller retunes */
+        printf("channel %d\n", (int)e->value);
+        fflush(stdout);
+        P.exit_status = 12;
+        P.quit = 1;
+        break;
     }
 }
 
@@ -1024,10 +1035,30 @@ static void on_signal(int sig)
     P.quit = 1;
 }
 
+/* --channels: for the OSD's list */
+static void load_channels(const char *path, int current)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        logmsg("%s: %s", path, strerror(errno));
+        return;
+    }
+    char *lines[512], buf[512];
+    int n = 0;
+    while (n < 512 && fgets(buf, sizeof buf, f)) {
+        buf[strcspn(buf, "\n")] = 0;
+        lines[n++] = strdup(buf);
+    }
+    fclose(f);
+    osd_set_channels(lines, n, current);
+    while (n)
+        free(lines[--n]);
+}
+
 static void usage(void)
 {
     fputs("usage: amplay [-v] [--audio URL] [--start SECONDS] [--title TEXT] URL\n"
-          "       amplay --live [--program N] [--title TEXT] URL\n"
+          "       amplay --live [--program N] [--title TEXT] [--channels FILE --channel N] URL\n"
           "       amplay --reset\n", stderr);
     exit(2);
 }
@@ -1042,13 +1073,15 @@ int main(int argc, char **argv)
         { "live", no_argument, NULL, 'l' },
         { "program", required_argument, NULL, 'p' },
         { "verbose", no_argument, NULL, 'v' },
+        { "channels", required_argument, NULL, 'C' },
+        { "channel", required_argument, NULL, 'N' },
         { 0 }
     };
     const char *audio_url = NULL;
     double start = 0;
     int c;
     P.program = -1;
-    while ((c = getopt_long(argc, argv, "a:s:rt:vlp:", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "a:s:rt:vlp:C:N:", opts, NULL)) != -1) {
         switch (c) {
         case 'a': audio_url = optarg; break;
         case 's': start = atof(optarg); break;
@@ -1057,6 +1090,8 @@ int main(int argc, char **argv)
         case 'l': P.live = 1; break;
         case 'p': P.program = atoi(optarg); break;
         case 'v': P.verbose = 1; break;
+        case 'C': P.channels = optarg; break;
+        case 'N': P.channel = atoi(optarg); break;
         default: usage();
         }
     }
@@ -1154,6 +1189,8 @@ int main(int argc, char **argv)
         return 1;
     }
     P.x11 = getenv("DISPLAY") && osd_open() == 0;
+    if (P.x11 && P.live && P.channels)
+        load_channels(P.channels, P.channel);
     if (!P.x11)
         kbd_open();
     else

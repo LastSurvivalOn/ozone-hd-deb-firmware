@@ -102,7 +102,17 @@ reused as they are:
   NIT), then for watching sets TS-tap PES filters on the service's PIDs and pipes `dvr0` into
   `amplay --live --program <sid>`.
 
-Not done: EPG, teletext/subtitles, recording, radio services, scrambled channels (shown with a lock).
+The TV window (`ozone-tv`, GTK) has the channels with what's on, and the selected channel's guide. The guide is the
+broadcast EIT, read by one section filter on PID 0x12 (tables 0x4e-0x6f) whenever something is tuned:
+Zeonbud's multiplexes carry now/next and a week of schedule for their own services and for the
+others', so watching or scanning fills in most of it. `ozone-tv guide` spends 25 s on each
+multiplex for the rest. It is kept in `~/.local/share/ozone-tv/epg.json`, and the TDT (PID 0x14)
+corrects the clock if the box's is off. In the player, Enter opens amplay's channel list on the left (`--channels`:
+number, name, now on); choosing one prints `channel N` and exits with status 12, and ozone-tv retunes. Channels are
+numbered by their place in the list, as the stock app does: the NIT gives the same LCNs to services of different
+multiplexes.
+
+Not done: teletext/subtitles, recording, radio services, descrambling (channels found encrypted get a lock).
 
 Logs, for debugging without a network: every `ozone-tv` run writes `/mnt/nand/linux/logs/tv-<time>-<command>/tv.log`
 (what it did, the frontend's replies, the libraries' Android log, the kernel log, amplay, the signal

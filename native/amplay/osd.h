@@ -10,11 +10,11 @@ struct osd_state {
     const char *title;
 };
 
-enum osd_action { OSD_PAUSE, OSD_SEEK_REL, OSD_SEEK_ABS, OSD_VOLUME, OSD_MUTE, OSD_QUIT };
+enum osd_action { OSD_PAUSE, OSD_SEEK_REL, OSD_SEEK_ABS, OSD_VOLUME, OSD_MUTE, OSD_QUIT, OSD_CHANNEL };
 
 struct osd_event {
     enum osd_action action;
-    double value;             /* seconds for seeks, percent for volume */
+    double value;             /* seconds for seeks, percent for volume, the list index for a channel */
 };
 
 /* Opens a full-screen window filled with the transparent color; 0 on success */
@@ -24,6 +24,9 @@ int osd_fd(void);
 unsigned osd_key565(void);
 /* Turns pending X input into actions, returns how many were stored */
 int osd_poll(struct osd_event *ev, int max);
+/* Live TV: the channel list of the side panel (Enter opens it), one "number\tname\tnow on" per
+   line, and the one playing; choosing another one gives OSD_CHANNEL */
+void osd_set_channels(char **lines, int n, int current);
 /* Redraws the bars when what they show changed; hides them when idle */
 void osd_update(const struct osd_state *s);
 void osd_close(void);
