@@ -1,0 +1,31 @@
+#!/bin/sh
+# Minimal init replacement for Debian in the chroot: systemd doesn't work on kernel 3.10 without cgroups,
+# so run the sysv scripts enabled in /etc/rc2.d (insserv sets the order).
+# Enable a service: update-rc.d <name> enable; disable: update-rc.d <name> disable
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export RUNLEVEL=2 PREVLEVEL=N
+
+# Services listed in /etc/ozone/native-only are needed only in pure Linux (time, hardware, etc.)
+wanted() {
+    [ -x "$1" ] || return 1
+    name=$(basename "$1" | sed 's/^S[0-9]*//')
+    ! grep -qx "$name" /etc/ozone/native-only 2>/dev/null
+}
+
+case "$1" in
+start)
+    for s in /etc/rc2.d/S*; do
+        wanted "$s" && "$s" start
+    done
+    ;;
+stop)
+    for s in $(ls -r /etc/rc2.d/S* 2>/dev/null); do
+        wanted "$s" && "$s" stop
+    done
+    ;;
+*)
+    echo "usage: $0 start|stop"
+    exit 1
+    ;;
+esac

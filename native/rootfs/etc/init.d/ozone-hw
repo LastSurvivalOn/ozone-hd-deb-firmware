@@ -1,0 +1,56 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          ozone-hw
+# Required-Start:    kmod
+# Required-Stop:
+# Default-Start:     S
+# Default-Stop:
+# Short-Description: Box hardware: CPU, temperature, display
+# Description:       Does what init.amlogic*.rc and set_display_mode.sh do in Android.
+### END INIT INFO
+
+# Under Android (chroot mode), Android manages the hardware
+/etc/ozone/is-native || exit 0
+
+CPU=/sys/devices/system/cpu/cpu0/cpufreq
+FB=/sys/class/graphics
+
+case "$1" in
+start)
+    # Same limits as the stock firmware; hotplug turns off spare cores when idle
+    echo 1536000 > $CPU/scaling_max_freq
+    echo 96000 > $CPU/scaling_min_freq
+    echo hotplug > $CPU/scaling_governor
+
+    # 1280x720 desktop, the hardware scaler stretches it to 1080p. It must be 16 bit (RGB565): all 32-bit
+    # Amlogic OSD formats have alpha and X writes zeros there, so the layer turns transparent (black screen);
+    # modern Xorg no longer supports 24 bit
+    fbset -fb /dev/fb0 -g 1280 720 1280 1440 16 -rgba 5/11,6/5,5/0,0/0
+    echo 0 0 1279 719 > $FB/fb0/free_scale_axis
+    echo 0 0 1919 1079 > $FB/fb0/window_axis
+    echo 0x10001 > $FB/fb0/free_scale
+    dd if=/dev/zero of=/dev/fb0 bs=1M count=8 2>/dev/null
+    echo 1 > $FB/fb1/blank
+    echo 0 > $FB/fb0/blank
+
+    # Without udev the kernel creates device nodes for root only; set permissions as in regular Debian
+    chgrp -R audio /dev/snd && chmod -R g+rw /dev/snd
+    chgrp video /dev/fb0 /dev/fb1 && chmod g+rw /dev/fb0 /dev/fb1
+    chgrp input /dev/input/* && chmod g+rw /dev/input/*
+
+    # softvol creates the "Master" control only on first open; polybar expects it right away.
+    # aplay opens the device safely (see /etc/asound.conf and mpv.conf)
+    timeout 3 aplay -q -D default -f S16_LE -r 48000 -c 2 -d 1 /dev/zero
+    amixer -q sset Master 70%
+
+    # Hardware video path: decoder -> post-processing -> video layer
+    echo "rm default" > /sys/class/vfm/map
+    echo "add default decoder ppmgr deinterlace amvideo" > /sys/class/vfm/map
+    ;;
+stop|restart|force-reload|status)
+    ;;
+*)
+    echo "usage: $0 start" >&2
+    exit 3
+    ;;
+esac

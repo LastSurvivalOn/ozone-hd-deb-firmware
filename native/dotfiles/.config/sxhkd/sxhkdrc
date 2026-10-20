@@ -1,0 +1,37 @@
+# Apps
+super + Return
+    urxvt
+super + d
+    rofi -show drun
+super + y
+    yt
+super + shift + e
+    ozone-power
+super + Escape
+    pkill -USR1 -x sxhkd
+
+# Windows
+super + q
+    bspc node -c
+super + f
+    bspc node -t ~fullscreen
+super + s
+    bspc node -t ~floating
+super + m
+    bspc desktop -l next
+super + {h,j,k,l}
+    bspc node -f {west,south,north,east}
+super + shift + {h,j,k,l}
+    bspc node -s {west,south,north,east}
+
+# Workspaces
+super + {_,shift + }{1-5}
+    bspc {desktop -f,node -d} '^{1-5}'
+super + Tab
+    bspc desktop -f last
+
+# Volume
+XF86Audio{Raise,Lower}Volume
+    amixer -q set Master 5%{+,-}
+XF86AudioMute
+    amixer -q set Master toggle

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Graphical session. Started from /etc/inittab (respawn), so X comes back up if it crashes.
+# The user is the first regular one (uid 1000).
+
+USER_NAME=$(getent passwd 1000 | cut -d: -f1)
+LOG=/var/log/ozone-desktop.log
+
+/usr/local/lib/ozone/gen-xorg-input
+exec su -l "$USER_NAME" -c 'exec startx -- :0 vt7 -nolisten tcp -keeptty' > $LOG 2>&1

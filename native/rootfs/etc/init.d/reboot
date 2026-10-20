@@ -1,0 +1,23 @@
+#! /bin/sh
+### BEGIN INIT INFO
+# Provides:          reboot
+# Required-Start:
+# Required-Stop:
+# Default-Start:
+# Default-Stop:      6
+# Short-Description: Execute the reboot command.
+# Description:       ozone wrapper around the stock script (dpkg-divert -> /usr/local/lib/ozone/reboot.distrib):
+#                    if reboot-android left /run/ozone-reboot-arg, restarts the kernel
+#                    via reboot(RESTART2, arg), the way Android does "reboot recovery".
+### END INIT INFO
+
+ARG_FILE=/run/ozone-reboot-arg
+
+if [ "$1" = stop ] && [ -s $ARG_FILE ]; then
+    arg=$(cat $ARG_FILE)
+    echo "Rebooting with argument: $arg"
+    # ARM EABI: sync = 36, reboot = 88; LINUX_REBOOT_CMD_RESTART2 = 0xA1B2C3D4
+    perl -e 'syscall(36); syscall(88, 0xfee1dead, 672274793, 0xA1B2C3D4, $ARGV[0]); warn "reboot: $!\n"' "$arg"
+fi
+
+exec /usr/local/lib/ozone/reboot.distrib "$@"

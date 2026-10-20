@@ -1,0 +1,19 @@
+# Partition dumps of the box (1+ GB, device-specific)
+ozone_backup/
+*.img
+
+# Downloaded artifacts (Debian rootfs, SmartTube apk, static busybox, toolchains)
+cache/
+
+# Build output
+native/out/
+out/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors
+.vscode/
+*.swp
+*~

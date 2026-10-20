@@ -1,0 +1,58 @@
+#!/bin/busybox sh
+# Pure Linux initramfs: brings up NAND, mounts /data/linux/debian.img as root and hands control
+# to Debian's /sbin/init. If something goes wrong: log in /data/linux/native-boot.log, telnet on eth0
+# for 5 minutes for diagnostics, then reboot (a normal reboot = Android).
+
+/bin/busybox --install -s /bin
+export PATH=/bin
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /tmp /nand /newroot
+# Kernel panic -> reboot instead of hanging forever
+echo 10 > /proc/sys/kernel/panic
+
+LOG=/tmp/boot.log
+log() { echo "[$(cut -d' ' -f1 /proc/uptime)] $*" >> $LOG; }
+
+save_log() {
+    for d in /newroot/mnt/nand/linux /nand/linux; do
+        [ -d $d ] && cp $LOG $d/native-boot.log && sync && return
+    done
+}
+
+fail() {
+    log "ERROR: $*"
+    save_log
+    ip link set eth0 up
+    udhcpc -i eth0 -q -t 10 -s /bin/udhcpc.script >> $LOG 2>&1
+    telnetd -l /bin/sh
+    log "telnet open, rebooting in 5 min"
+    save_log
+    sleep 300
+    reboot -f
+}
+
+log "initramfs started, kernel $(uname -r)"
+
+insmod /lib/modules/aml_nftl_dev.ko || fail "NAND driver failed to load"
+for i in $(seq 50); do
+    [ -b /dev/data ] && break
+    sleep 0.2
+done
+[ -b /dev/data ] || fail "no /dev/data"
+
+mount -t ext4 -o noatime /dev/data /nand || fail "data partition failed to mount"
+[ -f /nand/linux/debian.img ] || fail "no /data/linux/debian.img"
+losetup /dev/loop0 /nand/linux/debian.img || fail "losetup"
+mount -t ext4 -o noatime /dev/loop0 /newroot || fail "debian.img failed to mount"
+[ -x /newroot/usr/sbin/init ] || fail "Debian has no /sbin/init (sysvinit-core)"
+
+mkdir -p /newroot/mnt/nand
+mount --move /nand /newroot/mnt/nand
+log "handing control to Debian"
+save_log
+mount --move /dev /newroot/dev
+umount /sys /proc
+exec switch_root /newroot /sbin/init

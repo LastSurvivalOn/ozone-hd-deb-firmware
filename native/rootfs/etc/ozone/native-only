@@ -1,0 +1,4 @@
+# Services that /etc/ozone/rc does not start in chroot mode under Android
+# (Android handles them there). One init script name per line.
+chrony
+ozone-input

@@ -1,0 +1,27 @@
+#!/bin/sh
+# YouTube without a browser: search via rofi, playback via mpv (software decoding, up to 480p).
+# yt            — prompt for a search query or a link
+# yt <query>    — search right away
+
+q=${*:-$(rofi -dmenu -p "  YouTube" -theme-str 'listview { lines: 0; }' < /dev/null)}
+[ -n "$q" ] || exit 0
+
+case "$q" in
+http://*|https://*)
+    url=$q
+    ;;
+*)
+    ozone-notify "Searching: $q"
+    list=$(yt-dlp --flat-playlist --no-warnings \
+        --print "%(title)s	%(channel)s · %(duration_string)s	%(id)s" "ytsearch20:$q") ||
+        { ozone-notify "Search failed"; exit 1; }
+    id=$(printf '%s\n' "$list" |
+        rofi -dmenu -i -p "  $q" -display-columns 1,2 -display-column-separator '	' |
+        cut -f3)
+    [ -n "$id" ] || exit 0
+    url="https://www.youtube.com/watch?v=$id"
+    ;;
+esac
+
+ozone-notify "Loading video…"
+exec mpv --force-window=immediate "$url"

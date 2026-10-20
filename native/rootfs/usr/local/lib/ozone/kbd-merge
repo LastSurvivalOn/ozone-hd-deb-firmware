@@ -1,0 +1,88 @@
+#!/usr/bin/python3
+"""Merges all keyboards (USB, IR remote, the TV's HDMI-CEC remote) into one virtual "ozone-kbd".
+
+udev doesn't work on kernel 3.10, so X doesn't see keyboards plugged in after it starts.
+X reads only the virtual keyboard, and this script picks up new devices every second
+and forwards their key presses. Mice are not included: the kernel merges them into /dev/input/mice.
+"""
+import fcntl
+import os
+import selectors
+import struct
+
+from evdev import InputDevice, ecodes, list_devices
+
+NAME = 'ozone-kbd'
+# Keys are codes below 0x100; mouse buttons (BTN_*) are left to mice, otherwise X would treat us as a mouse
+KEYS = [c for c in range(1, ecodes.KEY_MAX) if c < 0x100 or c >= 0x160]
+
+
+class LegacyUInput:
+    """Virtual device via the legacy uinput interface (writing uinput_user_dev).
+    evdev.UInput uses the UI_DEV_SETUP ioctl, which kernel 3.10 doesn't have yet."""
+    UI_DEV_CREATE = 0x5501
+    UI_SET_EVBIT = 0x40045564
+    UI_SET_KEYBIT = 0x40045565
+    BUS_VIRTUAL = 0x06
+
+    def __init__(self, name, keys):
+        self.fd = os.open('/dev/uinput', os.O_WRONLY | os.O_NONBLOCK)
+        fcntl.ioctl(self.fd, self.UI_SET_EVBIT, ecodes.EV_KEY)
+        for k in keys:
+            fcntl.ioctl(self.fd, self.UI_SET_KEYBIT, k)
+        # name[80], input_id{bustype, vendor, product, version}, ff_effects_max, abs*[64] x4
+        os.write(self.fd, struct.pack('80sHHHHi256i', name.encode(), self.BUS_VIRTUAL,
+                                      0x1, 0x1, 1, 0, *([0] * 256)))
+        fcntl.ioctl(self.fd, self.UI_DEV_CREATE)
+
+    def write(self, etype, code, value):
+        # struct input_event: timeval (the kernel sets the time), type, code, value
+        os.write(self.fd, struct.pack('llHHi', 0, 0, etype, code, value))
+
+    def syn(self):
+        self.write(ecodes.EV_SYN, ecodes.SYN_REPORT, 0)
+
+
+ui = LegacyUInput(NAME, KEYS)
+sel = selectors.DefaultSelector()
+devices = {}
+
+
+def is_keyboard(dev):
+    keys = dev.capabilities().get(ecodes.EV_KEY, [])
+    return dev.name != NAME and any(c < 0x100 for c in keys)
+
+
+def scan():
+    for path in list_devices():
+        if path in devices:
+            continue
+        try:
+            dev = InputDevice(path)
+        except OSError:
+            continue
+        if is_keyboard(dev):
+            devices[path] = dev
+            sel.register(dev, selectors.EVENT_READ)
+        else:
+            dev.close()
+
+
+def drop(dev):
+    sel.unregister(dev)
+    devices.pop(dev.path, None)
+    dev.close()
+
+
+while True:
+    scan()
+    for key, _ in sel.select(timeout=1.0):
+        dev = key.fileobj
+        try:
+            for ev in dev.read():
+                if ev.type == ecodes.EV_KEY and (ev.code < 0x100 or ev.code >= 0x160):
+                    ui.write(ev.type, ev.code, ev.value)
+            ui.syn()
+        except OSError:
+            # device was unplugged
+            drop(dev)

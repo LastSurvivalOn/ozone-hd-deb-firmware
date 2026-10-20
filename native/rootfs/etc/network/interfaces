@@ -1,0 +1,6 @@
+# Used only in pure Linux; under Android, Android manages the network.
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp

@@ -1,0 +1,16 @@
+#!/bin/sh
+# Power menu for the panel and sxhkd
+
+choice=$(printf '%s\n' \
+    "  Android (T2, SmartTube)" \
+    "  Restart desktop" \
+    "  Reboot" \
+    "  Power off" |
+    rofi -dmenu -i -p "  Power" -theme-str 'listview { lines: 4; }')
+
+case "$choice" in
+*Android*)          reboot-android ;;
+*desktop*)          bspc quit ;;
+*Reboot*)           sudo reboot ;;
+*"Power off"*)      sudo poweroff ;;
+esac

@@ -1,0 +1,4 @@
+# Root is /data/linux/debian.img on NAND; the initramfs mounts it, and the data partition is visible as /mnt/nand.
+# Under Android (chroot mode) this file is not used.
+/dev/loop0  /     ext4   noatime                      0  0
+tmpfs       /tmp  tmpfs  nosuid,nodev,size=128m       0  0

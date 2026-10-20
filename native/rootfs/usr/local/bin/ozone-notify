@@ -1,0 +1,4 @@
+#!/bin/sh
+# Short message in the polybar panel (status module); disappears after 6 seconds
+polybar-msg action "#status.send.$*" > /dev/null 2>&1
+( sleep 6; polybar-msg action "#status.send." > /dev/null 2>&1 ) &

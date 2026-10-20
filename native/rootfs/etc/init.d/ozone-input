@@ -1,0 +1,41 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          ozone-input
+# Required-Start:    $local_fs
+# Required-Stop:     $local_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Virtual keyboard for X (hotplug without udev)
+### END INIT INFO
+
+# Under Android, Android handles input
+/etc/ozone/is-native || exit 0
+
+DAEMON=/usr/local/lib/ozone/kbd-merge
+PIDFILE=/run/ozone-input.pid
+
+case "$1" in
+start)
+    start-stop-daemon --start --quiet --background --make-pidfile --pidfile $PIDFILE \
+        --exec /usr/bin/python3 -- $DAEMON
+    # X generates its input config right after runlevel 2, so give the virtual keyboard time to appear
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        grep -q 'Name="ozone-kbd"' /proc/bus/input/devices && break
+        sleep 0.5
+    done
+    ;;
+stop)
+    start-stop-daemon --stop --quiet --pidfile $PIDFILE --remove-pidfile
+    ;;
+restart|force-reload)
+    $0 stop
+    $0 start
+    ;;
+status)
+    start-stop-daemon --status --pidfile $PIDFILE
+    ;;
+*)
+    echo "usage: $0 start|stop|restart|status" >&2
+    exit 3
+    ;;
+esac

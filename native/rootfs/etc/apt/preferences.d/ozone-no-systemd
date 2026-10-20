@@ -1,0 +1,7 @@
+# systemd does not start on kernel 3.10 without cgroups, and systemd-sysv replaces sysvinit as /sbin/init,
+# so after such an upgrade the box loops on kernel panic. Dependency chains like
+# dbus-user-session -> libpam-systemd -> systemd-sysv pull it in silently, so ban it explicitly.
+# The D-Bus session bus comes from dbus-x11.
+Package: systemd-sysv libpam-systemd dbus-user-session
+Pin: release *
+Pin-Priority: -1

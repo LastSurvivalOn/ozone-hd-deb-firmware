@@ -1,0 +1,46 @@
+configuration {
+    modi: "drun,run";
+    show-icons: false;
+    drun-display-format: "{name}";
+    display-drun: "  Apps";
+    display-run: "  Command";
+    font: "JetBrains Mono Bold 11";
+}
+
+* {
+    base:     #1e1e2e;
+    mantle:   #181825;
+    surface0: #313244;
+    text:     #cdd6f4;
+    subtext:  #a6adc8;
+    mauve:    #cba6f7;
+
+    background-color: transparent;
+    text-color: @text;
+}
+
+window {
+    width: 640px;
+    background-color: @base;
+    border: 3px;
+    border-color: @mauve;
+    padding: 18px;
+}
+
+mainbox { spacing: 12px; }
+
+inputbar {
+    background-color: @surface0;
+    padding: 10px 14px;
+    spacing: 10px;
+    children: [ prompt, entry ];
+}
+
+prompt { text-color: @mauve; }
+entry { placeholder: "search…"; placeholder-color: @subtext; }
+
+listview { lines: 10; spacing: 4px; fixed-height: false; }
+
+element { padding: 8px 14px; }
+element selected { background-color: @mauve; text-color: @base; }
+element-text { text-color: inherit; }

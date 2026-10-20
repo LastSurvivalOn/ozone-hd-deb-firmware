@@ -1,0 +1,7 @@
+#!/bin/sh
+# Cleanly shuts down Linux and reboots into Android (which lives in the recovery partition).
+# The actual restart with the "recovery" argument is done by /etc/init.d/reboot at the end of runlevel 6.
+/etc/ozone/is-native || { echo "this is already Android (Debian in a chroot)"; exit 1; }
+[ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+echo recovery > /run/ozone-reboot-arg
+exec /sbin/reboot
