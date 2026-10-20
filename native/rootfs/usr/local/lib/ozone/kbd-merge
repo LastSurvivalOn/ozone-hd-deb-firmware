@@ -9,6 +9,9 @@ import fcntl
 import os
 import selectors
 import struct
+import sys
+import time
+import traceback
 
 from evdev import InputDevice, ecodes, list_devices
 
@@ -46,6 +49,9 @@ class LegacyUInput:
 ui = LegacyUInput(NAME, KEYS)
 sel = selectors.DefaultSelector()
 devices = {}
+# Devices that aren't keyboards, by path, with the node's ctime: a new device can get a freed path.
+# Opening and probing them on every event made typing lag by up to 250 ms under load.
+ignored = {}
 
 
 def is_keyboard(dev):
@@ -58,6 +64,9 @@ def scan():
         if path in devices:
             continue
         try:
+            ctime = os.stat(path).st_ctime
+            if ignored.get(path) == ctime:
+                continue
             dev = InputDevice(path)
         except OSError:
             continue
@@ -65,17 +74,25 @@ def scan():
             devices[path] = dev
             sel.register(dev, selectors.EVENT_READ)
         else:
+            ignored[path] = ctime
             dev.close()
 
 
 def drop(dev):
     sel.unregister(dev)
     devices.pop(dev.path, None)
-    dev.close()
+    try:
+        dev.close()
+    except OSError:
+        pass   # on 3.10 even close() fails with ENODEV once the device is gone
 
 
+last_scan = 0
 while True:
-    scan()
+    # look for newly plugged keyboards once a second, not on every key press
+    if time.monotonic() - last_scan >= 1:
+        scan()
+        last_scan = time.monotonic()
     for key, _ in sel.select(timeout=1.0):
         dev = key.fileobj
         try:
@@ -85,4 +102,8 @@ while True:
             ui.syn()
         except OSError:
             # device was unplugged
+            drop(dev)
+        except Exception:
+            # never die: X only knows ozone-kbd from its start, a new one would leave it without keys
+            traceback.print_exc(file=sys.stderr)
             drop(dev)

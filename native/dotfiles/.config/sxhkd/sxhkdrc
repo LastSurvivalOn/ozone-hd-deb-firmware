@@ -6,7 +6,7 @@ super + d
 super + y
     yt
 super + w
-    gdbus call --session --dest org.ozone.Web --object-path /org/ozone/Web --method org.gtk.Application.Activate {} > /dev/null 2>&1 || ozone-web
+    ozone-web-show
 super + shift + e
     ozone-power
 super + Escape
