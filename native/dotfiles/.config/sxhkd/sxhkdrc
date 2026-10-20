@@ -5,6 +5,8 @@ super + d
     rofi -show drun
 super + y
     yt
+super + w
+    ozone-web
 super + shift + e
     ozone-power
 super + Escape

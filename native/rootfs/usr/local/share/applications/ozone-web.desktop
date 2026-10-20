@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Web
+GenericName=Web browser
+Comment=WebKit browser tuned for this box
+Exec=ozone-web %U
+Icon=web-browser
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;

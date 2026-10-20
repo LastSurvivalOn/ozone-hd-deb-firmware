@@ -18,10 +18,13 @@ SPLASH=/usr/share/ozone/splash.rgb565
 
 case "$1" in
 start)
-    # Same limits as the stock firmware; hotplug turns off spare cores when idle
+    # Same limits as the stock firmware. Its hotplug governor runs on one core and brings the others
+    # up too late for a browser (pages load 20-35 % slower); interactive jumps to full speed under
+    # load and drops back when idle, with all four cores online.
     echo 1536000 > $CPU/scaling_max_freq
     echo 96000 > $CPU/scaling_min_freq
-    echo hotplug > $CPU/scaling_governor
+    echo interactive > $CPU/scaling_governor
+    for c in /sys/devices/system/cpu/cpu[1-3]/online; do echo 1 > $c; done
 
     # 1280x720 desktop, the hardware scaler stretches it to 1080p. It must be 16 bit (RGB565): all 32-bit
     # Amlogic OSD formats have alpha and X writes zeros there, so the layer turns transparent (black screen);
@@ -49,6 +52,12 @@ start)
              graphics/fb0/blank graphics/fb0/color_key graphics/fb0/enable_key; do
         chgrp video /sys/class/$a && chmod g+w /sys/class/$a
     done
+    # Compressed swap in RAM (zram, LZO on this kernel): a browser tab can take 250 MB of the 830
+    swapon --show=NAME --noheadings | grep -q zram0 || {
+        echo $((384 << 20)) > /sys/block/zram0/disksize &&
+        mkswap /dev/zram0 > /dev/null && swapon -p 10 /dev/zram0
+    }
+
     # Frame-rate automation (switching the HDMI refresh rate to the video's) dereferences a NULL mode
     # name when a decoder closes and takes the kernel down. Android turns it off at boot too.
     echo 0 > /sys/class/tv/policy_fr_auto

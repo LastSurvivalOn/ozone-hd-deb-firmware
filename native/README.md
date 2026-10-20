@@ -33,7 +33,7 @@ Desktop packages:
 `xserver-xorg-core xserver-xorg-legacy xserver-xorg-video-fbdev xserver-xorg-input-evdev
 xserver-xorg-input-mouse xinit x11-xserver-utils x11-utils xfonts-base bspwm sxhkd polybar rofi
 feh rxvt-unicode fonts-jetbrains-mono fonts-font-awesome fonts-noto-color-emoji mpv alsa-utils
-python3 nodejs dbus-x11` (with `--no-install-recommends`), and to build amplay: `gcc libc6-dev make
+python3 nodejs dbus-x11 python3-gi gir1.2-webkit2-4.1 gir1.2-gtk-3.0` (with `--no-install-recommends`), and to build amplay: `gcc libc6-dev make
 pkg-config libavformat-dev libavcodec-dev libswresample-dev libavutil-dev libasound2-dev libx11-dev
 libxft-dev`.
 
@@ -50,6 +50,35 @@ workspaces, CPU/memory/temperature/IP/volume/clock, power.
 | Super+Shift+E | power (sleep, Android, reboot, power off) |
 | Super+Q / F / S | close / fullscreen / floating |
 | Super+1…5 | workspaces |
+
+## Browser
+
+`ozone-web` (Super+W, the globe on the panel): Python + GTK3 on WebKitGTK 2.50, with tabs, an
+address/search bar (DuckDuckGo HTML), find (Ctrl+F), zoom, downloads to `~/Downloads`, session
+restore. One instance: opening it again adds a tab. Measured on the box before picking it:
+
+| | Chromium 150 | Firefox ESR 153 | WebKitGTK 2.50 |
+|---|---|---|---|
+| starts | no: killed in `execve` on 3.10 | 27-33 s | 9-13 s (1.5 s as a new tab) |
+| scrolling a plain page | | 27 fps | 2.7 fps by default, **45 fps** with GPU paths off |
+| memory | | 280-400 MB | 150-250 MB |
+
+On real sites the limit is their JavaScript, not painting: wheel scrolling Wikipedia ran at 1-3 fps,
+BBC at 0.5, and with JavaScript off at 16-20 and 12 (composited mode, CPU/llvmpipe raster, dropping
+shadows and filters, unfixing sticky headers: no gain). So:
+
+- **fast mode** (⚡, F8): JavaScript off for the site, remembered in `~/.local/share/ozone-web/sites.json`;
+  on by default for sites that read fine without it (Wikipedia, BBC, Stack Exchange, HN, old.reddit…);
+- **reader view** (📖, F9): the article as a static page, ~1 s to open, scrolls at 20 fps;
+- ads and trackers blocked by a WebKit content filter (pgl.yoyo.org, `ozone-web --update-filters`);
+- no HTML5 media: YouTube watch pages (also the in-app navigation) go to `yt`/amplay, YouTube
+  search to `yt`;
+- `WEBKIT_DISABLE_DMABUF_RENDERER`/`WEBKIT_DISABLE_COMPOSITING_MODE`, no smooth scrolling, WebGL,
+  WebAudio; 350 MB memory limit per web process; zram swap (384 MB) from `ozone-hw`;
+- the CPU governor is `interactive` with all four cores (`ozone-hw`): the stock `hotplug` keeps one
+  core and made pages load 20-35 % slower.
+
+Load log (times per page, crashes): `~/.cache/ozone-web/log`.
 
 ## Hardware and kernel limitations (already handled)
 

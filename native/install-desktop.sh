@@ -12,7 +12,7 @@ ssh_box() { ssh -i $KEY -o ConnectTimeout=10 <USER>@$IP "$@"; }
 echo ">> system files"
 tar -C "$HERE/rootfs" -czf - \
     usr/local/lib/ozone/desktop usr/local/lib/ozone/gen-xorg-input usr/local/lib/ozone/kbd-merge usr/local/lib/ozone/splash \
-    usr/local/bin/yt usr/local/bin/ozone-power usr/local/bin/ozone-standby usr/local/bin/ozone-notify etc/init.d/ozone-input etc/ozone/native-only \
+    usr/local/bin/yt usr/local/bin/ozone-web usr/local/share/applications/ozone-web.desktop usr/local/bin/ozone-power usr/local/bin/ozone-standby usr/local/bin/ozone-notify etc/init.d/ozone-input etc/ozone/native-only \
     etc/X11/xorg.conf.d/00-ozone-screen.conf etc/X11/Xwrapper.config etc/asound.conf |
     ssh_box 'sudo tar -C / --no-same-owner -xzf -'
 
@@ -37,5 +37,7 @@ ssh_box 'set -e
     # keyboard hotplug without udev (see /usr/local/lib/ozone/kbd-merge)
     sudo apt-get install -y -qq --no-install-recommends python3-evdev > /dev/null
     sudo update-rc.d ozone-input defaults
+    # ozone-web opens links from other programs
+    sudo update-alternatives --install /usr/bin/x-www-browser x-www-browser /usr/local/bin/ozone-web 60 > /dev/null
     fc-list : family | grep -i -E "jetbrains|fontawesome" | sort -u'
 echo ">> done; start without rebooting: sudo telinit q"

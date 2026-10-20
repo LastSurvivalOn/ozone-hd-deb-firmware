@@ -1,0 +1,630 @@
+#!/usr/bin/python3
+"""ozone-web: a small browser on WebKitGTK, tuned for the S805 (Cortex-A5, no usable GPU under X).
+
+What was measured on the box, and what follows from it:
+
+- Engines: Chromium doesn't start on kernel 3.10 (killed in execve). Firefox ESR works but needs
+  27-33 s to start, twice WebKit's memory, and scrolls slower. WebKitGTK is the one to use.
+- WebKit renders through EGL by default, which on fbdev means Mesa in software: 2.7 fps scrolling
+  a plain page. WEBKIT_DISABLE_DMABUF_RENDERER + WEBKIT_DISABLE_COMPOSITING_MODE: 45 fps, 60 MB
+  less. Composited mode with CPU or llvmpipe raster gained nothing on real pages.
+- Real wheel scrolling on heavy sites (Wikipedia, BBC) runs at 1-3 fps, and the cause is the
+  sites' JavaScript reacting to every scroll, not painting: with JS off the same pages scroll at
+  12-20 fps. Hence the per-site fast mode (JS off), on by default for sites that work without
+  it, and the reader view (F9), a static copy of the article.
+- No HTML5 media: WebKit's GStreamer path has neither codecs nor CPU for it here, and on YouTube it
+  took the web process down. Video goes to the hardware decoder: watch pages, including the
+  in-page navigation of YouTube's app, open in `yt` -> amplay; YouTube search goes to `yt` too.
+- Ads and trackers are blocked by a compiled WebKit content filter (pgl.yoyo.org list).
+- One instance: opening it again adds a tab to the running window instead of starting another
+  4-second, 200 MB browser.
+
+  ozone-web [URL...]
+  ozone-web --update-filters     fetch the blocklist again
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+os.environ.setdefault('WEBKIT_DISABLE_DMABUF_RENDERER', '1')
+os.environ.setdefault('WEBKIT_DISABLE_COMPOSITING_MODE', '1')
+
+import gi  # noqa: E402
+
+gi.require_version('Gdk', '3.0')
+gi.require_version('Gtk', '3.0')
+gi.require_version('WebKit2', '4.1')
+from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango, WebKit2  # noqa: E402
+
+HOME_PAGE = 'https://html.duckduckgo.com/html/'
+SEARCH = 'https://html.duckduckgo.com/html/?q='
+DATA = os.path.join(GLib.get_user_data_dir(), 'ozone-web')
+CACHE = os.path.join(GLib.get_user_cache_dir(), 'ozone-web')
+FILTERS_JSON = os.path.join(DATA, 'blocklist.json')
+SITES_JSON = os.path.join(DATA, 'sites.json')
+SESSION = os.path.join(DATA, 'session.json')
+LOG = os.path.join(CACHE, 'log')
+BLOCKLIST_URL = 'https://pgl.yoyo.org/adservers/serverlist.php?hostformat=nohtml&showintro=0&mimetype=plaintext'
+MEMORY_LIMIT_MB = 350   # per web process; WebKit drops caches and stops runaway pages above it
+# Read fine without JavaScript, and scroll several times faster for it
+FAST_SITES = ('wikipedia.org', 'wikimedia.org', 'wiktionary.org', 'wikibooks.org', 'bbc.com', 'bbc.co.uk',
+              'news.ycombinator.com', 'stackoverflow.com', 'stackexchange.com', 'superuser.com',
+              'askubuntu.com', 'old.reddit.com', 'lwn.net', 'debian.org', 'archlinux.org')
+YOUTUBE_WATCH = re.compile(r'^https?://((www|m)\.)?(youtube\.com/(watch|shorts/)|youtu\.be/)')
+YOUTUBE_OTHER = re.compile(r'^https?://((www|m)\.)?youtube\.com/?(results|\?|$|#)')
+
+# Font Awesome 4, like the panel
+ICON = {'back': '', 'forward': '', 'reload': '', 'stop': '', 'home': '',
+        'new': '', 'close': '', 'fast': '', 'reader': '', 'shield': ''}
+
+CSS = b'''
+* { font-family: "JetBrains Mono"; font-size: 13px; }
+window, .toolbar, notebook header { background: #11111b; color: #cdd6f4; }
+.toolbar { padding: 4px 6px; }
+button.flat { color: #a6adc8; padding: 2px 8px; min-height: 26px; border: none; background: none; }
+button.flat:hover { color: #cdd6f4; background: #313244; }
+button.flat:disabled { color: #45475a; }
+button.icon label { font-family: "FontAwesome"; font-size: 15px; }
+button.active { color: #cba6f7; }
+entry { background: #1e1e2e; color: #cdd6f4; border: 1px solid #313244; border-radius: 6px;
+        padding: 3px 10px; caret-color: #cba6f7; }
+entry:focus { border-color: #cba6f7; }
+entry progress { background: none; border: none; border-bottom: 2px solid #cba6f7; }
+notebook header tab { background: #181825; color: #a6adc8; padding: 2px 4px; border: none; }
+notebook header tab:checked { background: #1e1e2e; color: #cdd6f4; box-shadow: inset 0 -2px #cba6f7; }
+notebook header tab button.flat { padding: 0 4px; min-height: 18px; }
+'''
+
+# Reader view: the element holding most paragraph text, cleaned of everything but content.
+# Runs in its own script world; on a fast-mode page JavaScript is switched on just for this call
+# (the page's own scripts were skipped at load and don't come back).
+READER_JS = r'''(() => {
+  const score = new Map();
+  for (const p of document.querySelectorAll('p, pre, li')) {
+    const n = p.textContent.trim().length;
+    if (n < 40) continue;
+    for (let el = p.parentElement, w = 1; el && w > 0.2; el = el.parentElement, w /= 2)
+      score.set(el, (score.get(el) || 0) + n * w);
+  }
+  let best = null, top = 0;
+  for (const [el, s] of score) if (s > top) { top = s; best = el; }
+  if (!best || top < 600) return '';
+  const c = best.cloneNode(true);
+  c.querySelectorAll('script, style, noscript, iframe, form, button, input, select, nav, aside, footer, ' +
+                     '[role=navigation], [aria-hidden=true], .mw-editsection, .navbox, .reference').forEach(e => e.remove());
+  for (const img of c.querySelectorAll('img')) {
+    const src = img.dataset.src || img.getAttribute('src');
+    if (src) img.src = new URL(src, location.href).href;
+    img.removeAttribute('srcset'); img.removeAttribute('loading');
+  }
+  for (const a of c.querySelectorAll('a[href]')) a.href = new URL(a.getAttribute('href'), location.href).href;
+  for (const e of c.querySelectorAll('*')) { e.removeAttribute('style'); e.removeAttribute('class'); e.removeAttribute('width'); e.removeAttribute('height'); }
+  const h1 = document.querySelector('h1');
+  return JSON.stringify({ title: (h1 && h1.textContent.trim()) || document.title, html: c.innerHTML });
+})()'''
+
+READER_PAGE = '''<!doctype html><meta charset="utf-8"><title>{title}</title>
+<style>
+body {{ background: #1e1e2e; color: #cdd6f4; font: 21px/1.6 "DejaVu Serif", serif; margin: 0; }}
+main {{ max-width: 44em; margin: 0 auto; padding: 32px 24px 80px; }}
+h1, h2, h3 {{ font-family: "JetBrains Mono", monospace; line-height: 1.25; color: #f5f5f5; }}
+a {{ color: #cba6f7; }} img {{ max-width: 100%; height: auto; }}
+pre, code {{ font: 17px "JetBrains Mono", monospace; background: #181825; }} pre {{ padding: 12px; overflow-x: auto; }}
+table {{ border-collapse: collapse; }} td, th {{ border: 1px solid #313244; padding: 4px 8px; }}
+.src {{ font: 15px "JetBrains Mono", monospace; color: #7f849c; }}
+</style><main><p class="src">{host}</p><h1>{title}</h1>{html}</main>'''
+
+
+def update_filters():
+    """Turns the ad server list into a WebKit content blocker (Safari's JSON rule format)."""
+    with urllib.request.urlopen(BLOCKLIST_URL, timeout=30) as r:
+        hosts = [h.strip() for h in r.read().decode().splitlines()]
+    rules = [{'trigger': {'url-filter': r'^[^:]+://+([^:/]+\.)?' + re.escape(h) + r'[:/]'},
+              'action': {'type': 'block'}}
+             for h in hosts if h and not h.startswith('#')]
+    os.makedirs(DATA, exist_ok=True)
+    with open(FILTERS_JSON + '.tmp', 'w') as f:
+        json.dump(rules, f)
+    os.replace(FILTERS_JSON + '.tmp', FILTERS_JSON)
+    return len(rules)
+
+
+def to_uri(text):
+    text = text.strip()
+    if re.match(r'^[a-z][a-z0-9+.-]*:', text):
+        return text
+    if ' ' not in text and ('.' in text or text.startswith('localhost')):
+        return 'https://' + text
+    return SEARCH + GLib.uri_escape_string(text, None, False)
+
+
+def host_of(uri):
+    return (urllib.parse.urlsplit(uri or '').hostname or '').lower()
+
+
+def flat_button(icon, tooltip, handler, *args):
+    b = Gtk.Button(label=ICON[icon], relief=Gtk.ReliefStyle.NONE, tooltip_text=tooltip, can_focus=False)
+    b.get_style_context().add_class('flat')
+    b.get_style_context().add_class('icon')
+    b.connect('clicked', lambda _b: handler(*args))
+    return b
+
+
+def set_active(button, on):
+    ctx = button.get_style_context()
+    ctx.add_class('active') if on else ctx.remove_class('active')
+
+
+class Tab(Gtk.Box):
+    def __init__(self, browser, view):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.browser, self.view = browser, view
+        self.reader_of = None    # the page's URI while it is shown as a reader view
+        self.started = 0
+        self.pack_start(view, True, True, 0)
+        self.label = Gtk.Label(label='New tab', ellipsize=Pango.EllipsizeMode.END, width_chars=18,
+                               max_width_chars=18, xalign=0)
+        close = flat_button('close', 'Close tab (Ctrl+W)', browser.close_tab, self)
+        self.header = Gtk.Box(spacing=4)
+        self.header.pack_start(self.label, True, True, 0)
+        self.header.pack_start(close, False, False, 0)
+        self.header.show_all()
+        view.connect('notify::title', self.on_title)
+        view.connect('notify::uri', self.on_uri)
+        view.connect('notify::estimated-load-progress', lambda *_: browser.sync(self))
+        view.connect('notify::is-loading', lambda *_: browser.sync(self))
+        view.connect('load-changed', self.on_load)
+        view.connect('create', browser.on_create)
+        view.connect('decide-policy', browser.on_decide_policy)
+        view.connect('web-process-terminated', self.on_crash)
+        view.connect('close', lambda *_: browser.close_tab(self))
+        self.show_all()
+
+    def on_load(self, view, event):
+        if event in (WebKit2.LoadEvent.STARTED, WebKit2.LoadEvent.REDIRECTED):
+            # before the new document commits: JavaScript on or off for the site it comes from
+            view.get_settings().set_enable_javascript(not self.browser.is_fast(view.get_uri()))
+            if event == WebKit2.LoadEvent.STARTED:
+                self.started = time.monotonic()
+        elif event == WebKit2.LoadEvent.COMMITTED and self.reader_of and view.get_uri() != self.reader_of:
+            self.reader_of = None    # navigated away from the reader view
+        elif event == WebKit2.LoadEvent.FINISHED and self.started:
+            print(f'loaded in {time.monotonic() - self.started:.1f} s: {view.get_uri()}', flush=True)
+            self.started = 0
+        self.browser.sync(self)
+
+    def on_uri(self, view, _param):
+        # YouTube's app switches videos with pushState, which is no navigation policy decision
+        uri = view.get_uri() or ''
+        if YOUTUBE_WATCH.match(uri):
+            self.browser.play(uri)
+            view.go_back() if view.can_go_back() else GLib.idle_add(self.browser.close_tab, self)
+        self.browser.sync(self)
+
+    def on_title(self, *_):
+        title = self.view.get_title() or self.view.get_uri() or 'New tab'
+        self.label.set_text(title)
+        self.header.set_tooltip_text(title)
+        self.browser.sync(self)
+
+    def on_crash(self, view, reason):
+        print(f'web process ended ({reason.value_nick}): {view.get_uri()}', flush=True)
+        uri = GLib.markup_escape_text(view.get_uri() or '')
+        memory = reason == WebKit2.WebProcessTerminationReason.EXCEEDED_MEMORY_LIMIT
+        view.load_alternate_html(
+            '<body style="background:#1e1e2e;color:#cdd6f4;font:18px JetBrains Mono;padding:40px">'
+            '<h2>The page crashed</h2><p>' + ('It ran out of memory. ' if memory else '') +
+            f'<a style="color:#cba6f7" href="{uri}">Reload</a></p>', uri, None)
+
+
+class Browser(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title='ozone-web')
+        self.set_default_size(1280, 690)
+
+        style = Gtk.CssProvider()
+        style.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), style,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        os.makedirs(DATA, exist_ok=True)
+        pressure = WebKit2.MemoryPressureSettings()
+        pressure.set_memory_limit(MEMORY_LIMIT_MB)
+        manager = WebKit2.WebsiteDataManager(base_data_directory=DATA, base_cache_directory=CACHE)
+        manager.get_cookie_manager().set_persistent_storage(os.path.join(DATA, 'cookies.sqlite'),
+                                                            WebKit2.CookiePersistentStorage.SQLITE)
+        self.context = WebKit2.WebContext(website_data_manager=manager, memory_pressure_settings=pressure)
+        self.context.set_cache_model(WebKit2.CacheModel.WEB_BROWSER)
+        self.context.set_spell_checking_enabled(False)
+        self.context.connect('download-started', self.on_download)
+
+        self.settings = WebKit2.Settings(
+            hardware_acceleration_policy=WebKit2.HardwareAccelerationPolicy.NEVER,
+            enable_smooth_scrolling=False,
+            enable_webgl=False,
+            enable_webaudio=False,
+            enable_media=False,
+            enable_media_stream=False,
+            enable_encrypted_media=False,
+            enable_page_cache=True,
+            enable_developer_extras=False,
+            enable_back_forward_navigation_gestures=False,
+        )
+        self.content = WebKit2.UserContentManager()
+        self.policies = WebKit2.WebsitePolicies(autoplay=WebKit2.AutoplayPolicy.DENY)
+        self.blocking = False
+        self.sites = self.load_json(SITES_JSON, {})
+        self.load_filters()
+
+        # toolbar
+        self.back = flat_button('back', 'Back (Alt+Left)', lambda: self.tab.view.go_back())
+        self.forward = flat_button('forward', 'Forward (Alt+Right)', lambda: self.tab.view.go_forward())
+        self.reload = flat_button('reload', 'Reload (F5)', self.reload_or_stop)
+        home = flat_button('home', 'Home', lambda: self.tab.view.load_uri(HOME_PAGE))
+        self.entry = Gtk.Entry(placeholder_text='Search or address')
+        self.entry.connect('activate', self.on_entry)
+        self.entry.connect('focus-in-event', lambda *_: GLib.idle_add(self.entry.select_region, 0, -1))
+        self.find = Gtk.Entry(placeholder_text='Find', width_chars=18, no_show_all=True)
+        self.find.connect('changed', self.on_find)
+        self.find.connect('activate', lambda *_: self.tab.view.get_find_controller().search_next())
+        self.fast = flat_button('fast', 'Fast mode for this site: JavaScript off (F8)', self.toggle_fast)
+        self.reader = flat_button('reader', 'Reader view (F9)', self.toggle_reader)
+        self.shield = flat_button('shield', 'Ad blocking', lambda: None)
+        bar = Gtk.Box(spacing=2)
+        bar.get_style_context().add_class('toolbar')
+        for w in (self.back, self.forward, self.reload, home):
+            bar.pack_start(w, False, False, 0)
+        bar.pack_start(self.entry, True, True, 6)
+        for w in (self.find, self.fast, self.reader, self.shield):
+            bar.pack_start(w, False, False, 0)
+
+        self.notebook = Gtk.Notebook(scrollable=True, show_border=False)
+        new = flat_button('new', 'New tab (Ctrl+T)', self.new_tab, HOME_PAGE)
+        self.notebook.set_action_widget(new, Gtk.PackType.END)
+        new.show()
+        self.notebook.connect('switch-page', lambda _n, page, _i: self.sync(page))
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.pack_start(bar, False, False, 0)
+        box.pack_start(self.notebook, True, True, 0)
+        self.add(box)
+        self.connect('key-press-event', self.on_key)
+        self.connect('delete-event', self.on_quit)
+        self.show_all()
+        self.sync_shield()
+
+    # -- tabs -------------------------------------------------------------------------------------
+
+    @property
+    def tab(self):
+        return self.notebook.get_nth_page(self.notebook.get_current_page())
+
+    def make_view(self, related=None):
+        # every tab gets its own copy of the settings: JavaScript is switched per site
+        s = WebKit2.Settings()
+        for p in self.settings.list_properties():
+            if p.flags & GObject.ParamFlags.WRITABLE and not p.flags & GObject.ParamFlags.DEPRECATED:
+                s.set_property(p.name, self.settings.get_property(p.name))
+        kwargs = dict(related_view=related) if related else dict(web_context=self.context)
+        view = WebKit2.WebView(settings=s, user_content_manager=self.content, website_policies=self.policies,
+                               **kwargs)
+        view.set_background_color(Gdk.RGBA(0.118, 0.118, 0.18, 1))   # Catppuccin base while loading
+        return view
+
+    def add_tab(self, view):
+        tab = Tab(self, view)
+        n = self.notebook.insert_page(tab, tab.header, self.notebook.get_current_page() + 1)
+        self.notebook.set_tab_reorderable(tab, True)
+        self.notebook.set_current_page(n)
+        return tab
+
+    def new_tab(self, uri=None):
+        tab = self.add_tab(self.make_view())
+        if uri:
+            tab.view.load_uri(uri)
+        if not uri or uri == HOME_PAGE:
+            self.entry.grab_focus()
+        else:
+            tab.view.grab_focus()
+        return tab
+
+    def close_tab(self, tab):
+        self.notebook.remove_page(self.notebook.page_num(tab))
+        tab.view.destroy()
+        if self.notebook.get_n_pages() == 0:
+            self.on_quit()
+
+    def on_create(self, view, _action):
+        # target=_blank and window.open: a new tab sharing the opener's process
+        return self.add_tab(self.make_view(related=view)).view
+
+    # -- navigation -------------------------------------------------------------------------------
+
+    def on_entry(self, entry):
+        self.tab.view.load_uri(to_uri(entry.get_text()))
+        self.tab.view.grab_focus()
+
+    def reload_or_stop(self):
+        v = self.tab.view
+        v.stop_loading() if v.is_loading() else v.reload()
+
+    def on_decide_policy(self, view, decision, kind):
+        if kind == WebKit2.PolicyDecisionType.RESPONSE:
+            if not decision.is_mime_type_supported():
+                decision.download()
+                return True
+            return False
+        uri = decision.get_navigation_action().get_request().get_uri() or ''
+        if YOUTUBE_WATCH.match(uri):
+            self.play(uri)
+        elif YOUTUBE_OTHER.match(uri):
+            # the YouTube app is far too heavy for this CPU; yt searches it in a second
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(uri).query).get('search_query', [''])[0]
+            subprocess.Popen(['yt'] + ([q] if q else []), start_new_session=True)
+        else:
+            return False
+        decision.ignore()
+        if not view.get_uri():   # an empty tab opened just for the link
+            GLib.idle_add(self.close_tab, view.get_parent())
+        return True
+
+    def play(self, uri):
+        """Video belongs to the hardware decoder, not to WebKit"""
+        now = time.monotonic()
+        if uri == getattr(self, 'playing', (None, 0))[0] and now - self.playing[1] < 5:
+            return   # both the policy decision and the URI change report the same click
+        self.playing = (uri, now)
+        subprocess.Popen(['yt', uri], start_new_session=True)
+
+    def on_download(self, _context, download):
+        def destination(dl, name):
+            folder = (GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD) or
+                      os.path.expanduser('~/Downloads'))
+            os.makedirs(folder, exist_ok=True)
+            dl.set_destination(os.path.join(folder, name))
+            subprocess.Popen(['ozone-notify', 'Downloading ' + name])
+            return True
+        download.connect('decide-destination', destination)
+        download.connect('finished', lambda dl: subprocess.Popen(
+            ['ozone-notify', 'Downloaded ' + os.path.basename(dl.get_destination() or '')]))
+
+    def on_find(self, entry):
+        fc = self.tab.view.get_find_controller()
+        text = entry.get_text()
+        if text:
+            fc.search(text, WebKit2.FindOptions.CASE_INSENSITIVE | WebKit2.FindOptions.WRAP_AROUND, 1000)
+        else:
+            fc.search_finish()
+
+    # -- fast mode and reader view ------------------------------------------------------------------
+
+    def is_fast(self, uri):
+        host = host_of(uri)
+        if host in self.sites:
+            return self.sites[host]
+        return any(host == d or host.endswith('.' + d) for d in FAST_SITES)
+
+    def toggle_fast(self):
+        tab = self.tab
+        uri = tab.reader_of or tab.view.get_uri()
+        host = host_of(uri)
+        if not host:
+            return
+        self.sites[host] = not self.is_fast(uri)
+        self.save_json(SITES_JSON, self.sites)
+        tab.reader_of = None
+        tab.view.load_uri(uri)   # a reload keeps the old document's settings
+
+    def toggle_reader(self):
+        tab = self.tab
+        if tab.reader_of:
+            uri, tab.reader_of = tab.reader_of, None
+            tab.view.load_uri(uri)
+            return
+
+        js_was = tab.view.get_settings().get_enable_javascript()
+
+        def extracted(view, result):
+            view.get_settings().set_enable_javascript(js_was)
+            try:
+                text = view.evaluate_javascript_finish(result).to_string()
+            except GLib.Error as e:
+                print('ozone-web: reader:', e.message, flush=True)
+                text = ''
+            if not text:
+                subprocess.Popen(['ozone-notify', 'No article found on this page'])
+                return
+            page = json.loads(text)
+            uri = view.get_uri()
+            html = READER_PAGE.format(title=GLib.markup_escape_text(page['title']),
+                                      host=GLib.markup_escape_text(host_of(uri)), html=page['html'])
+            tab.reader_of = uri
+            view.get_settings().set_enable_javascript(False)
+            view.load_alternate_html(html, uri, uri)
+
+        tab.view.get_settings().set_enable_javascript(True)
+        tab.view.evaluate_javascript(READER_JS, -1, 'ozone-reader', None, None, extracted)
+
+    # -- state ------------------------------------------------------------------------------------
+
+    def sync(self, tab):
+        if tab is not self.tab:
+            return
+        v = tab.view
+        uri = tab.reader_of or v.get_uri() or ''
+        if not self.entry.has_focus():
+            self.entry.set_text('' if uri == HOME_PAGE else uri)
+        loading = v.is_loading()
+        self.entry.set_progress_fraction(v.get_estimated_load_progress() if loading else 0)
+        self.back.set_sensitive(v.can_go_back())
+        self.forward.set_sensitive(v.can_go_forward())
+        self.reload.set_label(ICON['stop'] if loading else ICON['reload'])
+        set_active(self.fast, self.is_fast(uri))
+        set_active(self.reader, bool(tab.reader_of))
+        self.set_title((v.get_title() or 'ozone-web') + ' — ozone-web')
+
+    def sync_shield(self):
+        set_active(self.shield, self.blocking)
+        self.shield.set_tooltip_text('Ads blocked' if self.blocking else 'Ad blocklist not loaded yet')
+
+    def load_filters(self):
+        store = WebKit2.UserContentFilterStore.new(os.path.join(CACHE, 'filters'))
+
+        def use(flt):
+            self.content.add_filter(flt)
+            self.blocking = True
+            GLib.idle_add(self.sync_shield)
+
+        def compiled(store, result):
+            try:
+                use(store.save_finish(result))
+            except GLib.Error as e:
+                print('ozone-web: blocklist:', e.message, flush=True)
+
+        def compile_json():
+            with open(FILTERS_JSON, 'rb') as f:
+                store.save('blocklist', GLib.Bytes.new(f.read()), None, compiled)
+
+        def fetch():
+            try:
+                update_filters()
+                GLib.idle_add(compile_json)
+            except OSError as e:
+                print('ozone-web: blocklist download:', e, flush=True)
+
+        def loaded(store, result):
+            try:
+                use(store.load_finish(result))
+            except GLib.Error:   # not compiled yet
+                if os.path.exists(FILTERS_JSON):
+                    compile_json()
+                else:
+                    threading.Thread(target=fetch, daemon=True).start()
+
+        store.load('blocklist', None, loaded)
+
+    @staticmethod
+    def load_json(path, default):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return default
+
+    @staticmethod
+    def save_json(path, value):
+        try:
+            with open(path + '.tmp', 'w') as f:
+                json.dump(value, f)
+            os.replace(path + '.tmp', path)
+        except OSError:
+            pass
+
+    def on_quit(self, *_):
+        tabs = [self.notebook.get_nth_page(i) for i in range(self.notebook.get_n_pages())]
+        self.save_json(SESSION, [u for u in (t.reader_of or t.view.get_uri() for t in tabs) if u and u != HOME_PAGE])
+        self.get_application().quit()
+        return False
+
+    # -- keys -------------------------------------------------------------------------------------
+
+    def on_key(self, _w, ev):
+        ctrl = bool(ev.state & Gdk.ModifierType.CONTROL_MASK)
+        alt = bool(ev.state & Gdk.ModifierType.MOD1_MASK)
+        k = Gdk.keyval_name(ev.keyval)
+        if not self.notebook.get_n_pages():
+            return False
+        v = self.tab.view
+        n = self.notebook.get_n_pages()
+        cur = self.notebook.get_current_page()
+        zoom = lambda d: v.set_zoom_level(min(max(v.get_zoom_level() + d, 0.3), 3))  # noqa: E731
+        actions = {
+            (1, 0, 'l'): self.entry.grab_focus,
+            (0, 0, 'F6'): self.entry.grab_focus,
+            (1, 0, 't'): lambda: self.new_tab(HOME_PAGE),
+            (1, 0, 'w'): lambda: self.close_tab(self.tab),
+            (1, 0, 'Tab'): lambda: self.notebook.set_current_page((cur + 1) % n),
+            (1, 0, 'ISO_Left_Tab'): lambda: self.notebook.set_current_page((cur - 1) % n),
+            (0, 1, 'Left'): v.go_back,
+            (0, 1, 'Right'): v.go_forward,
+            (0, 0, 'F5'): v.reload,
+            (1, 0, 'r'): v.reload,
+            (1, 0, 'plus'): lambda: zoom(0.1),
+            (1, 0, 'equal'): lambda: zoom(0.1),
+            (1, 0, 'minus'): lambda: zoom(-0.1),
+            (1, 0, '0'): lambda: v.set_zoom_level(1),
+            (1, 0, 'f'): lambda: (self.find.show(), self.find.grab_focus()),
+            (0, 0, 'F8'): self.toggle_fast,
+            (0, 0, 'F9'): self.toggle_reader,
+            (0, 0, 'F11'): self.toggle_fullscreen,
+        }
+        if (int(ctrl), int(alt), k) in actions:
+            actions[(int(ctrl), int(alt), k)]()
+            return True
+        if k == 'Escape':
+            if self.find.get_visible():
+                self.find.set_text('')
+                self.find.hide()
+            elif v.is_loading():
+                v.stop_loading()
+            v.grab_focus()
+            return True
+        return False
+
+    def toggle_fullscreen(self):
+        st = self.get_window().get_state()
+        self.unfullscreen() if st & Gdk.WindowState.FULLSCREEN else self.fullscreen()
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id='org.ozone.Web', flags=Gio.ApplicationFlags.HANDLES_OPEN)
+        self.window = None
+
+    def get_window(self, restore):
+        if not self.window:
+            self.window = Browser(self)
+            for uri in (self.window.load_json(SESSION, []) if restore else []):
+                self.window.new_tab(uri)
+        self.window.present()
+        return self.window
+
+    def do_activate(self):
+        # first start: the last session; started again while running: a new tab
+        fresh = self.window is None
+        w = self.get_window(restore=True)
+        if not fresh or not w.notebook.get_n_pages():
+            w.new_tab(HOME_PAGE)
+
+    def do_open(self, files, _n, _hint):
+        w = self.get_window(restore=False)
+        for f in files:
+            w.new_tab(f.get_uri())
+
+
+def main():
+    if sys.argv[1:] == ['--update-filters']:
+        print(f'{update_filters()} hosts blocked; recompiled on the next start')
+        path = os.path.join(CACHE, 'filters')
+        for f in os.listdir(path) if os.path.isdir(path) else []:
+            os.remove(os.path.join(path, f))
+        return
+    GLib.set_prgname('ozone-web')   # the window class bspwm and rofi see
+    if not sys.stderr.isatty():
+        os.makedirs(CACHE, exist_ok=True)
+        log = open(LOG, 'a', buffering=1)
+        os.dup2(log.fileno(), 1)
+        os.dup2(log.fileno(), 2)
+    # bare words and host names become URIs before GApplication takes them for file names
+    args = [sys.argv[0]] + [to_uri(a) for a in sys.argv[1:]]
+    sys.exit(App().run(args))
+
+
+if __name__ == '__main__':
+    main()
