@@ -1,10 +1,15 @@
 #!/bin/sh
-# YouTube without a browser: search via rofi, playback via mpv (software decoding, up to 480p).
+# YouTube without a browser: search via rofi, playback through the hardware decoder (amplay, up to
+# 1080p60 H.264), or mpv in software if that fails.
 # yt            — prompt for a search query or a link
 # yt <query>    — search right away
 
-q=${*:-$(rofi -dmenu -p "  YouTube" -theme-str 'listview { lines: 0; }' < /dev/null)}
+q=${*:-$(rofi -dmenu -p "  YouTube" -theme-str 'listview { lines: 0; }' < /dev/null)}
 [ -n "$q" ] || exit 0
+
+# yt-dlp needs a JavaScript runtime to solve YouTube's signature challenges
+YTDLP="yt-dlp --no-warnings"
+command -v node > /dev/null && YTDLP="$YTDLP --js-runtimes node"
 
 case "$q" in
 http://*|https://*)
@@ -12,11 +17,11 @@ http://*|https://*)
     ;;
 *)
     ozone-notify "Searching: $q"
-    list=$(yt-dlp --flat-playlist --no-warnings \
+    list=$($YTDLP --flat-playlist \
         --print "%(title)s	%(channel)s · %(duration_string)s	%(id)s" "ytsearch20:$q") ||
         { ozone-notify "Search failed"; exit 1; }
     id=$(printf '%s\n' "$list" |
-        rofi -dmenu -i -p "  $q" -display-columns 1,2 -display-column-separator '	' |
+        rofi -dmenu -i -p "  $q" -display-columns 1,2 -display-column-separator '	' |
         cut -f3)
     [ -n "$id" ] || exit 0
     url="https://www.youtube.com/watch?v=$id"
@@ -24,4 +29,15 @@ http://*|https://*)
 esac
 
 ozone-notify "Loading video…"
+# The decoder takes H.264 (YouTube serves it up to 1080p); separate video and audio streams
+urls=$($YTDLP -g -f 'bv*[vcodec^=avc1][height<=1080]+ba[acodec^=mp4a]/b[vcodec^=avc1][height<=1080]' "$url")
+video=$(printf '%s\n' "$urls" | sed -n 1p)
+audio=$(printf '%s\n' "$urls" | sed -n 2p)
+if [ -n "$video" ]; then
+    amplay ${audio:+--audio "$audio"} "$video"
+    status=$?
+    amplay --reset   # in case it crashed with the desktop hidden
+    [ $status = 0 ] && exit 0
+    ozone-notify "Hardware playback failed, trying mpv"
+fi
 exec mpv --force-window=immediate "$url"

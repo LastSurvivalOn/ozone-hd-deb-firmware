@@ -43,6 +43,16 @@ start)
     chgrp video /dev/fb0 /dev/fb1 && chmod g+rw /dev/fb0 /dev/fb1
     chgrp input /dev/input/* && chmod g+rw /dev/input/*
 
+    # Hardware video decoder (amplay): the stream ports and the sysfs knobs it drives
+    chgrp video /dev/amstream_* /dev/amvideo && chmod g+rw /dev/amstream_* /dev/amvideo
+    for a in video/axis video/screen_mode video/disable_video tsync/enable tsync/startsync_mode \
+             graphics/fb0/blank; do
+        chgrp video /sys/class/$a && chmod g+w /sys/class/$a
+    done
+    # Frame-rate automation (switching the HDMI refresh rate to the video's) dereferences a NULL mode
+    # name when a decoder closes and takes the kernel down. Android turns it off at boot too.
+    echo 0 > /sys/class/tv/policy_fr_auto
+
     # softvol creates the "Master" control only on first open; polybar expects it right away.
     # aplay opens the device safely (see /etc/asound.conf and mpv.conf)
     timeout 3 aplay -q -D default -f S16_LE -r 48000 -c 2 -d 1 /dev/zero

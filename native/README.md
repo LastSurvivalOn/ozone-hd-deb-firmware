@@ -25,11 +25,16 @@ Flashing the image (from Android, as root): `dd if=linux-recovery.img of=/dev/bl
 copied to recovery: `dd if=/dev/block/boot of=/dev/block/recovery`. Backups of all partitions are in
 `~/ozone_backup/backup/`.
 
+Boot logo: `./install-logo.sh <ip> [1920x1080 png]` (default `logo/bootup.png`) writes the picture into
+the logo partition that u-boot shows at power-on and installs the same picture as the Linux splash;
+`--stock` puts the original back. `tools/logoimg.py` unpacks and repacks that partition (`AML_RES!`).
+
 Desktop packages:
 `xserver-xorg-core xserver-xorg-legacy xserver-xorg-video-fbdev xserver-xorg-input-evdev
 xserver-xorg-input-mouse xinit x11-xserver-utils x11-utils xfonts-base bspwm sxhkd polybar rofi
 feh rxvt-unicode fonts-jetbrains-mono fonts-font-awesome fonts-noto-color-emoji mpv alsa-utils
-python3 nodejs dbus-x11` (with `--no-install-recommends`).
+python3 nodejs dbus-x11` (with `--no-install-recommends`), and to build amplay: `gcc libc6-dev make
+pkg-config libavformat-dev libavcodec-dev libswresample-dev libavutil-dev libasound2-dev`.
 
 ## Desktop
 
@@ -41,7 +46,7 @@ workspaces, CPU/memory/temperature/IP/volume/clock, power.
 | Super+Enter | terminal |
 | Super+D | apps |
 | Super+Y | YouTube (search → mpv) |
-| Super+Shift+E | power (Android, reboot) |
+| Super+Shift+E | power (sleep, Android, reboot, power off) |
 | Super+Q / F / S | close / fullscreen / floating |
 | Super+1…5 | workspaces |
 
@@ -56,10 +61,35 @@ workspaces, CPU/memory/temperature/IP/volume/clock, power.
 | `mpv --ao=alsa` enables silence padding → the HDMI audio driver hangs the kernel | `ao=sdl` |
 | no volume control, no mmap (dmix) | softvol `Master`, one sound at a time |
 | no `getrandom()`/seccomp | Dropbear instead of OpenSSH, chrony with `-F 0` |
-| no fbcon | only the logo is on screen until X starts |
+| no fbcon | the boot logo stays on screen until X starts; ozone-hw redraws it on fb0 and pulses it |
+| power off reboots: `meson_power_off` restarts with reason `charging_reboot`, u-boot boots on | `HALT=halt` (and `INIT_HALT`) in `/etc/default/halt`, HDMI off first; plug in to turn on |
+| deep suspend powers USB down, wakes only on the IR remote | Sleep = Android early suspend with a wakelock held (`ozone-standby`): HDMI off, any key wakes |
 
 ## Video
 
-The S805 hardware decoder is only reachable through Amlogic's closed interface (amstream), which mpv
-doesn't support. In software: 360p decodes at ~65 fps, but converting frames for the screen limits
-playback to ~20 fps without audio and ~14 fps with audio. For 1080p YouTube use Android + SmartTube.
+`amplay` (source in `amplay/`) plays through the S805 hardware decoder: H.264 and HEVC up to 1080p60,
+MPEG-1/2. FFmpeg demuxes (files, HTTP, separate video and audio streams) and decodes audio for ALSA; the
+elementary video stream goes to Amlogic's amstream driver with a PTS per packet, and the decoder puts
+frames straight on the video layer, so the CPU stays at ~20-40 %. The desktop is hidden while it plays.
+
+```sh
+amplay film.mkv
+amplay --audio <audio url> <video url>      # what yt does with YouTube's DASH streams
+amplay --reset                              # brings the desktop back if amplay was killed
+```
+
+Keys: Space pause, ←/→ ±10 s, PgDn/PgUp ±60 s, ↑/↓ volume, M mute, Q/Esc quit. `yt` (Super+Y) picks
+H.264 up to 1080p and falls back to mpv, which decodes in software (360p at best: converting frames
+to RGB565 caps it at ~20 fps).
+
+How the driver is driven, and what breaks it:
+
+- Port setup as the stock Android player does it: `VFORMAT`, `VID`, `SYSINFO`, `PORT_INIT` on
+  `/dev/amstream_vbuf` (`_hevc` for HEVC), `/dev/amvideo` held open; then `TSTAMP` (90 kHz) before each
+  packet. Without PTS the decoder runs but amvideo never shows a frame.
+- `/sys/class/tv/policy_fr_auto` must be 0 (ozone-hw sets it at boot, amplay checks): with frame-rate
+  automation on, closing the decoder dereferences a NULL mode name in `tv_validate_vmode` and the
+  kernel oopses.
+- tsync is always in audio master mode after port init, and audio isn't fed to the DSP, so pcrscr is
+  driven from userspace: the kernel sets it 3 s behind the first frame (its wait for audio); amplay
+  starts the clock at that moment and keeps pcrscr within 40 ms of the ALSA clock.

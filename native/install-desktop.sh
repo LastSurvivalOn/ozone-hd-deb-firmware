@@ -19,6 +19,10 @@ tar -C "$HERE/rootfs" -czf - \
 echo ">> user files"
 tar -C "$HERE/dotfiles" -czf - . | ssh_box 'tar -C ~ -xzf - && chmod +x ~/.xinitrc ~/.config/bspwm/bspwmrc ~/.config/polybar/launch.sh'
 
+echo ">> amplay (video through the hardware decoder), built on the box"
+tar -C "$HERE/amplay" -czf - amplay.c Makefile |
+    ssh_box 'set -e; d=$(mktemp -d); tar -C $d -xzf -; make -s -C $d; sudo make -s -C $d install; rm -r $d'
+
 echo ">> yt-dlp (latest release: the Debian version stopped working with YouTube long ago)"
 ssh_box 'sudo curl -fsSL -o /usr/local/bin/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp &&
          sudo chmod 755 /usr/local/bin/yt-dlp && yt-dlp --version'
