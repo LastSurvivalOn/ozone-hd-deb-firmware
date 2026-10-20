@@ -30,11 +30,12 @@ esac
 
 ozone-notify "Loading video…"
 # The decoder takes H.264 (YouTube serves it up to 1080p); separate video and audio streams
-urls=$($YTDLP -g -f 'bv*[vcodec^=avc1][height<=1080]+ba[acodec^=mp4a]/b[vcodec^=avc1][height<=1080]' "$url")
-video=$(printf '%s\n' "$urls" | sed -n 1p)
-audio=$(printf '%s\n' "$urls" | sed -n 2p)
+out=$($YTDLP --print title -g -f 'bv*[vcodec^=avc1][height<=1080]+ba[acodec^=mp4a]/b[vcodec^=avc1][height<=1080]' "$url")
+title=$(printf '%s\n' "$out" | sed -n 1p)
+video=$(printf '%s\n' "$out" | sed -n 2p)
+audio=$(printf '%s\n' "$out" | sed -n 3p)
 if [ -n "$video" ]; then
-    amplay ${audio:+--audio "$audio"} "$video"
+    amplay --title "$title" ${audio:+--audio "$audio"} "$video"
     status=$?
     amplay --reset   # in case it crashed with the desktop hidden
     [ $status = 0 ] && exit 0

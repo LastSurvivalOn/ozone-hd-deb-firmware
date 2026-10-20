@@ -8,14 +8,16 @@
  * (pcrscr). The CPU never touches a pixel, so 1080p plays at full frame rate.
  *
  * Demuxing and audio are done with FFmpeg: audio is decoded in software and played through ALSA,
- * and pcrscr is kept on the audio clock. The video layer sits under the OSD, so the desktop (fb0)
- * is blanked while playing. Keys are read from the keyboards directly (evdev, grabbed so they
- * don't reach X).
+ * and pcrscr is kept on the audio clock. The video layer sits under the desktop OSD layer (fb0):
+ * under X, fb0's color key makes the player window transparent and osd.c draws the controls on
+ * it; without X (DISPLAY unset) fb0 is blanked and keys come from the keyboards directly (evdev,
+ * grabbed).
  *
- *   amplay [--audio URL] [--start SECONDS] URL     URL: a file or anything FFmpeg opens
+ *   amplay [--audio URL] [--start SECONDS] [--title TEXT] URL     URL: a file or anything FFmpeg opens
  *   amplay --reset                                 put the desktop back after a crash
  *
  * Keys: Space/P pause, Left/Right -/+10 s, PgDn/PgUp -/+60 s, Up/Down volume, M mute, Q/Esc quit.
+ * Mouse (under X): click the progress bar to seek, the picture to pause, the wheel for volume.
  * Exit status 3 means the video codec has no hardware decoder (the caller can fall back to mpv).
  */
 #define _GNU_SOURCE
@@ -43,6 +45,8 @@
 #include <libavutil/channel_layout.h>
 #include <libavutil/opt.h>
 #include <libswresample/swresample.h>
+
+#include "osd.h"
 
 /* amstream ioctls, from Amlogic's include/linux/amlogic/amports/amstream.h (3.10 kernels) */
 #define AMSTREAM_IOC_VFORMAT          _IOW('S', 0x04, int)
@@ -221,6 +225,12 @@ static struct {
     int64_t wclock, wclock_at; /* the same for the wall clock used when there is no audio */
     int64_t ready_at, started_at;
 
+    int64_t start_time;       /* 90 kHz: the stream's own start, so the clock shows 0:00 */
+    double duration;          /* seconds, 0 if unknown */
+    double last_pos;
+    const char *title;
+    int x11;                  /* controls drawn under X, or evdev without */
+
     volatile sig_atomic_t quit;
     int verbose;
 } P = { .vfd = -1, .cntl = -1, .clk_m = PTHREAD_MUTEX_INITIALIZER, .gate = PTHREAD_COND_INITIALIZER };
@@ -293,14 +303,83 @@ static void display_on(void)
     sysfs_write(SYS "video/axis", axis);
     sysfs_write(SYS "video/screen_mode", "0");    /* keep the aspect ratio */
     sysfs_write(SYS "tsync/enable", "1");
-    sysfs_write(SYS "graphics/fb0/blank", "1");   /* the desktop OSD covers the video layer */
+    if (P.x11) {
+        /* the player window's color becomes transparent and the video layer shows through */
+        char key[16];
+        snprintf(key, sizeof key, "0x%x", osd_key565());
+        sysfs_write(SYS "graphics/fb0/color_key", key);
+        sysfs_write(SYS "graphics/fb0/enable_key", "1");
+    } else {
+        sysfs_write(SYS "graphics/fb0/blank", "1");   /* the desktop layer covers the video layer */
+    }
 }
 
 static void display_off(void)
 {
     sysfs_write(SYS "video/disable_video", "1");
     sysfs_write(SYS "tsync/enable", "0");
+    sysfs_write(SYS "graphics/fb0/enable_key", "0");
     sysfs_write(SYS "graphics/fb0/blank", "0");
+}
+
+/* ---- volume: the softvol "Master" control from /etc/asound.conf ---------------------------- */
+
+static snd_mixer_t *mixer;
+static snd_mixer_elem_t *master;
+static int saved_volume = -1;   /* volume before mute; softvol has no mute switch */
+
+static void mixer_open(void)
+{
+    snd_mixer_selem_id_t *id;
+    snd_mixer_selem_id_alloca(&id);
+    snd_mixer_selem_id_set_name(id, "Master");
+    if (snd_mixer_open(&mixer, 0) < 0)
+        return;
+    if (snd_mixer_attach(mixer, "default") < 0 || snd_mixer_selem_register(mixer, NULL, NULL) < 0 ||
+        snd_mixer_load(mixer) < 0 || !(master = snd_mixer_find_selem(mixer, id))) {
+        snd_mixer_close(mixer);
+        mixer = NULL;
+        master = NULL;
+    }
+}
+
+static int volume_get(void)
+{
+    long min, max, v;
+    if (!master)
+        return 0;
+    snd_mixer_handle_events(mixer);
+    snd_mixer_selem_get_playback_volume_range(master, &min, &max);
+    snd_mixer_selem_get_playback_volume(master, 0, &v);
+    return max > min ? (int)((v - min) * 100 / (max - min)) : 0;
+}
+
+static void volume_set(int pct)
+{
+    long min, max;
+    if (!master)
+        return;
+    pct = pct < 0 ? 0 : pct > 100 ? 100 : pct;
+    snd_mixer_selem_get_playback_volume_range(master, &min, &max);
+    snd_mixer_selem_set_playback_volume_all(master, min + (max - min) * pct / 100);
+}
+
+static void volume_change(int delta)
+{
+    int v = saved_volume >= 0 ? saved_volume : volume_get();
+    saved_volume = -1;
+    volume_set(v + delta);
+}
+
+static void mute_toggle(void)
+{
+    if (saved_volume >= 0) {
+        volume_set(saved_volume);
+        saved_volume = -1;
+    } else {
+        saved_volume = volume_get();
+        volume_set(0);
+    }
 }
 
 /* ---- keyboards ----------------------------------------------------------------------------- */
@@ -698,24 +777,39 @@ static int finished(void)
     return now_us() - idle_since > 1500000;
 }
 
-static void seek(int seconds)
+/* Seconds since the start of the stream, for the controls; holds still while (re)starting */
+static double play_time(void)
 {
-    int64_t pos = position();
-    if (pos < 0)
-        return;
-    int64_t target = av_rescale(pos, AV_TIME_BASE, PTS_HZ) + (int64_t)seconds * AV_TIME_BASE;
-    if (target < 0)
-        target = 0;
+    int64_t pos = P.started ? position() : -1;
+    if (pos >= 0)
+        P.last_pos = (double)(pos - P.start_time) / PTS_HZ;
+    return P.last_pos;
+}
+
+/* to an absolute position in seconds from the start of the stream */
+static void seek_to(double seconds, int backward)
+{
+    if (P.duration > 0 && seconds > P.duration - 1)
+        seconds = P.duration - 1;
+    if (seconds < 0)
+        seconds = 0;
+    P.last_pos = seconds;
+    int64_t target = av_rescale(P.start_time, AV_TIME_BASE, PTS_HZ) + (int64_t)(seconds * AV_TIME_BASE);
     session_stop();
     for (int i = 0; i < P.nin; i++) {
         AVFormatContext *f = P.in[i].fmt;
-        if (av_seek_frame(f, -1, target, seconds < 0 ? AVSEEK_FLAG_BACKWARD : 0) < 0)
+        if (av_seek_frame(f, -1, target, backward ? AVSEEK_FLAG_BACKWARD : 0) < 0)
             av_seek_frame(f, -1, target, AVSEEK_FLAG_BACKWARD);
     }
     if (P.verbose)
         logmsg("seek to %.1f s", target / (double)AV_TIME_BASE);
     if (session_start() < 0)
         P.quit = 1;
+}
+
+static void seek(int seconds)
+{
+    seek_to(play_time() + seconds, seconds < 0);
 }
 
 static void toggle_pause(void)
@@ -734,40 +828,40 @@ static void toggle_pause(void)
         ioctl(P.vfd, AMSTREAM_IOC_SET_PCRSCR, (unsigned long)(uint32_t)a);
 }
 
+static void do_action(const struct osd_event *e)
+{
+    switch (e->action) {
+    case OSD_PAUSE: toggle_pause(); break;
+    case OSD_SEEK_REL: seek((int)e->value); break;
+    case OSD_SEEK_ABS: seek_to(e->value, e->value < play_time()); break;
+    case OSD_VOLUME: volume_change((int)e->value); break;
+    case OSD_MUTE: mute_toggle(); break;
+    case OSD_QUIT: P.quit = 1; break;
+    }
+}
+
+/* evdev keys, when there is no X */
 static void handle_key(int code, int repeat)
 {
-    if (repeat && code != KEY_LEFT && code != KEY_RIGHT && code != KEY_UP && code != KEY_DOWN &&
-        code != KEY_VOLUMEUP && code != KEY_VOLUMEDOWN)
-        return;
+    struct osd_event e;
     switch (code) {
     case KEY_SPACE: case KEY_P: case KEY_PLAYPAUSE: case KEY_PLAY: case KEY_PAUSE: case KEY_ENTER: case KEY_OK:
-        toggle_pause();
-        break;
-    case KEY_LEFT: case KEY_REWIND:
-        seek(-SEEK_SHORT);
-        break;
-    case KEY_RIGHT: case KEY_FASTFORWARD:
-        seek(SEEK_SHORT);
-        break;
-    case KEY_PAGEDOWN: case KEY_PREVIOUSSONG:
-        seek(-SEEK_LONG);
-        break;
-    case KEY_PAGEUP: case KEY_NEXTSONG:
-        seek(SEEK_LONG);
-        break;
-    case KEY_UP: case KEY_VOLUMEUP:
-        if (system("amixer -q sset Master 5%+ unmute")) {}
-        break;
-    case KEY_DOWN: case KEY_VOLUMEDOWN:
-        if (system("amixer -q sset Master 5%-")) {}
-        break;
-    case KEY_M: case KEY_MUTE:
-        if (system("amixer -q sset Master toggle")) {}
-        break;
+        e = (struct osd_event){ OSD_PAUSE, 0 }; break;
+    case KEY_LEFT: case KEY_REWIND: e = (struct osd_event){ OSD_SEEK_REL, -SEEK_SHORT }; break;
+    case KEY_RIGHT: case KEY_FASTFORWARD: e = (struct osd_event){ OSD_SEEK_REL, SEEK_SHORT }; break;
+    case KEY_PAGEDOWN: case KEY_PREVIOUSSONG: e = (struct osd_event){ OSD_SEEK_REL, -SEEK_LONG }; break;
+    case KEY_PAGEUP: case KEY_NEXTSONG: e = (struct osd_event){ OSD_SEEK_REL, SEEK_LONG }; break;
+    case KEY_UP: case KEY_VOLUMEUP: e = (struct osd_event){ OSD_VOLUME, 5 }; break;
+    case KEY_DOWN: case KEY_VOLUMEDOWN: e = (struct osd_event){ OSD_VOLUME, -5 }; break;
+    case KEY_M: case KEY_MUTE: e = (struct osd_event){ OSD_MUTE, 0 }; break;
     case KEY_Q: case KEY_ESC: case KEY_BACK: case KEY_STOP: case KEY_POWER: case KEY_HOMEPAGE: case KEY_BACKSPACE:
-        P.quit = 1;
-        break;
+        e = (struct osd_event){ OSD_QUIT, 0 }; break;
+    default:
+        return;
     }
+    if (repeat && e.action != OSD_SEEK_REL && e.action != OSD_VOLUME)
+        return;
+    do_action(&e);
 }
 
 /* ---- setup --------------------------------------------------------------------------------- */
@@ -829,7 +923,7 @@ static void on_signal(int sig)
 
 static void usage(void)
 {
-    fputs("usage: amplay [-v] [--audio URL] [--start SECONDS] URL\n"
+    fputs("usage: amplay [-v] [--audio URL] [--start SECONDS] [--title TEXT] URL\n"
           "       amplay --reset\n", stderr);
     exit(2);
 }
@@ -840,17 +934,19 @@ int main(int argc, char **argv)
         { "audio", required_argument, NULL, 'a' },
         { "start", required_argument, NULL, 's' },
         { "reset", no_argument, NULL, 'r' },
+        { "title", required_argument, NULL, 't' },
         { "verbose", no_argument, NULL, 'v' },
         { 0 }
     };
     const char *audio_url = NULL;
     double start = 0;
     int c;
-    while ((c = getopt_long(argc, argv, "a:s:rv", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "a:s:rt:v", opts, NULL)) != -1) {
         switch (c) {
         case 'a': audio_url = optarg; break;
         case 's': start = atof(optarg); break;
         case 'r': display_off(); return 0;
+        case 't': P.title = optarg; break;
         case 'v': P.verbose = 1; break;
         default: usage();
         }
@@ -904,6 +1000,15 @@ int main(int argc, char **argv)
     P.bsf->time_base_in = P.vst->time_base;
     av_bsf_init(P.bsf);
 
+    AVFormatContext *f0 = P.in[0].fmt;
+    P.start_time = f0->start_time != AV_NOPTS_VALUE ? av_rescale(f0->start_time, PTS_HZ, AV_TIME_BASE) : 0;
+    P.duration = f0->duration > 0 ? f0->duration / (double)AV_TIME_BASE : 0;
+    if (!P.title) {
+        AVDictionaryEntry *t = av_dict_get(f0->metadata, "title", NULL, 0);
+        const char *slash = strrchr(argv[optind], '/');
+        P.title = t ? t->value : strstr(argv[optind], "://") ? NULL : slash ? slash + 1 : argv[optind];
+    }
+
     if (P.verbose)
         logmsg("video %s %dx%d, audio %s", avcodec_get_name(P.vst->codecpar->codec_id), P.vst->codecpar->width,
                P.vst->codecpar->height, P.ast ? avcodec_get_name(P.ast->codecpar->codec_id) : "none");
@@ -924,13 +1029,32 @@ int main(int argc, char **argv)
         logmsg("can't turn off " SYS "tv/policy_fr_auto, refusing to start");
         return 1;
     }
+    P.x11 = getenv("DISPLAY") && osd_open() == 0;
+    if (!P.x11)
+        kbd_open();
+    else
+        kbd[nkbd++] = (struct pollfd){ .fd = osd_fd(), .events = POLLIN };
+    mixer_open();
     display_on();
-    kbd_open();
+    if (start > 0)
+        P.last_pos = start;
     int status = session_start() < 0;
     while (!P.quit && !status) {
         /* right after the start the kernel moves pcrscr (see sync_clock), so catch that quickly */
         int fast = !P.started || now_us() - P.started_at < 2000000;
-        if (poll(kbd, nkbd, fast ? 20 : 100) > 0) {
+        int ready = poll(kbd, nkbd, fast ? 20 : 100) > 0;
+        if (P.x11) {
+            struct osd_event ev[8];
+            int n = osd_poll(ev, 8);
+            for (int i = 0; i < n && !P.quit; i++)
+                do_action(&ev[i]);
+            struct osd_state st = {
+                .pos = play_time(), .dur = P.duration, .paused = P.paused, .loading = !P.started,
+                .volume = saved_volume >= 0 ? saved_volume : volume_get(), .muted = saved_volume >= 0,
+                .title = P.title,
+            };
+            osd_update(&st);
+        } else if (ready) {
             for (int i = 0; i < nkbd; i++) {
                 struct input_event ev[16];
                 ssize_t n = (kbd[i].revents & POLLIN) ? read(kbd[i].fd, ev, sizeof ev) : 0;
@@ -944,7 +1068,12 @@ int main(int argc, char **argv)
             break;
     }
     session_stop();
-    kbd_close();
+    if (P.x11) {
+        nkbd = 0;
+        osd_close();
+    } else {
+        kbd_close();
+    }
     display_off();
     return status;
 }

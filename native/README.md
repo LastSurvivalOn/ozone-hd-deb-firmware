@@ -34,7 +34,8 @@ Desktop packages:
 xserver-xorg-input-mouse xinit x11-xserver-utils x11-utils xfonts-base bspwm sxhkd polybar rofi
 feh rxvt-unicode fonts-jetbrains-mono fonts-font-awesome fonts-noto-color-emoji mpv alsa-utils
 python3 nodejs dbus-x11` (with `--no-install-recommends`), and to build amplay: `gcc libc6-dev make
-pkg-config libavformat-dev libavcodec-dev libswresample-dev libavutil-dev libasound2-dev`.
+pkg-config libavformat-dev libavcodec-dev libswresample-dev libavutil-dev libasound2-dev libx11-dev
+libxft-dev`.
 
 ## Desktop
 
@@ -70,7 +71,11 @@ workspaces, CPU/memory/temperature/IP/volume/clock, power.
 `amplay` (source in `amplay/`) plays through the S805 hardware decoder: H.264 and HEVC up to 1080p60,
 MPEG-1/2. FFmpeg demuxes (files, HTTP, separate video and audio streams) and decodes audio for ALSA; the
 elementary video stream goes to Amlogic's amstream driver with a PTS per packet, and the decoder puts
-frames straight on the video layer, so the CPU stays at ~20-40 %. The desktop is hidden while it plays.
+frames straight on the video layer, so the CPU stays at ~20-40 %. Under X the player is a window in
+fb0's hardware color key (magenta is transparent), so the video shows through it and the controls
+are plain X drawing on top: title and close at the top, buttons, time, a clickable progress bar and
+volume at the bottom. They hide after 3 s; Xorg stays at ~0 % CPU. Without X the desktop is blanked
+and keys are read from evdev.
 
 ```sh
 amplay film.mkv
@@ -78,7 +83,8 @@ amplay --audio <audio url> <video url>      # what yt does with YouTube's DASH s
 amplay --reset                              # brings the desktop back if amplay was killed
 ```
 
-Keys: Space pause, ←/→ ±10 s, PgDn/PgUp ±60 s, ↑/↓ volume, M mute, Q/Esc quit. `yt` (Super+Y) picks
+Keys: Space pause, ←/→ ±10 s, PgDn/PgUp ±60 s, ↑/↓ volume, M mute, Q/Esc quit; mouse: move to show
+the controls, click the picture to pause, the progress bar to seek, wheel for volume. `yt` (Super+Y) picks
 H.264 up to 1080p and falls back to mpv, which decodes in software (360p at best: converting frames
 to RGB565 caps it at ~20 fps).
 
