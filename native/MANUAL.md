@@ -264,7 +264,7 @@ Sound comes out of the TV over HDMI.
 |---|---|
 | keyboard volume / mute keys | volume ±5 %, mute |
 | wheel over the 🔈 percentage on the panel | volume |
-| click on 🔈 | mute on/off |
+| click on 🔈 | mute on/off (the level comes back on the next click) |
 | **↑ / ↓**, **M** in the player | volume, mute |
 
 ## 9. When something goes wrong

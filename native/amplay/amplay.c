@@ -81,6 +81,7 @@ struct dec_sysinfo {
 #define SYNC_TOLERANCE  (PTS_HZ / 25)   /* re-set pcrscr when it drifts more than 40 ms off audio */
 #define PREROLL_BYTES   (512 * 1024)
 #define PREROLL_PTS     (PTS_HZ / 2)    /* or half a second of video, whichever comes first */
+#define I2S_BLOCK       16              /* frames: the I2S driver's buffer layout, see audio_thread */
 #define BUFFER_LOW      (PTS_HZ / 2)    /* downloaded video ahead of the clock: hold the clock below */
 #define BUFFER_HIGH     (3 * PTS_HZ)    /* and let it run again from here */
 #define SEEK_SHORT      10
@@ -598,6 +599,7 @@ static void *audio_thread(void *arg)
     AVFrame *frame = av_frame_alloc();
     uint8_t *buf = NULL;
     int bufsamples = 0;
+    int carry = 0;   /* frames at the start of buf left over from the last write, < I2S_BLOCK */
 
     /* hold back until the video decoder has a head start, so both begin together */
     pthread_mutex_lock(&P.clk_m);
@@ -613,16 +615,34 @@ static void *audio_thread(void *arg)
             int64_t ts = frame->best_effort_timestamp;
             int64_t pts = ts != AV_NOPTS_VALUE ? to_pts90(ts, P.ast->time_base) : P.aclock;
             int max = swr_get_out_samples(P.swr, frame->nb_samples);
-            if (max > bufsamples) {
+            if (carry + max > bufsamples) {
+                uint8_t *nbuf = NULL;
+                av_samples_alloc(&nbuf, NULL, 2, carry + max, AV_SAMPLE_FMT_S16, 0);
+                if (buf)
+                    memcpy(nbuf, buf, carry * 4);
                 av_freep(&buf);
-                av_samples_alloc(&buf, NULL, 2, max, AV_SAMPLE_FMT_S16, 0);
-                bufsamples = max;
+                buf = nbuf;
+                bufsamples = carry + max;
             }
-            int n = swr_convert(P.swr, &buf, max, (const uint8_t **)frame->extended_data, frame->nb_samples);
+            uint8_t *out = buf + carry * 4;
+            int n = carry + swr_convert(P.swr, &out, max, (const uint8_t **)frame->extended_data, frame->nb_samples);
             int64_t end = pts + (int64_t)frame->nb_samples * PTS_HZ / frame->sample_rate;
-            for (int off = 0; off < n && !P.stop;) {
+            /* The Amlogic I2S driver keeps the buffer in blocks of 16 frames (16 left samples, then
+               16 right) and converts each write in place: one that doesn't start and end on a block
+               boundary lands shifted, and the TV gets noise or nothing (dmesg: "audio data
+               unligned"). So whole blocks only, and the rest waits for the next frame. */
+            int whole = n / I2S_BLOCK * I2S_BLOCK;
+            for (int off = 0; off < whole && !P.stop;) {
                 audio_pause_wait();
-                snd_pcm_sframes_t w = snd_pcm_writei(P.pcm, buf + off * 4, n - off);
+                snd_pcm_sframes_t room = snd_pcm_avail_update(P.pcm);
+                int len = whole - off;
+                if (room >= 0 && room < I2S_BLOCK) {
+                    snd_pcm_wait(P.pcm, 100);
+                    continue;
+                }
+                if (room > 0 && len > room)
+                    len = room / I2S_BLOCK * I2S_BLOCK;
+                snd_pcm_sframes_t w = snd_pcm_writei(P.pcm, buf + off * 4, len);
                 if (w == -EAGAIN) {
                     snd_pcm_wait(P.pcm, 100);
                     continue;
@@ -636,7 +656,9 @@ static void *audio_thread(void *arg)
                 }
                 off += w;
             }
-            audio_clock_update(end);
+            carry = n - whole;
+            memmove(buf, buf + whole * 4, carry * 4);
+            audio_clock_update(end - (int64_t)carry * PTS_HZ / AUDIO_RATE);
             av_frame_unref(frame);
         }
     }

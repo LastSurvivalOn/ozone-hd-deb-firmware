@@ -36,6 +36,6 @@ super + Tab
 
 # Volume
 XF86Audio{Raise,Lower}Volume
-    amixer -q set Master 5%{+,-}
+    ozone-volume {up,down}
 XF86AudioMute
-    amixer -q set Master toggle
+    ozone-volume mute

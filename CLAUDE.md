@@ -8,7 +8,7 @@ Scripts that turn an OzoneHD T2 WiFi set-top box (Amlogic S805 / Meson8B, armv7,
 
 Everything (READMEs, comments, script messages, UI labels) is in English.
 
-- Box: `ssh -i ~/.ssh/id_ed25519_ozone <USER>@<BOX_IP>` (passwordless sudo), `adb connect <BOX_IP>:5555` (rooted, `su`).
+- Box: `ssh -i ~/.ssh/id_ed25519_ozone <USER>@<BOX_IP>` (passwordless sudo), or over WiFi at <BOX_WIFI_IP> (`-o HostKeyAlias=<BOX_IP>`; both are DHCP reservations on the router), `adb connect <BOX_IP>:5555` (rooted, `su`).
 - Partition backups (boot, recovery, system, misc, logo; **not** the bootloader) live in `ozone_backup/backup/` and also in `~/ozone_backup/backup/`, which the scripts read by default.
 - `*/cache/` holds downloaded artifacts (Debian rootfs tarball, SmartTube apk, static armhf busybox). `native/out/` is build output.
 
@@ -45,7 +45,7 @@ Several of these were found by bricking or hanging the box. Don't undo them.
 - No `getrandom()` and no seccomp, so Dropbear replaces OpenSSH and chrony runs with `DAEMON_OPTS="-F 0"`.
 - `HUNG_TASK_PANIC` and `SOFTLOCKUP_PANIC` are on. `rootfs/etc/sysctl.d/ozone.conf` disables them, as Android does.
 - Display: fb0 must be **16 bpp RGB565**. The 32-bit OSD formats have alpha and X writes 0, which gives a black screen; Xorg 21 rejects 24 bpp. `ozone-hw` sets this up. There is no fbcon, so nothing appears on screen before X starts.
-- **mpv must use `ao=sdl`.** `ao=alsa` sets `silence_size=boundary`, and the Amlogic HDMI audio driver then hangs the kernel. ALSA uses softvol `Master` with no dmix (no mmap).
+- **mpv must use `ao=sdl`.** `ao=alsa` sets `silence_size=boundary`, and the Amlogic HDMI audio driver then hangs the kernel. ALSA uses softvol `Master` with no dmix (no mmap), on **device 1 (SPDIF)**: HDMI takes its audio from the SPDIF encoder, and device 0 (I2S) never reaches the TV. Master has no mute switch, so the panel and media keys use `ozone-volume` (mute = volume 0); polybar's internal/alsa shows it as muted for ever. The I2S driver keeps its buffer in blocks of 16 frames (16 L, then 16 R) and converts each write in place, so every write must start and end on a 16-frame boundary, or the TV gets garbage or silence (dmesg `audio data unligned`); amplay writes whole blocks only.
 - No working udev. Device permissions are set in `ozone-hw`. Xorg input comes from a generated static config (`gen-xorg-input`). Keyboard hotplug goes through `kbd-merge`, a python-evdev bridge that creates the `ozone-kbd` virtual device through the legacy uinput API, because 3.10 has no `UI_DEV_SETUP`. X only knows `ozone-kbd` from when it started, so `kbd-merge` must never exit (on 3.10 even `close()` of an unplugged device fails with ENODEV; that used to kill it and leave X without a keyboard). Errors go to `/var/log/kbd-merge.log`. Restarting it means restarting X too (`bspc quit`).
 - **WiFi:** the 8189ES only appears on SDIO after ioctl `0x6d01` on `/dev/wifi_power` (what Android's `set_wifi_power` does); then `insmod 8189es.ko ifname=wlan0 if2name=p2p0` (`/etc/init.d/ozone-wifi`). Without that the driver loads but finds no card.
 - Mainline Linux or Armbian is not an option: NAND sits behind the proprietary `aml_nftl_dev.ko`, WiFi needs the vendor `8189es.ko`, and DVB-T2 tuning runs in userspace Android libs.
