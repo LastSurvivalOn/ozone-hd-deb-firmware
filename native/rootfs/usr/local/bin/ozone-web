@@ -15,11 +15,18 @@ What was measured on the box, and what follows from it:
 - No HTML5 media: WebKit's GStreamer path has neither codecs nor CPU for it here, and on YouTube it
   took the web process down. Video goes to the hardware decoder: watch pages, including the
   in-page navigation of YouTube's app, open in `yt` -> amplay; YouTube search goes to `yt` too.
-- Ads and trackers are blocked by a compiled WebKit content filter (pgl.yoyo.org list).
+- Ads and trackers are blocked by a compiled WebKit content filter (pgl.yoyo.org list), and so are
+  all third-party scripts (analytics, tag managers, ad and social widgets) apart from the common
+  library CDNs: CNN loaded in 22 s instead of 45, The Verge in 12 instead of 48. The shield button
+  lets them through for a site that needs them.
 - One instance: opening it again adds a tab to the running window instead of starting another
-  4-second, 200 MB browser.
+  4-second, 200 MB browser. `--background` (started with the desktop) keeps it ready, hidden,
+  with a web process already spawned (~60 MB): it opens at once, and closing the window frees
+  the tabs and hides it again. A running instance gets requests through gdbus before this script
+  even imports GTK (66 ms instead of 1.5 s).
 
   ozone-web [URL...]
+  ozone-web --background         start hidden, ready to open
   ozone-web --update-filters     fetch the blocklist again
 """
 import json
@@ -32,6 +39,37 @@ import time
 import urllib.parse
 import urllib.request
 
+APP_ID = 'org.ozone.Web'
+SEARCH = 'https://html.duckduckgo.com/html/?q='
+
+
+def to_uri(text):
+    text = text.strip()
+    if re.match(r'^[a-z][a-z0-9+.-]*:', text):
+        return text
+    if ' ' not in text and ('.' in text or text.startswith('localhost')):
+        return 'https://' + text
+    return SEARCH + urllib.parse.quote(text, safe='')
+
+
+def forward(uris):
+    """Hands the request to a running instance, if there is one, without loading GTK and WebKit"""
+    def gvariant(u):
+        return "'" + u.replace('\\', '\\\\').replace("'", "\\'") + "'"
+    method = (['org.gtk.Application.Open', '[' + ', '.join(gvariant(u) for u in uris) + ']', "''", '{}'] if uris
+              else ['org.gtk.Application.Activate', '{}'])
+    try:
+        return subprocess.run(['gdbus', 'call', '--session', '--dest', APP_ID, '--object-path',
+                               '/' + APP_ID.replace('.', '/'), '--method'] + method,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+if __name__ == '__main__' and sys.argv[1:2] not in (['--update-filters'], ['--background']):
+    if forward([to_uri(a) for a in sys.argv[1:]]):
+        sys.exit(0)
+
 os.environ.setdefault('WEBKIT_DISABLE_DMABUF_RENDERER', '1')
 os.environ.setdefault('WEBKIT_DISABLE_COMPOSITING_MODE', '1')
 
@@ -43,7 +81,6 @@ gi.require_version('WebKit2', '4.1')
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk, Pango, WebKit2  # noqa: E402
 
 HOME_PAGE = 'https://html.duckduckgo.com/html/'
-SEARCH = 'https://html.duckduckgo.com/html/?q='
 DATA = os.path.join(GLib.get_user_data_dir(), 'ozone-web')
 CACHE = os.path.join(GLib.get_user_cache_dir(), 'ozone-web')
 FILTERS_JSON = os.path.join(DATA, 'blocklist.json')
@@ -56,6 +93,10 @@ MEMORY_LIMIT_MB = 350   # per web process; WebKit drops caches and stops runaway
 FAST_SITES = ('wikipedia.org', 'wikimedia.org', 'wiktionary.org', 'wikibooks.org', 'bbc.com', 'bbc.co.uk',
               'news.ycombinator.com', 'stackoverflow.com', 'stackexchange.com', 'superuser.com',
               'askubuntu.com', 'old.reddit.com', 'lwn.net', 'debian.org', 'archlinux.org')
+# Third-party scripts still allowed: library CDNs, and sites' own asset domains
+SCRIPT_CDNS = ('githubassets.com', 'gstatic.com', 'googleapis.com', 'cdnjs.cloudflare.com', 'jsdelivr.net',
+               'unpkg.com', 'code.jquery.com', 'bootstrapcdn.com', 'cloudfront.net', 'akamaized.net',
+               'redditstatic.com', 'twimg.com', 'sstatic.net', 'wikimedia.org', 'gitlab-static.net')
 YOUTUBE_WATCH = re.compile(r'^https?://((www|m)\.)?(youtube\.com/(watch|shorts/)|youtu\.be/)')
 YOUTUBE_OTHER = re.compile(r'^https?://((www|m)\.)?youtube\.com/?(results|\?|$|#)')
 
@@ -133,15 +174,6 @@ def update_filters():
         json.dump(rules, f)
     os.replace(FILTERS_JSON + '.tmp', FILTERS_JSON)
     return len(rules)
-
-
-def to_uri(text):
-    text = text.strip()
-    if re.match(r'^[a-z][a-z0-9+.-]*:', text):
-        return text
-    if ' ' not in text and ('.' in text or text.startswith('localhost')):
-        return 'https://' + text
-    return SEARCH + GLib.uri_escape_string(text, None, False)
 
 
 def host_of(uri):
@@ -259,8 +291,11 @@ class Browser(Gtk.ApplicationWindow):
         self.content = WebKit2.UserContentManager()
         self.policies = WebKit2.WebsitePolicies(autoplay=WebKit2.AutoplayPolicy.DENY)
         self.blocking = False
-        self.sites = self.load_json(SITES_JSON, {})
+        self.sites = self.load_json(SITES_JSON, {})   # host: {"fast": bool, "scripts": bool}
+        self.script_filter = None
+        self.store = WebKit2.UserContentFilterStore.new(os.path.join(CACHE, 'filters'))
         self.load_filters()
+        self.update_script_filter()
 
         # toolbar
         self.back = flat_button('back', 'Back (Alt+Left)', lambda: self.tab.view.go_back())
@@ -275,7 +310,7 @@ class Browser(Gtk.ApplicationWindow):
         self.find.connect('activate', lambda *_: self.tab.view.get_find_controller().search_next())
         self.fast = flat_button('fast', 'Fast mode for this site: JavaScript off (F8)', self.toggle_fast)
         self.reader = flat_button('reader', 'Reader view (F9)', self.toggle_reader)
-        self.shield = flat_button('shield', 'Ad blocking', lambda: None)
+        self.shield = flat_button('shield', 'Third-party scripts blocked on this site', self.toggle_scripts)
         bar = Gtk.Box(spacing=2)
         bar.get_style_context().add_class('toolbar')
         for w in (self.back, self.forward, self.reload, home):
@@ -296,8 +331,7 @@ class Browser(Gtk.ApplicationWindow):
         self.add(box)
         self.connect('key-press-event', self.on_key)
         self.connect('delete-event', self.on_quit)
-        self.show_all()
-        self.sync_shield()
+        box.show_all()   # the window itself is shown by App (or stays hidden in the background)
 
     # -- tabs -------------------------------------------------------------------------------------
 
@@ -324,8 +358,13 @@ class Browser(Gtk.ApplicationWindow):
         self.notebook.set_current_page(n)
         return tab
 
+    def warm_up(self):
+        """An empty tab whose web process is already running, for the next page to open"""
+        self.warm = self.add_tab(self.make_view())
+        self.warm.view.load_uri('about:blank')
+
     def new_tab(self, uri=None):
-        tab = self.add_tab(self.make_view())
+        tab, self.warm = (self.warm, None) if getattr(self, 'warm', None) else (self.add_tab(self.make_view()), None)
         if uri:
             tab.view.load_uri(uri)
         if not uri or uri == HOME_PAGE:
@@ -335,6 +374,8 @@ class Browser(Gtk.ApplicationWindow):
         return tab
 
     def close_tab(self, tab):
+        if tab is getattr(self, 'warm', None):
+            self.warm = None
         self.notebook.remove_page(self.notebook.page_num(tab))
         tab.view.destroy()
         if self.notebook.get_n_pages() == 0:
@@ -404,22 +445,67 @@ class Browser(Gtk.ApplicationWindow):
 
     # -- fast mode and reader view ------------------------------------------------------------------
 
+    def site(self, uri):
+        s = self.sites.get(host_of(uri))
+        return s if isinstance(s, dict) else {}
+
     def is_fast(self, uri):
         host = host_of(uri)
-        if host in self.sites:
-            return self.sites[host]
-        return any(host == d or host.endswith('.' + d) for d in FAST_SITES)
+        return self.site(uri).get('fast', any(host == d or host.endswith('.' + d) for d in FAST_SITES))
 
-    def toggle_fast(self):
+    def scripts_allowed(self, uri):
+        return self.site(uri).get('scripts', False)
+
+    def set_site(self, key, value):
         tab = self.tab
         uri = tab.reader_of or tab.view.get_uri()
         host = host_of(uri)
         if not host:
             return
-        self.sites[host] = not self.is_fast(uri)
+        self.sites[host] = dict(self.site(uri), **{key: value})
         self.save_json(SITES_JSON, self.sites)
         tab.reader_of = None
-        tab.view.load_uri(uri)   # a reload keeps the old document's settings
+        if key == 'scripts':
+            self.update_script_filter(lambda: tab.view.load_uri(uri))
+        else:
+            tab.view.load_uri(uri)   # a reload keeps the old document's settings
+
+    def toggle_fast(self):
+        uri = self.tab.reader_of or self.tab.view.get_uri()
+        self.set_site('fast', not self.is_fast(uri))
+
+    def toggle_scripts(self):
+        uri = self.tab.reader_of or self.tab.view.get_uri()
+        self.set_site('scripts', not self.scripts_allowed(uri))
+
+    def update_script_filter(self, then=None):
+        """A small rule list, recompiled when a site is let through: third-party scripts blocked,
+        except from the CDNs and on allowed sites (ignore-previous-rules acts within its own list,
+        so the ad blocklist still applies there)"""
+        rules = [{'trigger': {'url-filter': '.*', 'resource-type': ['script'], 'load-type': ['third-party']},
+                  'action': {'type': 'block'}}]
+        rules += [{'trigger': {'url-filter': r'^[^:]+://+([^:/]+\.)?' + re.escape(d) + r'[:/]',
+                               'resource-type': ['script']},
+                   'action': {'type': 'ignore-previous-rules'}} for d in SCRIPT_CDNS]
+        allowed = [h for h, s in self.sites.items() if isinstance(s, dict) and s.get('scripts')]
+        if allowed:
+            rules.append({'trigger': {'url-filter': '.*', 'if-domain': ['*' + h for h in allowed]},
+                          'action': {'type': 'ignore-previous-rules'}})
+
+        def compiled(store, result):
+            try:
+                flt = store.save_finish(result)
+            except GLib.Error as e:
+                print('ozone-web: script filter:', e.message, flush=True)
+                return
+            if self.script_filter:
+                self.content.remove_filter(self.script_filter)
+            self.content.add_filter(flt)
+            self.script_filter = flt
+            if then:
+                then()
+
+        self.store.save('scripts', GLib.Bytes.new(json.dumps(rules).encode()), None, compiled)
 
     def toggle_reader(self):
         tab = self.tab
@@ -466,20 +552,19 @@ class Browser(Gtk.ApplicationWindow):
         self.forward.set_sensitive(v.can_go_forward())
         self.reload.set_label(ICON['stop'] if loading else ICON['reload'])
         set_active(self.fast, self.is_fast(uri))
+        allowed = self.scripts_allowed(uri)
+        set_active(self.shield, not allowed)
+        self.shield.set_tooltip_text(('Third-party scripts allowed here' if allowed else
+                                      'Third-party scripts blocked here') + (', ads blocked' if self.blocking else ''))
         set_active(self.reader, bool(tab.reader_of))
         self.set_title((v.get_title() or 'ozone-web') + ' — ozone-web')
 
-    def sync_shield(self):
-        set_active(self.shield, self.blocking)
-        self.shield.set_tooltip_text('Ads blocked' if self.blocking else 'Ad blocklist not loaded yet')
-
     def load_filters(self):
-        store = WebKit2.UserContentFilterStore.new(os.path.join(CACHE, 'filters'))
+        store = self.store
 
         def use(flt):
             self.content.add_filter(flt)
             self.blocking = True
-            GLib.idle_add(self.sync_shield)
 
         def compiled(store, result):
             try:
@@ -528,9 +613,19 @@ class Browser(Gtk.ApplicationWindow):
 
     def on_quit(self, *_):
         tabs = [self.notebook.get_nth_page(i) for i in range(self.notebook.get_n_pages())]
-        self.save_json(SESSION, [u for u in (t.reader_of or t.view.get_uri() for t in tabs) if u and u != HOME_PAGE])
-        self.get_application().quit()
-        return False
+        uris = [t.reader_of or t.view.get_uri() for t in tabs if t is not getattr(self, 'warm', None)]
+        self.save_json(SESSION, [u for u in uris if u and u not in (HOME_PAGE, 'about:blank')])
+        if not self.get_application().background:
+            self.get_application().quit()
+            return False
+        # stay resident: drop the pages (and their web processes), keep one warm tab
+        self.hide()
+        self.warm = None
+        for t in tabs:
+            self.notebook.remove_page(self.notebook.page_num(t))
+            t.view.destroy()
+        self.warm_up()
+        return True
 
     # -- keys -------------------------------------------------------------------------------------
 
@@ -584,26 +679,43 @@ class Browser(Gtk.ApplicationWindow):
 
 class App(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id='org.ozone.Web', flags=Gio.ApplicationFlags.HANDLES_OPEN)
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_OPEN)
         self.window = None
+        self.background = False
+
+    def do_command_line_background(self):
+        self.background = True
+        self.hold()
+        self.window = Browser(self)
+        self.window.hide()
+        self.window.warm_up()
 
     def get_window(self, restore):
         if not self.window:
             self.window = Browser(self)
-            for uri in (self.window.load_json(SESSION, []) if restore else []):
-                self.window.new_tab(uri)
-        self.window.present()
-        return self.window
+        w = self.window
+        shown = w.get_visible()
+        if restore and not shown:
+            for uri in w.load_json(SESSION, []):
+                w.new_tab(uri)
+        w.show()
+        w.present()
+        return w, shown
 
     def do_activate(self):
-        # first start: the last session; started again while running: a new tab
-        fresh = self.window is None
-        w = self.get_window(restore=True)
-        if not fresh or not w.notebook.get_n_pages():
+        if self.background and self.window is None:
+            return self.do_command_line_background()
+        # first opening: the last session; opened again while shown: a new tab
+        w, shown = self.get_window(restore=True)
+        real = [t for t in (w.notebook.get_nth_page(i) for i in range(w.notebook.get_n_pages()))
+                if t is not getattr(w, 'warm', None)]
+        if shown or not real:
             w.new_tab(HOME_PAGE)
+        elif getattr(w, 'warm', None):
+            w.close_tab(w.warm)   # the restored session needs no empty tab
 
     def do_open(self, files, _n, _hint):
-        w = self.get_window(restore=False)
+        w, _shown = self.get_window(restore=False)
         for f in files:
             w.new_tab(f.get_uri())
 
@@ -621,9 +733,13 @@ def main():
         log = open(LOG, 'a', buffering=1)
         os.dup2(log.fileno(), 1)
         os.dup2(log.fileno(), 2)
+    app = App()
+    if sys.argv[1:] == ['--background']:
+        app.background = True   # becomes the resident instance unless one is already running
+        sys.exit(app.run([sys.argv[0]]))
     # bare words and host names become URIs before GApplication takes them for file names
     args = [sys.argv[0]] + [to_uri(a) for a in sys.argv[1:]]
-    sys.exit(App().run(args))
+    sys.exit(app.run(args))
 
 
 if __name__ == '__main__':

@@ -33,7 +33,7 @@ Desktop packages:
 `xserver-xorg-core xserver-xorg-legacy xserver-xorg-video-fbdev xserver-xorg-input-evdev
 xserver-xorg-input-mouse xinit x11-xserver-utils x11-utils xfonts-base bspwm sxhkd polybar rofi
 feh rxvt-unicode fonts-jetbrains-mono fonts-font-awesome fonts-noto-color-emoji mpv alsa-utils
-python3 nodejs dbus-x11 python3-gi gir1.2-webkit2-4.1 gir1.2-gtk-3.0` (with `--no-install-recommends`), and to build amplay: `gcc libc6-dev make
+python3 nodejs dbus-x11 python3-gi gir1.2-webkit2-4.1 gir1.2-gtk-3.0 libglib2.0-bin xdotool` (with `--no-install-recommends`), and to build amplay: `gcc libc6-dev make
 pkg-config libavformat-dev libavcodec-dev libswresample-dev libavutil-dev libasound2-dev libx11-dev
 libxft-dev`.
 
@@ -55,7 +55,10 @@ workspaces, CPU/memory/temperature/IP/volume/clock, power.
 
 `ozone-web` (Super+W, the globe on the panel): Python + GTK3 on WebKitGTK 2.50, with tabs, an
 address/search bar (DuckDuckGo HTML), find (Ctrl+F), zoom, downloads to `~/Downloads`, session
-restore. One instance: opening it again adds a tab. Measured on the box before picking it:
+restore. One instance: opening it again adds a tab, and it starts hidden with the desktop
+(`--background`, ~60 MB) with a web process already running, so the panel button shows it in
+~0.1 s and a page like HN is up in ~2 s; closing the window frees the tabs and hides it again.
+Measured on the box before picking WebKit:
 
 | | Chromium 150 | Firefox ESR 153 | WebKitGTK 2.50 |
 |---|---|---|---|
@@ -70,7 +73,10 @@ shadows and filters, unfixing sticky headers: no gain). So:
 - **fast mode** (⚡, F8): JavaScript off for the site, remembered in `~/.local/share/ozone-web/sites.json`;
   on by default for sites that read fine without it (Wikipedia, BBC, Stack Exchange, HN, old.reddit…);
 - **reader view** (📖, F9): the article as a static page, ~1 s to open, scrolls at 20 fps;
-- ads and trackers blocked by a WebKit content filter (pgl.yoyo.org, `ozone-web --update-filters`);
+- ads and trackers blocked by a WebKit content filter (pgl.yoyo.org, `ozone-web --update-filters`),
+  and third-party scripts blocked except for library CDNs: CNN loads in 21 s instead of 45, The Verge
+  in 12 instead of 48, pravda.com.ua in 3.6 instead of 8. The shield button lets them through for a
+  site that breaks without them (remembered);
 - no HTML5 media: YouTube watch pages (also the in-app navigation) go to `yt`/amplay, YouTube
   search to `yt`;
 - `WEBKIT_DISABLE_DMABUF_RENDERER`/`WEBKIT_DISABLE_COMPOSITING_MODE`, no smooth scrolling, WebGL,
