@@ -87,6 +87,13 @@ reused as they are:
 
 Not done: EPG, teletext/subtitles, recording, radio services, scrambled channels (shown with a lock).
 
+Logs, for debugging without a network: every `ozone-tv` run writes `/mnt/nand/linux/logs/tv-<time>-<command>/tv.log`
+(what it did, the frontend's replies, the libraries' Android log, the kernel log, amplay, the signal
+every 3 s), and a scan adds 3 s of each multiplex found (`mux-<MHz>.ts`, replay with `--test`).
+Under Android, `hybrid/box/android-log.sh` (installed at `/data/linux/android-log.sh`, started by
+`ozlinux.sh start` at boot) records logcat, the kernel log and the DVB sysfs state into
+`/data/linux/logs/android-N/`, i.e. `/mnt/nand/linux/logs/` seen from native Linux.
+
 ## YouTube
 
 `yt` (Super+Y, the YouTube button on the panel, and what `ozone-web` hands YouTube over to) is a

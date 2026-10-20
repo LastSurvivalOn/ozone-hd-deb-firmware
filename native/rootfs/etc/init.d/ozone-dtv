@@ -26,11 +26,12 @@ start)
         chmod 444 /dev/__properties__
     fi
 
-    # Android's kernel logger, so the libraries' messages can be read (ozone-tv --log)
+    # Android's kernel logger, so the libraries' messages can be read (ozone-tv log, the session
+    # logs). It shows a reader other uids' entries only if the reader is in the node's group.
     mkdir -p /dev/log
     for n in main events radio system; do
         [ -e /dev/log/$n ] || mknod /dev/log/$n c $(tr : ' ' < /sys/class/misc/log_$n/dev)
-        chmod 666 /dev/log/$n
+        chgrp video /dev/log/$n && chmod 666 /dev/log/$n
     done
 
     # The Android names of the DVB nodes (ueventd's /dev/dvb0.demux0 etc.)
@@ -39,8 +40,10 @@ start)
     done
     # demux and dvr are used by the scanner and player as the regular user
     chgrp video /dev/dvb/adapter0/* && chmod g+rw /dev/dvb/adapter0/*
-    # and ozone-tv --test switches demux0 to memory input
-    chgrp video /sys/class/stb/demux0_source && chmod g+w /sys/class/stb/demux0_source
+    # ozone-tv --test switches demux0 to memory input, and ozone-tv routes the TS-tap output to dvr0
+    for a in demux0_source asyncfifo0_source; do
+        chgrp video /sys/class/stb/$a && chmod g+w /sys/class/stb/$a
+    done
     ;;
 stop|restart|force-reload|status)
     ;;

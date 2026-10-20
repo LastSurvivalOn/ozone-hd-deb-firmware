@@ -75,6 +75,8 @@ mount)
     do_mount
     ;;
 start)
+    # Android-side logs for the TV work (android-log.sh), independent of Debian
+    [ -f /data/linux/android-log.sh ] && $BB setsid /system/bin/sh /data/linux/android-log.sh > /dev/null 2>&1 &
     do_mount || { echo "failed to mount $IMG"; exit 1; }
     # Below the lowmemorykiller threshold (it only touches >= 0), but the kernel OOM killer can still kill it
     echo -100 > /proc/self/oom_score_adj

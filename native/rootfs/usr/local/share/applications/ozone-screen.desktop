@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Screen size
+Comment=Fit the picture to a screen that cuts off its edges
+Exec=ozone-screen
+Icon=video-display
+Terminal=false
+Categories=Settings;

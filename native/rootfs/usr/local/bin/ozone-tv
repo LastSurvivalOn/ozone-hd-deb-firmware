@@ -12,27 +12,41 @@ chosen service's PIDs, read from dvr0 and piped into amplay, which decodes the v
   ozone-tv play N                 watch channel N of the list
   ozone-tv status KHZ [BW]        tune and print the signal once a second (aiming the antenna)
   ozone-tv log                    the frontend libraries' messages (Android log)
+  ozone-tv logs                   where the session logs are, and the latest one
 
   --test FILE: instead of the tuner, FILE (a TS) is fed into the demux from memory, as a single
   multiplex at 0 kHz; tests the scanner and player without an antenna.
-Channels are kept in ~/.local/share/ozone-tv/channels.json.
+Channels are kept in ~/.local/share/ozone-tv/channels.json (with --test, channels-test.json).
+
+Every run is logged, without needing a network: /mnt/nand/linux/logs/tv-<time>-<command>/tv.log
+(the data partition, where Android's own logs go too, see hybrid/box/android-log.sh) has what
+ozone-tv did, the frontend's replies, the libraries' Android log, the kernel log, amplay's
+messages and the signal every 3 s while watching; a scan adds the raw tables and 3 s of every
+multiplex found (mux-<MHz>.ts), to replay later with --test. The last 30 runs are kept.
 """
 import fcntl
 import json
 import os
+import re
 import select
 import struct
 import subprocess
 import sys
 import threading
 import time
+import traceback
 
 DTVFE = '/usr/local/lib/ozone/dtvfe'
 DEMUX = '/dev/dvb/adapter0/demux0'
 DVR = '/dev/dvb/adapter0/dvr0'
 DEMUX_SOURCE = '/sys/class/stb/demux0_source'
+ASYNCFIFO_SOURCE = '/sys/class/stb/asyncfifo0_source'
+NO_DATA_TIMEOUT = 10   # s without a byte from dvr0 before giving up on a channel
 DATA = os.path.join(os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share'), 'ozone-tv')
 CHANNELS = os.path.join(DATA, 'channels.json')
+LOCK = os.path.join(DATA, 'busy')   # the frontend can serve one run at a time
+LOGS = '/mnt/nand/linux/logs' if os.access('/mnt/nand/linux', os.W_OK) else os.path.join(DATA, 'logs')
+SAMPLE_SECONDS = 3
 
 # linux/dvb/dmx.h
 DMX_START = 0x6f29
@@ -48,10 +62,148 @@ AUDIO_TYPES = {0x03: 'mp1', 0x04: 'mp2', 0x0f: 'aac', 0x11: 'aac-latm', 0x81: 'a
 TV_SERVICE_TYPES = {0x01, 0x11, 0x16, 0x19, 0x1f}
 
 
+class Log:
+    """One file per run with everything that happened, from every source, in time order. Lines
+    are written as they come and the file is synced at least every second, so a kernel oops (it
+    reboots the box) or a pulled plug loses at most that second."""
+
+    KERNEL_NOISE = re.compile(r'audio data unligned|CTS_CPU_CLK')   # several lines a second
+    STATE = ['/sys/class/stb/' + n for n in ('source', 'demux0_source', 'demux1_source', 'tso_source',
+                                              'asyncfifo0_source', 'dsc_source', 'hw_setting',
+                                              'demux0_filter_users', 'demux0_free_filters', 'dvr0_mode')]
+
+    def __init__(self):
+        self.f, self.dir, self.synced = None, None, 0
+        self.lock = threading.Lock()
+
+    def start(self, what):
+        try:
+            os.makedirs(LOGS, exist_ok=True)
+            runs = sorted(n for n in os.listdir(LOGS) if n.startswith('tv-'))
+            for old in runs[:-29]:
+                subprocess.call(['rm', '-rf', os.path.join(LOGS, old)])
+            self.dir = os.path.join(LOGS, 'tv-%s-%s' % (time.strftime('%Y%m%d-%H%M%S'), what))
+            os.makedirs(self.dir, exist_ok=True)
+            self.f = open(os.path.join(self.dir, 'tv.log'), 'a', buffering=1)
+        except OSError as e:
+            print('no log: %s' % e, file=sys.stderr)
+            return
+        self.started = time.time()
+        self.write('tv', 'ozone-tv %s (pid %d)' % (' '.join(sys.argv[1:]), os.getpid()))
+        self.environment()
+        threading.Thread(target=self._kernel, daemon=True).start()
+        threading.Thread(target=self._android, daemon=True).start()
+
+    def write(self, src, text):
+        if not self.f:
+            return
+        t = time.time()
+        stamp = time.strftime('%H:%M:%S', time.localtime(t)) + '.%03d' % (t % 1 * 1000)
+        with self.lock:
+            try:
+                for line in str(text).splitlines() or ['']:
+                    self.f.write('%s [%s] %s\n' % (stamp, src, line))
+                if t - self.synced >= 1:
+                    self.f.flush()
+                    os.fsync(self.f.fileno())
+                    self.synced = t
+            except (OSError, ValueError):
+                pass
+
+    def path(self, name):
+        return os.path.join(self.dir, name) if self.dir else None
+
+    def close(self):
+        with self.lock:
+            if self.f:
+                self.f.flush()
+                os.fsync(self.f.fileno())
+                self.f.close()
+                self.f = None
+
+    def environment(self):
+        def read(path):
+            try:
+                with open(path) as f:
+                    return f.read().strip()
+            except OSError as e:
+                return '(%s)' % e.strerror
+        self.write('env', 'kernel %s, uptime %s s' % (os.uname().release, read('/proc/uptime').split()[0]))
+        self.write('env', '/system mounted: %s, /dev/__properties__: %s, dtvfe: %s, i2c-2: %s' % (
+            os.path.ismount('/system'), os.path.exists('/dev/__properties__'), os.access(DTVFE, os.X_OK),
+            os.path.exists('/dev/i2c-2')))
+        self.write('env', 'dvb nodes: %s' % ' '.join(sorted(os.listdir('/dev/dvb/adapter0')))
+                   if os.path.isdir('/dev/dvb/adapter0') else 'no /dev/dvb/adapter0')
+        for f in self.STATE:
+            self.write('env', '%s: %s' % (f, read(f)))
+        self.write('env', 'channels in the list: %d' % len(load_channels()))
+
+    def _kernel(self):
+        try:
+            p = subprocess.Popen(['dmesg', '-w'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 text=True, errors='replace')
+        except OSError as e:
+            self.write('kernel', 'dmesg: %s' % e)
+            return
+        # dmesg -w starts with the whole buffer: only what came after this run started
+        since = float(open('/proc/uptime').read().split()[0]) - 2
+        for line in p.stdout:
+            m = re.match(r'\[\s*(\d+\.\d+)\]', line)
+            if m and float(m.group(1)) < since or self.KERNEL_NOISE.search(line):
+                continue
+            self.write('kernel', line.rstrip())
+
+    def _android(self):
+        """The libraries log through Android's logger (/dev/log/main, see ozone-dtv)"""
+        try:
+            fd = os.open('/dev/log/main', os.O_RDONLY)
+        except OSError as e:
+            self.write('lib', '/dev/log/main: %s' % e.strerror)
+            return
+        while True:
+            try:
+                entry = logger_entry(os.read(fd, 5 * 1024))
+            except OSError:
+                return
+            # the logger keeps older entries: only this run's
+            if entry and entry[0] >= self.started - 2:
+                _sec, pid, prio, tag, msg = entry
+                self.write('lib', '%s%s(%d): %s' % ('VDIWEF'[prio - 2] + ' ' if 2 <= prio <= 7 else '', tag, pid, msg))
+
+
+LOG = Log()
+
+
 def notify(text):
     print(text, flush=True)
+    LOG.write('tv', text)
     if os.environ.get('DISPLAY'):
         subprocess.call(['ozone-notify', text], stderr=subprocess.DEVNULL)
+
+
+BUSY = None
+
+
+def busy(text):
+    """What this run is doing, for a second one that finds the lock taken"""
+    if BUSY:
+        BUSY.seek(0)
+        BUSY.truncate()
+        BUSY.write(text)
+        BUSY.flush()
+
+
+def say(text):
+    """To the terminal and the log, not the panel"""
+    print(text, flush=True)
+    LOG.write('tv', text)
+
+
+def pipe_to_log(stream, src):
+    def run():
+        for line in stream:
+            LOG.write(src, line.rstrip())
+    threading.Thread(target=run, daemon=True).start()
 
 
 # ---- frontend -------------------------------------------------------------------------------------
@@ -62,16 +214,26 @@ class Frontend:
     def __init__(self):
         # (Android's linker finds the libraries in /system/lib by itself)
         cmd = [DTVFE] if os.geteuid() == 0 else ['sudo', '-n', DTVFE]
+        t = time.monotonic()
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                                  stderr=subprocess.PIPE, text=True, bufsize=1)
+        pipe_to_log(self.p.stderr, 'dtvfe')
         reply = self.p.stdout.readline().split()
+        LOG.write('fe', 'start: %s (%.1f s)' % (' '.join(reply) or 'no reply, exit %s' % self.p.poll(),
+                                                time.monotonic() - t))
         if not reply or reply[0] != 'ready':
             raise RuntimeError('frontend: ' + (' '.join(reply) or 'dtvfe did not start'))
         self.khz = None
+        self.lock = threading.Lock()   # the signal monitor asks while the player runs
+        route_dvr()
 
     def _ask(self, line):
-        self.p.stdin.write(line + '\n')
-        reply = self.p.stdout.readline().split()
+        with self.lock:
+            t = time.monotonic()
+            self.p.stdin.write(line + '\n')
+            reply = self.p.stdout.readline().split()
+            LOG.write('fe', '%s -> %s (%.2f s)' % (line, ' '.join(reply) or 'no reply, exit %s' % self.p.poll(),
+                                                   time.monotonic() - t))
         if len(reply) != 4:
             raise RuntimeError('frontend: ' + (' '.join(reply) or 'dtvfe died'))
         return int(reply[1]), int(reply[2]), int(reply[3])
@@ -100,6 +262,20 @@ class Frontend:
             self.p.kill()
 
 
+def route_dvr():
+    """From the tuner input, TS-tap filters reach dvr0 through an asyncfifo (DMA) fed by the demux,
+    and nothing selects one after boot: without this, sections arrive but dvr0 stays empty"""
+    try:
+        with open(ASYNCFIFO_SOURCE) as f:
+            cur = f.read().strip()
+        if cur != 'dmx0':
+            with open(ASYNCFIFO_SOURCE, 'w') as f:
+                f.write('dmx0')
+        LOG.write('dmx', 'asyncfifo0 source: %r -> dmx0' % cur)
+    except OSError as e:
+        LOG.write('dmx', 'asyncfifo0 source: %s' % e)
+
+
 class TestFrontend:
     """--test: a TS file fed into demux0 from memory, looping, paced at OZONE_TV_TEST_RATE bit/s
     (default 7 M, the rate of the generated test multiplex)"""
@@ -107,6 +283,7 @@ class TestFrontend:
     def __init__(self, path):
         self.path = path
         self.khz = None
+        LOG.write('fe', 'test input: %s' % path)
         with open(DEMUX_SOURCE, 'w') as f:
             f.write('hiu')
         self.stop = threading.Event()
@@ -158,7 +335,8 @@ def read_sections(pid, table_id, ext=None, timeout=3.0):
                 break
             try:
                 sec = os.read(fd, 4096)
-            except OSError:   # timeout or overflow reported by the driver
+            except OSError as e:   # timeout or overflow reported by the driver
+                LOG.write('si', 'pid 0x%x table 0x%x: %s' % (pid, table_id, e.strerror))
                 break
             if len(sec) < 12 or not sec[5] & 1:   # not current_next
                 continue
@@ -166,7 +344,12 @@ def read_sections(pid, table_id, ext=None, timeout=3.0):
             last = sec[7]
             if last is not None and len(got) > last:
                 break
-        return [got[k] for k in sorted(got)]
+        secs = [got[k] for k in sorted(got)]
+        LOG.write('si', 'pid 0x%x table 0x%x%s: %s' % (pid, table_id, '' if ext is None else ' ext %d' % ext,
+                                                       '%d section(s)' % len(secs) if secs else 'nothing in %.0f s' % timeout))
+        for sec in secs:   # raw, for parsing again later
+            LOG.write('si', '  ' + sec.hex())
+        return secs
     finally:
         os.close(fd)
 
@@ -190,8 +373,8 @@ def dvb_text(b):
         text = b.decode(enc if enc != 'iso6937' else 'latin-1', errors='replace')
     except LookupError:
         text = b.decode('latin-1', errors='replace')
-    # emphasis and control codes (0x80-0x9f) out
-    return ''.join(c for c in text if not 0x80 <= ord(c) <= 0x9f).strip()
+    # emphasis and control codes (0x80-0x9f) out, and the NULs some broadcasters pad with
+    return ''.join(c for c in text if not 0x80 <= ord(c) <= 0x9f and c != '\0').strip()
 
 
 def descriptors(b):
@@ -274,6 +457,7 @@ def parse_nit_lcn(secs):
 def read_mux(khz, bw, plp):
     """The services of the multiplex the frontend is locked to"""
     progs = parse_pat(read_sections(0x00, 0x00))
+    LOG.write('tv', 'PAT: %s' % ', '.join('service %d -> PMT 0x%x' % kv for kv in sorted(progs.items())))
     if not progs:
         return []
     sdt = parse_sdt(read_sections(0x11, 0x42, timeout=4))
@@ -295,7 +479,41 @@ def read_mux(khz, bw, plp):
             'video': video, 'audio': audio,
             'lcn': lcn.get(sid),
         })
+    for c in found:
+        LOG.write('tv', 'service: %s' % json.dumps(c, ensure_ascii=False))
     return found
+
+
+def record_sample(services, path, seconds=SAMPLE_SECONDS):
+    """A few seconds of the multiplex (tables and every service's streams) for replaying with --test"""
+    # the demux has 32 filters (31 free): tables first, then whole services while they fit
+    pids = [0x00, 0x10, 0x11, 0x12, 0x14] + [c['pmt_pid'] for c in services]   # PAT NIT SDT EIT TDT, PMTs
+    for c in services:
+        more = [p for p in [c['pcr_pid']] + ([c['video']['pid']] if c['video'] else []) +
+                [a['pid'] for a in c['audio']] if p not in pids and p != 0x1fff]
+        if len(pids) + len(more) > 28:
+            break
+        pids += more
+    svc = Service({'pids': pids})
+    dvr = os.open(DVR, os.O_RDONLY | os.O_NONBLOCK)
+    size = 0
+    try:
+        with open(path, 'wb') as out:
+            end = time.monotonic() + seconds
+            while time.monotonic() < end:
+                if not select.select([dvr], [], [], 0.5)[0]:
+                    continue
+                try:
+                    data = os.read(dvr, 188 * 1024)
+                except (BlockingIOError, OSError):
+                    continue
+                out.write(data)
+                size += len(data)
+    finally:
+        os.close(dvr)
+        svc.close()
+    LOG.write('tv', 'sample: %s, %.1f MB, %.1f Mbit/s over %d PIDs' % (os.path.basename(path), size / 1e6,
+                                                                     size * 8 / seconds / 1e6, len(pids)))
 
 
 # ---- channel list ---------------------------------------------------------------------------------
@@ -303,9 +521,19 @@ def read_mux(khz, bw, plp):
 def load_channels():
     try:
         with open(CHANNELS) as f:
-            return json.load(f)
+            channels = json.load(f)
     except (OSError, ValueError):
         return []
+    for c in channels:   # lists scanned before NULs were dropped
+        c['name'] = c['name'].replace('\0', '').strip()
+        c['provider'] = c.get('provider', '').replace('\0', '').strip()
+    return channels
+
+
+def lock_icon(c):
+    """Only for channels found encrypted when watched: the SDT's free_CA_mode ('scrambled') is set
+    on Zeonbud's services that Android shows without any card"""
+    return '  \U0001f512' if c.get('encrypted') else ''
 
 
 def save_channels(channels):
@@ -326,17 +554,27 @@ def open_frontend(test):
 
 def scan(freqs, test=None):
     """freqs: [(kHz, bandwidth MHz)]"""
+    notify('Scanning %d frequencies, about %d min…' % (len(freqs), max(1, round(len(freqs) * 4.5 / 60))))
     fe = open_frontend(test)
     found = []
     try:
         for n, (khz, bw) in enumerate(freqs, 1):
+            # on the panel too: a scan of the whole band takes minutes, mostly without any signal
+            notify('Scan %d/%d: %d MHz… (found %d)' % (n, len(freqs), khz // 1000, sum(1 for c in found if not c['radio'])))
+            busy('a channel scan is running (%d/%d)' % (n, len(freqs)))
             locked, strength, quality = fe.tune(khz, bw)
             label = '%d MHz (%d/%d)' % (khz // 1000, n, len(freqs))
             if not locked:
-                print('%s: no signal, level %d%%' % (label, strength), flush=True)
+                say('%s: no signal, level %d%%' % (label, strength))
                 continue
+            say('%s: locked, level %d%%, quality %d%%' % (label, strength, quality))
             services = read_mux(khz, bw, 0)
             found += services
+            if services and not test and LOG.dir:
+                try:
+                    record_sample(services, LOG.path('mux-%d.ts' % (khz // 1000)))
+                except OSError as e:
+                    LOG.write('tv', 'sample: %s' % e)
             tv = sum(1 for s in services if not s['radio'])
             notify('%s: signal %d%%, quality %d%%: %d TV, %d radio' %
                    (label, strength, quality, tv, len(services) - tv))
@@ -346,7 +584,8 @@ def scan(freqs, test=None):
     done = {s['freq_khz'] for s in found}
     channels = sort_channels([c for c in load_channels() if c['freq_khz'] not in done] + found)
     save_channels(channels)
-    notify('Scan finished: %d channels' % sum(1 for c in channels if not c['radio']))
+    tv = sum(1 for c in channels if not c['radio'])
+    notify('Scan finished: %d channels' % tv if tv else 'Scan finished: nothing found, check the antenna')
     return channels
 
 
@@ -356,13 +595,20 @@ class Service:
     """PES filters with TS output on one service's PIDs; while they exist, its packets reach dvr0"""
 
     def __init__(self, ch):
-        pids = {0x00, ch['pmt_pid'], ch['pcr_pid'], ch['video']['pid']} | {a['pid'] for a in ch['audio']}
+        pids = set(ch['pids']) if 'pids' in ch else (
+            {0x00, ch['pmt_pid'], ch['pcr_pid'], ch['video']['pid']} | {a['pid'] for a in ch['audio']})
         self.fds = []
         for pid in sorted(pids):
             fd = os.open(DEMUX, os.O_RDWR)
-            fcntl.ioctl(fd, DMX_SET_PES_FILTER, struct.pack('<H2xiiiI', pid, DMX_IN_FRONTEND, DMX_OUT_TS_TAP,
-                                                             DMX_PES_OTHER, DMX_IMMEDIATE_START))
+            try:
+                fcntl.ioctl(fd, DMX_SET_PES_FILTER, struct.pack('<H2xiiiI', pid, DMX_IN_FRONTEND, DMX_OUT_TS_TAP,
+                                                                 DMX_PES_OTHER, DMX_IMMEDIATE_START))
+            except OSError as e:   # out of filters, most likely
+                LOG.write('dmx', 'PES filter on 0x%x: %s' % (pid, e.strerror))
+                os.close(fd)
+                continue
             self.fds.append(fd)
+        LOG.write('dmx', 'PES filters on %s' % ' '.join('0x%x' % p for p in sorted(pids)))
 
     def close(self):
         for fd in self.fds:
@@ -380,11 +626,14 @@ def watch(index, test=None):
         index %= len(channels)
         while True:
             ch = channels[index]
+            LOG.write('tv', 'channel %d: %s' % (index + 1, json.dumps(ch, ensure_ascii=False)))
+            busy('watching %s' % ch['name'])
             if fe.khz != ch['freq_khz']:
                 locked, strength, _q = fe.tune(ch['freq_khz'], ch['bandwidth'], ch['plp'])
                 if not locked:
                     notify('%s: no signal (%d%%)' % (ch['name'], strength))
-            status = play(ch, index)
+            status = play(ch, index, fe)
+            LOG.write('tv', 'player exit status %s' % status)
             if status == 10:
                 index = (index + 1) % len(channels)
             elif status == 11:
@@ -395,19 +644,48 @@ def watch(index, test=None):
         fe.close()
 
 
-def play(ch, index):
+def monitor_signal(fe, stop):
+    """The signal every 3 s while watching, into the log"""
+    while not stop.wait(3):
+        try:
+            locked, strength, quality = fe.status()
+        except (RuntimeError, OSError) as e:
+            LOG.write('signal', str(e))
+            return
+        LOG.write('signal', '%s, level %d%%, quality %d%%' % ('locked' if locked else 'NO LOCK', strength, quality))
+
+
+def play(ch, index, fe=None):
     service = Service(ch)
     dvr = os.open(DVR, os.O_RDONLY | os.O_NONBLOCK)
     try:
         fcntl.ioctl(dvr, DMX_SET_BUFFER_SIZE, 4 << 20)
-    except OSError:
-        pass
-    title = '%d  %s%s' % (ch['lcn'] or index + 1, ch['name'], '  \U0001f512' if ch['scrambled'] else '')
-    player = subprocess.Popen(['amplay', '--live', '--program', str(ch['sid']), '--title', title, 'pipe:0'],
-                              stdin=subprocess.PIPE)
+    except OSError as e:
+        LOG.write('dmx', 'dvr buffer size: %s' % e.strerror)
+    title = '%d  %s%s' % (ch['lcn'] or index + 1, ch['name'], lock_icon(ch))
+    player = subprocess.Popen(['amplay', '-v', '--live', '--program', str(ch['sid']), '--title', title, 'pipe:0'],
+                              stdin=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors='replace')
+    pipe_to_log(player.stderr, 'amplay')
+    stop = threading.Event()
+    if fe:
+        threading.Thread(target=monitor_signal, args=(fe, stop), daemon=True).start()
     out = player.stdin.fileno()
+    # what came out of the demux, every 5 s: no data means no signal or wrong PIDs
+    got, overflows, since = 0, 0, time.monotonic()
+    started, total = time.monotonic(), 0
+    vpid = ch['video']['pid'] if ch.get('video') else None
+    checked, scrambled = 0, 0   # video packets looked at, and how many had scrambling bits
     try:
         while player.poll() is None:
+            if time.monotonic() - since >= 5:
+                LOG.write('dvr', '%.2f Mbit/s, %d overflow(s)' % (got * 8 / (time.monotonic() - since) / 1e6, overflows))
+                got, overflows, since = 0, 0, time.monotonic()
+            if (not checked if vpid is not None else not total) and time.monotonic() - started > NO_DATA_TIMEOUT:
+                # amplay is still waiting for the picture, with nothing on screen
+                notify('%s: no %s from the tuner' % (ch['name'], 'video' if total else 'data'))
+                LOG.write('tv', 'gave up: %d bytes in %d s, none of them video' % (total, NO_DATA_TIMEOUT))
+                player.terminate()
+                break
             if not select.select([dvr], [], [], 0.5)[0]:
                 continue
             try:
@@ -415,12 +693,29 @@ def play(ch, index):
             except BlockingIOError:
                 continue
             except OSError:   # EOVERFLOW: the reader fell behind, the driver dropped data
+                overflows += 1
                 continue
+            got += len(data)
+            total += len(data)
+            if vpid is not None and checked < 2000:
+                for i in range(0, len(data) - 187, 188):
+                    if data[i] == 0x47 and ((data[i + 1] & 0x1f) << 8 | data[i + 2]) == vpid:
+                        checked += 1
+                        scrambled += bool(data[i + 3] & 0xc0)   # transport_scrambling_control
+                if checked >= 2000:
+                    encrypted = scrambled > checked // 2
+                    LOG.write('tv', 'video packets: %d of %d scrambled' % (scrambled, checked))
+                    remember_encrypted(ch, encrypted)
+                    if encrypted:
+                        notify('%s is encrypted: it needs the provider\'s card' % ch['name'])
+                        player.terminate()
+                        break
             try:
                 os.write(out, data)
             except BrokenPipeError:
                 break
     finally:
+        stop.set()
         os.close(dvr)
         service.close()
         try:
@@ -432,9 +727,18 @@ def play(ch, index):
     return status
 
 
+def remember_encrypted(ch, encrypted):
+    ch['encrypted'] = encrypted
+    channels = load_channels()
+    for c in channels:
+        if c['freq_khz'] == ch['freq_khz'] and c['sid'] == ch['sid']:
+            c['encrypted'] = encrypted
+    save_channels(channels)
+
+
 def menu(test=None):
     channels = [c for c in load_channels() if not c['radio']]
-    lines = ['%3d  %s%s' % (c['lcn'] or i + 1, c['name'], '  \U0001f512' if c['scrambled'] else '')
+    lines = ['%3d  %s%s' % (c['lcn'] or i + 1, c['name'], lock_icon(c))
              for i, c in enumerate(channels)]
     lines.append('     ⟳  Scan channels')
     r = subprocess.run(['rofi', '-dmenu', '-i', '-format', 'i', '-p', '  TV'], input='\n'.join(lines),
@@ -442,6 +746,7 @@ def menu(test=None):
     if r.returncode or not r.stdout.strip():
         return 0
     i = int(r.stdout)
+    LOG.write('tv', 'menu: %s' % ('scan' if i == len(channels) else 'channel %d' % (i + 1)))
     if i == len(channels):
         scan(uhf(21, 60), test) if not test else scan([(0, 8)], test)
         return menu(test)
@@ -453,29 +758,85 @@ def uhf(first, last):
     return [(306000 + 8000 * ch, 8) for ch in range(first, last + 1)]
 
 
+def logger_entry(buf):
+    """One Android logger v1 entry: (sec, pid, priority, tag, message), or None"""
+    if len(buf) < 20:
+        return None
+    n, _pad, pid, _tid, sec, _nsec = struct.unpack_from('<HHiiii', buf)
+    payload = buf[20:20 + n]
+    tag, _, msg = payload[1:].partition(b'\0')
+    return (sec, pid, payload[0] if payload else 0, tag.decode(errors='replace'),
+            msg.rstrip(b'\0\n').decode(errors='replace'))
+
+
 def show_log():
     """Android logger v1 entries from /dev/log/main"""
     fd = os.open('/dev/log/main', os.O_RDONLY | os.O_NONBLOCK)
     while True:
         try:
-            buf = os.read(fd, 5 * 1024)
+            entry = logger_entry(os.read(fd, 5 * 1024))
         except BlockingIOError:
             break
-        if not buf:
+        if not entry:
             break
-        n, _pad, pid, _tid, sec, nsec = struct.unpack_from('<HHiiii', buf)
-        payload = buf[20:20 + n]
-        tag, _, msg = payload[1:].partition(b'\0')
-        print('%s %s(%d): %s' % (time.strftime('%H:%M:%S', time.localtime(sec)), tag.decode(errors='replace'),
-                                 pid, msg.rstrip(b'\0\n').decode(errors='replace')))
+        sec, pid, _prio, tag, msg = entry
+        print('%s %s(%d): %s' % (time.strftime('%H:%M:%S', time.localtime(sec)), tag, pid, msg))
+
+
+def show_logs():
+    runs = sorted(n for n in os.listdir(LOGS) if n.startswith('tv-')) if os.path.isdir(LOGS) else []
+    print(LOGS)
+    for n in runs:
+        print('  ' + n)
+    if runs:
+        print(os.path.join(LOGS, runs[-1], 'tv.log'))
 
 
 def main(argv):
+    args = argv[1:]
+    if '--test' in args:
+        i = args.index('--test')
+        del args[i:i + 2]
+    cmd = args[0] if args else 'menu'
+    if cmd in ('log', 'logs'):
+        return show_log() if cmd == 'log' else show_logs()
+    # one at a time: a second run would start a second dtvfe on the same tuner
+    os.makedirs(DATA, exist_ok=True)
+    global BUSY
+    lock = open(LOCK, 'a+')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock.seek(0)
+        notify('TV is busy: %s' % (lock.read().strip() or 'another ozone-tv is running'))
+        return 1
+    BUSY = lock
+    busy('the channel list is open' if cmd == 'menu' else 'ozone-tv ' + cmd)
+    LOG.start(cmd + ('-test' if '--test' in argv else ''))
+    try:
+        return run(argv)
+    except SystemExit as e:
+        LOG.write('tv', 'exit %s' % e.code)
+        raise
+    except KeyboardInterrupt:
+        return 130
+    except BaseException as e:
+        LOG.write('tv', traceback.format_exc())
+        notify('TV error: %s' % e)
+        raise
+    finally:
+        LOG.write('tv', 'done')
+        LOG.close()
+
+
+def run(argv):
+    global CHANNELS
     test = None
     if '--test' in argv:
         i = argv.index('--test')
         test = argv[i + 1]
         del argv[i:i + 2]
+        CHANNELS = os.path.join(DATA, 'channels-test.json')   # the real list stays as it is
     cmd = argv[1] if len(argv) > 1 else 'menu'
     if cmd == 'menu':
         return menu(test)
@@ -506,9 +867,6 @@ def main(argv):
             return 0
         finally:
             fe.close()
-    if cmd == 'log':
-        show_log()
-        return 0
     sys.exit(__doc__)
 
 

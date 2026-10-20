@@ -31,7 +31,12 @@ start)
     # modern Xorg no longer supports 24 bit
     fbset -fb /dev/fb0 -g 1280 720 1280 1440 16 -rgba 5/11,6/5,5/0,0/0
     echo 0 0 1279 719 > $FB/fb0/free_scale_axis
-    echo 0 0 1919 1079 > $FB/fb0/window_axis
+    # into the whole 1080p output, or a window inside it for screens that cut off the edges
+    # (ozone-screen keeps the margins in /etc/ozone/screen; amplay puts the video there too)
+    h=0 v=0
+    [ -r /etc/ozone/screen ] && read h v < /etc/ozone/screen
+    case "$h$v" in *[!0-9]*|'') h=0 v=0 ;; esac
+    echo $h $v $((1919 - h)) $((1079 - v)) > $FB/fb0/window_axis
     echo 0x10001 > $FB/fb0/free_scale
     dd if=/dev/zero of=/dev/fb0 bs=1M count=8 2>/dev/null
     # u-boot's logo sits on fb1 in memory the kernel doesn't reserve, so take it over on fb0
@@ -44,6 +49,10 @@ start)
     # Without udev the kernel creates device nodes for root only; set permissions as in regular Debian
     chgrp -R audio /dev/snd && chmod -R g+rw /dev/snd
     chgrp video /dev/fb0 /dev/fb1 && chmod g+rw /dev/fb0 /dev/fb1
+    # ozone-screen, as the regular user
+    [ -e /etc/ozone/screen ] || echo 0 0 > /etc/ozone/screen
+    chgrp video /etc/ozone/screen $FB/fb0/window_axis $FB/fb0/free_scale &&
+        chmod g+w /etc/ozone/screen $FB/fb0/window_axis $FB/fb0/free_scale
     chgrp input /dev/input/* && chmod g+rw /dev/input/*
 
     # Hardware video decoder (amplay): the stream ports and the sysfs knobs it drives

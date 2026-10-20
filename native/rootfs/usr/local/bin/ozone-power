@@ -5,14 +5,16 @@ choice=$(printf '%s\n' \
     "  Sleep (a key or mouse click wakes it)" \
     "  Android (T2, SmartTube)" \
     "  Restart desktop" \
+    "  Screen size (edges cut off)" \
     "  Reboot" \
     "  Power off (unplug to turn back on)" |
-    rofi -dmenu -i -p "  Power" -theme-str 'listview { lines: 5; }')
+    rofi -dmenu -i -p "  Power" -theme-str 'listview { lines: 6; }')
 
 case "$choice" in
 *Sleep*)            sudo ozone-standby ;;
 *Android*)          reboot-android ;;
 *desktop*)          bspc quit ;;
+*Screen*)           ozone-screen ;;
 *Reboot*)           sudo reboot ;;
 *"Power off"*)      sudo poweroff ;;
 esac

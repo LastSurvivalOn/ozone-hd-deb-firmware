@@ -293,7 +293,7 @@ static int fr_auto_off(void)
 
 static void display_on(void)
 {
-    char mode[32] = "", axis[64];
+    char mode[32] = "", axis[64], line[96] = "";
     FILE *f = fopen(SYS "display/mode", "r");
     if (f) {
         if (!fgets(mode, sizeof mode, f))
@@ -308,6 +308,16 @@ static void display_on(void)
     else if (!strncmp(mode, "480", 3))
         w = 720, h = 480;
     snprintf(axis, sizeof axis, "0 0 %d %d", w - 1, h - 1);
+    /* where the scaler puts the desktop: inside the edges on screens that cut them off
+       (ozone-screen); the video goes into the same window. Reads "window axis is [x0 y0 x1 y1]". */
+    f = fopen(SYS "graphics/fb0/window_axis", "r");
+    if (f) {
+        int x0, y0, x1, y1;
+        const char *p = fgets(line, sizeof line, f) ? strchr(line, '[') : NULL;
+        if (p && sscanf(p + 1, "%d %d %d %d", &x0, &y0, &x1, &y1) == 4 && x1 > x0 && y1 > y0)
+            snprintf(axis, sizeof axis, "%d %d %d %d", x0, y0, x1, y1);
+        fclose(f);
+    }
 
     sysfs_write(SYS "video/axis", axis);
     sysfs_write(SYS "video/screen_mode", "0");    /* keep the aspect ratio */

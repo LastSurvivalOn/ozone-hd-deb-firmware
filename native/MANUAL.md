@@ -33,8 +33,25 @@ item with the arrows and Enter, or click it. Esc closes the menu.
 | Sleep | Turns the screen off. Press any key or click a mouse button to wake it. Waking is instant. The network keeps working while it sleeps. Quit the video player first: it doesn't stop by itself. |
 | Android | Closes Linux and starts the original Android (the stock TV app, SmartTube). |
 | Restart desktop | Restarts the graphical session. Open windows close. Use it when something hangs (see section 9). |
+| Screen size | Fits the picture to a screen that cuts off its edges, see below. |
 | Reboot | Restarts the box into Linux. |
 | Power off | Stops the system and turns off the screen. The box itself can't cut its own power, so it stays powered until you unplug it. To turn it on again, unplug it and plug it back in. |
+
+**Screen size.** Some TVs and monitors cut off the edges of the picture: the panel at the top or
+the bottom of the player is half hidden. Open ⏻ → **Screen size** (or "Screen size" in the app
+menu). A purple frame with arrows in the corners appears:
+
+| Keys | Action |
+|---|---|
+| **←** / **→** | narrower / wider |
+| **↑** / **↓** | taller / shorter |
+| **+** / **−** | all edges at once |
+| **R** | back to the full size |
+| **Enter** | save |
+| **Esc** | cancel |
+
+Make the frame and the corner arrows just visible at the edges, then press Enter. The setting is
+kept across reboots, and videos fit into the same area. For another screen, adjust it again.
 
 **From Android back to Linux:** restart the box from Android, or unplug it and plug it back in.
 Linux always starts by default.
@@ -164,9 +181,14 @@ keyboard that has them do the same as the keys above.
 
 Open it with **Super+T** or the screen icon on the panel. An antenna must be connected to the box.
 
-**The first time**, choose **⟳ Scan channels** at the end of the list. The scan checks every
-frequency, which takes 2–3 minutes. When it finishes, the panel shows "Scan finished: N channels",
-and the list fills up. Scan again if you move the antenna or channels change.
+**The first time**, choose **⟳ Scan channels** at the end of the list. The scan checks 40
+frequencies, about 3 minutes in all. The panel shows the progress, for example "Scan 12/40: 570 MHz…
+(found 6)". When it finishes, the panel shows "Scan finished: N channels", and the channel list
+opens again. "Nothing found" means no signal on any frequency: check the antenna and its cable.
+Scan again if you move the antenna or channels change.
+
+Only one TV window can run at a time. If you open TV again during a scan, the panel says "TV is
+busy: a channel scan is running".
 
 **Watching:** choose a channel in the list (type part of the name to filter it) and press Enter.
 
@@ -255,7 +277,7 @@ Sound comes out of the TV over HDMI.
 | Super+Y | YouTube |
 | Super+W | browser |
 | Super+T | television |
-| Super+Shift+E | power menu (sleep, Android, restart, power off) |
+| Super+Shift+E | power menu (sleep, Android, restart, screen size, power off) |
 | Super+Esc | reload the key bindings |
 | Super+Q | close the window |
 | Super+F | full screen |

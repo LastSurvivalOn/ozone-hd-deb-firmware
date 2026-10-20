@@ -1,0 +1,192 @@
+#!/usr/bin/python3
+"""ozone-screen: fits the picture to a TV or monitor that cuts off its edges (overscan).
+
+The 1280x720 desktop is stretched by the hardware scaler to the 1080p output; this moves the
+scaler's output window (/sys/class/graphics/fb0/window_axis) in from the edges, so nothing is cut
+off. Video follows: amplay puts the video layer in the same window. The margins are kept in
+/etc/ozone/screen ("horizontal vertical", in 1080p pixels) and applied at boot by ozone-hw.
+
+  ozone-screen          full-screen frame to fit with the keys
+  ozone-screen H V      set the margins directly
+  ozone-screen reset    no margins
+
+Keys: ← / → narrower / wider, ↑ / ↓ taller / shorter, + / - all edges, Enter save, Esc cancel,
+R no margins.
+"""
+import os
+import re
+import sys
+
+CONF = '/etc/ozone/screen'
+FB = '/sys/class/graphics/fb0'
+W, H = 1920, 1080
+STEP = 6
+MAX_H, MAX_V = 240, 135
+
+
+def load():
+    try:
+        with open(CONF) as f:
+            h, v = (int(x) for x in f.read().split()[:2])
+        return h, v
+    except (OSError, ValueError):
+        return 0, 0
+
+
+def apply(h, v):
+    """The scaler draws the desktop into this window, the rest of the output stays black"""
+    with open(FB + '/window_axis', 'w') as f:
+        f.write('%d %d %d %d' % (h, v, W - 1 - h, H - 1 - v))
+    with open(FB + '/free_scale', 'w') as f:
+        f.write('0x10001')   # the window only takes effect when scaling is (re)enabled
+
+
+def save(h, v):
+    with open(CONF, 'w') as f:
+        f.write('%d %d\n' % (h, v))
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def clamp(h, v):
+    return max(0, min(MAX_H, h)), max(0, min(MAX_V, v))
+
+
+CSS = b'''
+* { font-family: "DejaVu Sans"; color: #cdd6f4; }
+window { background: #11111b; }
+.frame { border: 6px solid #cba6f7; }
+.corner { font-size: 40px; color: #cba6f7; margin: 10px; }
+.title { font-size: 26px; font-weight: bold; }
+.help { font-family: "JetBrains Mono"; font-size: 17px; color: #a6adc8; }
+.value { font-family: "JetBrains Mono"; font-size: 17px; color: #f9e2af; }
+button { font-size: 16px; background: #1e1e2e; border: 1px solid #313244; border-radius: 8px;
+         padding: 8px 18px; box-shadow: none; }
+button:hover { border-color: #cba6f7; }
+'''
+
+
+def window():
+    import gi
+    gi.require_version('Gtk', '3.0')
+    gi.require_version('Gdk', '3.0')
+    from gi.repository import Gdk, GLib, Gtk
+
+    saved = load()
+    state = {'h': saved[0], 'v': saved[1]}
+
+    # GTK's CSS parser loses the first number of the first stylesheet to a stale errno (see yt)
+    try:
+        Gtk.CssProvider().load_from_data(b'* { padding: 0px; }')
+    except GLib.Error:
+        pass
+    style = Gtk.CssProvider()
+    style.load_from_data(CSS)
+    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), style,
+                                             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    win = Gtk.Window(title='Screen size')
+    overlay = Gtk.Overlay()
+    frame = Gtk.Box()
+    frame.get_style_context().add_class('frame')
+    overlay.add(frame)
+    # arrows into the corners: they have to be visible, just touching the edges of the screen
+    for text, ha, va in (('◤', Gtk.Align.START, Gtk.Align.START), ('◥', Gtk.Align.END, Gtk.Align.START),
+                         ('◣', Gtk.Align.START, Gtk.Align.END), ('◢', Gtk.Align.END, Gtk.Align.END)):
+        c = Gtk.Label(label=text, halign=ha, valign=va)
+        c.get_style_context().add_class('corner')
+        overlay.add_overlay(c)
+
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18, halign=Gtk.Align.CENTER,
+                  valign=Gtk.Align.CENTER)
+    title = Gtk.Label(label='Fit the purple frame to the edges of the screen')
+    title.get_style_context().add_class('title')
+    box.pack_start(title, False, False, 0)
+    help_ = Gtk.Label(label='← →  narrower / wider        ↑ ↓  taller / shorter\n'
+                            '+ −  all edges                R  no margins\n'
+                            'Enter  save                   Esc  cancel', justify=Gtk.Justification.LEFT)
+    help_.get_style_context().add_class('help')
+    box.pack_start(help_, False, False, 0)
+    value = Gtk.Label()
+    value.get_style_context().add_class('value')
+    box.pack_start(value, False, False, 0)
+    buttons = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
+    box.pack_start(buttons, False, False, 0)
+    overlay.add_overlay(box)
+    win.add(overlay)
+
+    def show():
+        value.set_text('margins: %d px left and right, %d px top and bottom' % (state['h'], state['v']))
+
+    def change(dh, dv, absolute=False):
+        h, v = clamp(dh, dv) if absolute else clamp(state['h'] + dh, state['v'] + dv)
+        state['h'], state['v'] = h, v
+        try:
+            apply(h, v)
+        except OSError as e:
+            value.set_text('cannot set the window: %s' % e.strerror)
+            return
+        show()
+
+    def finish(keep):
+        try:
+            if keep:
+                save(state['h'], state['v'])
+            else:
+                apply(*saved)
+        except OSError as e:
+            print('ozone-screen: %s' % e, file=sys.stderr)
+        Gtk.main_quit()
+
+    for label, action in (('Save', lambda b: finish(True)), ('Cancel', lambda b: finish(False)),
+                          ('No margins', lambda b: change(0, 0, True))):
+        b = Gtk.Button(label=label)
+        b.connect('clicked', action)
+        buttons.pack_start(b, False, False, 0)
+
+    keys = {'Left': (STEP, 0), 'Right': (-STEP, 0), 'Up': (0, -STEP), 'Down': (0, STEP),
+            'plus': (-STEP, -STEP), 'equal': (-STEP, -STEP), 'KP_Add': (-STEP, -STEP),
+            'minus': (STEP, STEP), 'KP_Subtract': (STEP, STEP)}
+
+    def on_key(w, ev):
+        k = Gdk.keyval_name(ev.keyval)
+        if k in keys:
+            change(*keys[k])
+        elif k in ('Return', 'KP_Enter'):
+            finish(True)
+        elif k == 'Escape':
+            finish(False)
+        elif k in ('r', 'R'):
+            change(0, 0, True)
+        else:
+            return False
+        return True
+
+    win.connect('key-press-event', on_key)
+    win.connect('delete-event', lambda w, e: finish(False) or True)
+    show()
+    win.fullscreen()
+    win.show_all()
+    Gtk.main()
+
+
+def main(argv):
+    if len(argv) == 1:
+        return window()
+    if argv[1] == 'reset':
+        h, v = 0, 0
+    elif len(argv) == 3 and all(re.fullmatch(r'\d+', a) for a in argv[1:]):
+        h, v = clamp(int(argv[1]), int(argv[2]))
+    elif argv[1] == 'apply':   # at boot (ozone-hw)
+        h, v = load()
+        apply(h, v)
+        return 0
+    else:
+        sys.exit(__doc__)
+    apply(h, v)
+    save(h, v)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
