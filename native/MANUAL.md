@@ -210,9 +210,9 @@ information").
 
 | Keys in the TV window | Action |
 |---|---|
-| **↑ / ↓** | choose a channel |
-| **Enter** or a click | watch it |
-| **→** | into the guide (↑ / ↓ there shows each programme's full description) |
+| **↑ / ↓** or a click | choose a channel: its guide appears on the right |
+| **Enter** or a double click | watch it |
+| **→** | into the guide (↑ / ↓ or a click there shows each programme's full description) |
 | **←** | back to the channels |
 | **Esc** | close the window |
 
@@ -360,8 +360,8 @@ Sound comes out of the TV over HDMI.
 ### TV window
 | Keys | Action |
 |---|---|
-| ↑ / ↓ | choose a channel |
-| Enter | watch |
+| ↑ / ↓, a click | choose a channel and see its guide |
+| Enter, a double click | watch |
 | → / ← | into the guide / back to the channels |
 | Esc | close |
 

@@ -77,6 +77,16 @@ mount)
 start)
     # Android-side logs for the TV work (android-log.sh), independent of Debian
     [ -f /data/linux/android-log.sh ] && $BB setsid /system/bin/sh /data/linux/android-log.sh > /dev/null 2>&1 &
+    # Android starts with WiFi off whenever it was off at the last boot (and com.android.settingsEx
+    # then turns Ethernet on instead); the box lives on WiFi, so it goes on once Android is up. Twice:
+    # settingsEx's boot receiver may turn it off again right after the first time.
+    (
+        while [ "$(/system/bin/getprop sys.boot_completed)" != 1 ]; do $BB sleep 2; done
+        for i in 1 2; do
+            /system/bin/svc wifi enable
+            $BB sleep 10
+        done
+    ) > /dev/null 2>&1 &
     do_mount || { echo "failed to mount $IMG"; exit 1; }
     # Below the lowmemorykiller threshold (it only touches >= 0), but the kernel OOM killer can still kill it
     echo -100 > /proc/self/oom_score_adj

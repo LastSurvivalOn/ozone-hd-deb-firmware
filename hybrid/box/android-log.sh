@@ -5,6 +5,8 @@
 # everything goes to /data/linux/logs/android-N/ (from native Linux: /mnt/nand/linux/logs/).
 # Started at boot by ozlinux.sh start (installed at /data/linux/android-log.sh); the last 5 boots
 # are kept.
+# ozlinux.sh runs this with Debian's PATH, where Android's tools are not
+export PATH=/system/bin:/system/xbin
 BB=/system/xbin/busybox
 D=/data/linux/logs
 mkdir -p $D
