@@ -1,0 +1,13 @@
+# Default behaviour of shutdown -h / halt. Set to "halt" or "poweroff".
+# ozone: this kernel implements power off as a reboot (meson_power_off restarts with reason
+# "charging_reboot" and u-boot boots straight through), so the CPU is stopped instead. By then
+# ozone-hw has switched HDMI off. Plugging the box back in turns it on.
+HALT=halt
+# `poweroff` and `shutdown -P` export INIT_HALT=POWEROFF, which /etc/init.d/halt prefers over HALT;
+# this file is sourced by that script, so override it too
+INIT_HALT=HALT
+
+# Bring networking down right before halting/rebooting system. You
+# should only need this to handle issues with Wake-on-LAN or network
+# filesystems.  Set to "yes" or "no".
+NETDOWN=yes

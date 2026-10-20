@@ -4,7 +4,7 @@
 # Required-Start:    kmod
 # Required-Stop:
 # Default-Start:     S
-# Default-Stop:
+# Default-Stop:      0
 # Short-Description: Box hardware: CPU, temperature, display
 # Description:       Does what init.amlogic*.rc and set_display_mode.sh do in Android.
 ### END INIT INFO
@@ -47,7 +47,15 @@ start)
     echo "rm default" > /sys/class/vfm/map
     echo "add default decoder ppmgr deinterlace amvideo" > /sys/class/vfm/map
     ;;
-stop|restart|force-reload|status)
+stop)
+    # Halt: the box can't cut its own power (see /etc/default/halt), so at least switch HDMI off and
+    # let the TV show "no signal". Early suspend does that; the wakelock keeps it from going deeper.
+    if [ "$RUNLEVEL" = 0 ]; then
+        echo ozone-halt > /sys/power/wake_lock
+        echo mem > /sys/power/state
+    fi
+    ;;
+restart|force-reload|status)
     ;;
 *)
     echo "usage: $0 start" >&2

@@ -45,6 +45,7 @@ ssh_box 'set -e
     sudo sed -i "s/^DAEMON_OPTS=.*/DAEMON_OPTS=\"-F 0\"/" /etc/default/chrony
     sudo depmod -a '$KVER'
     grep -qx aml_thermal /etc/modules || echo aml_thermal | sudo tee -a /etc/modules >/dev/null
-    sudo update-rc.d ozone-hw defaults
+    # remove first: insserv keeps the runlevels of existing links over changed LSB headers
+    sudo update-rc.d ozone-hw remove && sudo update-rc.d ozone-hw defaults
     ls -l /usr/sbin/init /lib/modules/'$KVER'/extra/'
 echo ">> done"

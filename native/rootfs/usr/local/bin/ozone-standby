@@ -1,0 +1,92 @@
+#!/usr/bin/python3
+"""Standby: switches off HDMI and waits for any key or mouse button, then turns the screen back on.
+
+The S805 has no PMIC that could cut its power. Deep suspend (what stock Android calls power off)
+powers USB down and wakes only on the IR remote, the front button or the RTC. So this uses only
+Android's early suspend instead: writing "mem" to /sys/power/state while holding a wakelock runs the
+early-suspend handlers (HDMI, OSD, CPU clock down) but never suspends the kernel. USB keyboards,
+mice and the network keep working. Input devices are grabbed while asleep, so the wake-up press
+never reaches X.
+"""
+import fcntl
+import os
+import selectors
+import signal
+import subprocess
+import sys
+
+from evdev import InputDevice, ecodes, list_devices
+
+NAME = 'ozone-standby'
+POWER = '/sys/power'
+
+
+def write(path, value):
+    with open(path, 'w') as f:
+        f.write(value)
+
+
+def grab_inputs():
+    devices = []
+    for path in list_devices():
+        try:
+            dev = InputDevice(path)
+        except OSError:
+            continue
+        # ozone-kbd is fed by kbd-merge from the physical keyboards, which are grabbed below
+        if dev.name == 'ozone-kbd' or ecodes.EV_KEY not in dev.capabilities():
+            dev.close()
+            continue
+        try:
+            dev.grab()
+        except OSError:
+            pass  # held by someone else: its events still reach us
+        devices.append(dev)
+    return devices
+
+
+def wait_for_press(devices):
+    sel = selectors.DefaultSelector()
+    for dev in devices:
+        sel.register(dev, selectors.EVENT_READ)
+    while True:
+        for key, _ in sel.select():
+            try:
+                events = key.fileobj.read()
+            except OSError:  # unplugged
+                sel.unregister(key.fileobj)
+                continue
+            # keys, mouse buttons and the remote, but not mouse movement
+            if any(e.type == ecodes.EV_KEY and e.value == 1 for e in events):
+                return
+
+
+def main():
+    if not os.path.exists('/etc/ozone/is-native') or subprocess.call('/etc/ozone/is-native'):
+        sys.exit('standby only works in native Linux (under Android, use Android)')
+    if os.geteuid():
+        os.execvp('sudo', ['sudo', sys.argv[0]] + sys.argv[1:])
+
+    lock = open(f'/run/{NAME}.lock', 'w')
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit('already in standby')
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    # Nobody is watching: stop video instead of decoding it into a switched-off screen
+    subprocess.call(['pkill', '-x', 'mpv'])
+    devices = grab_inputs()
+    write(f'{POWER}/wake_lock', NAME)
+    try:
+        write(f'{POWER}/state', 'mem')
+        wait_for_press(devices)
+    finally:
+        write(f'{POWER}/state', 'on')
+        write(f'{POWER}/wake_unlock', NAME)
+        for dev in devices:
+            dev.close()
+
+
+if __name__ == '__main__':
+    main()

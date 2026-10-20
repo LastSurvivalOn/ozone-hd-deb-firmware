@@ -2,13 +2,15 @@
 # Power menu for the panel and sxhkd
 
 choice=$(printf '%s\n' \
+    "  Sleep (a key or mouse click wakes it)" \
     "  Android (T2, SmartTube)" \
     "  Restart desktop" \
     "  Reboot" \
-    "  Power off" |
-    rofi -dmenu -i -p "  Power" -theme-str 'listview { lines: 4; }')
+    "  Power off (unplug to turn back on)" |
+    rofi -dmenu -i -p "  Power" -theme-str 'listview { lines: 5; }')
 
 case "$choice" in
+*Sleep*)            sudo ozone-standby ;;
 *Android*)          reboot-android ;;
 *desktop*)          bspc quit ;;
 *Reboot*)           sudo reboot ;;
