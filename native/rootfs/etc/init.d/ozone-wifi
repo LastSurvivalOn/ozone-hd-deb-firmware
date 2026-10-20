@@ -1,0 +1,61 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          ozone-wifi
+# Required-Start:    $local_fs ozone-hw
+# Required-Stop:     $local_fs
+# Should-Start:      networking
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: WiFi (Realtek 8189ES) and switching between the cable and WiFi
+### END INIT INFO
+
+# Under Android, Android runs the WiFi
+/etc/ozone/is-native || exit 0
+
+CONF=/etc/wpa_supplicant/ozone.conf
+MODULE=/lib/modules/3.10.33/extra/8189es.ko
+LIB=/usr/local/lib/ozone
+
+case "$1" in
+start)
+    # Power to the chip as Android's WiFi HAL does it (set_wifi_power): POWER_UP, _IO('m', 1), on
+    # /dev/wifi_power. The SDIO card then shows up and the vendor driver takes it.
+    python3 -c 'import fcntl, os; fcntl.ioctl(os.open("/dev/wifi_power", os.O_RDWR), 0x6d01)'
+    grep -q '^8189es ' /proc/modules || insmod $MODULE ifname=wlan0 if2name=p2p0
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        [ -e /sys/class/net/wlan0 ] && break
+        sleep 0.5
+    done
+    [ -e /sys/class/net/wlan0 ] || { echo "ozone-wifi: no wlan0" >&2; exit 1; }
+    # the networks ozone-wifi saves, readable by root only (passwords)
+    mkdir -p /etc/wpa_supplicant
+    [ -s $CONF ] || printf 'ctrl_interface=DIR=/run/wpa_supplicant\nupdate_config=1\ncountry=UA\n' > $CONF
+    chmod 600 $CONF
+    ip link set wlan0 up
+    start-stop-daemon --start --quiet --pidfile /run/wpa_supplicant.wlan0.pid --exec /sbin/wpa_supplicant -- \
+        -B -P /run/wpa_supplicant.wlan0.pid -i wlan0 -D nl80211,wext -c $CONF -f /var/log/wpa_supplicant.log
+    # DHCP whenever it associates
+    start-stop-daemon --start --quiet --pidfile /run/wpa_cli.wlan0.pid --exec /sbin/wpa_cli -- \
+        -B -P /run/wpa_cli.wlan0.pid -i wlan0 -a $LIB/wifi-event
+    # and the cable: off its routes when pulled out, DHCP again when plugged back in
+    start-stop-daemon --start --quiet --background --make-pidfile --pidfile /run/ozone-netwatch.pid \
+        --exec /bin/sh -- $LIB/netwatch
+    ;;
+stop)
+    for p in ozone-netwatch wpa_cli.wlan0 wpa_supplicant.wlan0; do
+        start-stop-daemon --stop --quiet --pidfile /run/$p.pid --remove-pidfile
+    done
+    dhclient -x -pf /run/dhclient.wlan0.pid wlan0 2> /dev/null
+    ;;
+restart|force-reload)
+    $0 stop
+    $0 start
+    ;;
+status)
+    wpa_cli -i wlan0 status
+    ;;
+*)
+    echo "usage: $0 start|stop|restart|status" >&2
+    exit 3
+    ;;
+esac

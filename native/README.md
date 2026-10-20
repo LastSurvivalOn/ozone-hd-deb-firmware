@@ -33,7 +33,7 @@ Desktop packages:
 `xserver-xorg-core xserver-xorg-legacy xserver-xorg-video-fbdev xserver-xorg-input-evdev
 xserver-xorg-input-mouse xinit x11-xserver-utils x11-utils xfonts-base bspwm sxhkd polybar rofi
 feh rxvt-unicode fonts-jetbrains-mono fonts-font-awesome fonts-noto-color-emoji mpv alsa-utils
-python3 nodejs dbus-x11 python3-gi gir1.2-webkit2-4.1 gir1.2-gtk-3.0 libglib2.0-bin xdotool` (with `--no-install-recommends`), and to build amplay: `gcc libc6-dev make
+python3 nodejs dbus-x11 python3-gi gir1.2-webkit2-4.1 gir1.2-gtk-3.0 libglib2.0-bin xdotool wpasupplicant` (with `--no-install-recommends`), and to build amplay: `gcc libc6-dev make
 pkg-config libavformat-dev libavcodec-dev libswresample-dev libavutil-dev libasound2-dev libx11-dev
 libxft-dev`.
 
@@ -52,6 +52,23 @@ workspaces, CPU/memory/temperature/IP/volume/clock, power.
 | Super+Shift+E | power (sleep, Android, reboot, power off) |
 | Super+Q / F / S | close / fullscreen / floating |
 | Super+1…5 | workspaces |
+
+## WiFi
+
+`ozone-wifi` (the WiFi item on the panel, also in the app menu): the networks around in rofi, a
+password the first time, and saved networks connect again by themselves. The chip is a Realtek
+8189ES on SDIO, with Android's vendor driver (`8189es.ko`, copied by prepare-debian.sh).
+`/etc/init.d/ozone-wifi` starts it the way Android's WiFi HAL does:
+1. Power: ioctl `0x6d01` (`_IO('m', 1)`) on `/dev/wifi_power`. The SDIO card appears only after that.
+2. `insmod 8189es.ko ifname=wlan0 if2name=p2p0`.
+3. `wpa_supplicant` (nl80211) with `/etc/wpa_supplicant/ozone.conf`. It is root's file, and
+   passwords are stored as derived keys.
+4. A `wpa_cli` action script (`lib/ozone/wifi-event`) runs dhclient on association, with route
+   metric 600, so the cable wins when both are connected.
+
+`lib/ozone/netwatch` follows the cable. Kernel 3.10 keeps using a route whose link is down, so when
+the cable is pulled out it removes eth0's address and routes, and runs DHCP again when it comes
+back. Logs: `/var/log/wpa_supplicant.log`, `/var/log/netwatch.log`.
 
 ## Television (DVB-T/T2)
 

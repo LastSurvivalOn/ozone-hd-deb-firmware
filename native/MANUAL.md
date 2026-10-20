@@ -58,6 +58,19 @@ Linux always starts by default.
 
 ## 2. The desktop and the panel
 
+**WiFi.** Click **WiFi** on the panel (or "WiFi" in the app menu). After a few seconds a list of
+networks appears, strongest first:
+- the bars show the signal;
+- 🔒 means a password is needed;
+- **✓ connected** is the current network, and **saved** ones you've connected to before.
+
+Choose a network and type its password (once: it's remembered), then Enter. The panel shows
+"Connecting to …", then the network name and the box's address. Saved networks connect again by
+themselves after a reboot. The list also has **Rescan**, **Disconnect** and **Forget a network**.
+With both the cable and WiFi connected, the cable is used. When you pull the cable out, the box
+switches to WiFi within a few seconds.
+
+
 The panel is the bar along the top of the screen. From left to right:
 
 | Element | Click |
@@ -70,7 +83,8 @@ The panel is the bar along the top of the screen. From left to right:
 | yellow text | short messages: "Loading video…", "Scan finished", errors. They disappear after 6 s. |
 | centre | the title of the active window |
 | CPU %, memory, temperature | system load |
-| IP address | network status. It turns red ("offline") when there's no network. |
+| IP address | the cable connection (shown only with the cable plugged in) |
+| WiFi | the WiFi network the box is on. Click it to choose a network. It stays grey when not connected. |
 | 🔈 percentage | volume. Click to mute, scroll the wheel over it to change the volume. |
 | date and time | |
 | ⏻ | power menu |
@@ -265,7 +279,8 @@ Sound comes out of the TV over HDMI.
 | A black screen after turning on | Wait a minute. Failing that, unplug the box and plug it back in. |
 | The screen went dark by itself | It's asleep. Press a key or click the mouse. |
 | Everything is slow | Close unneeded browser tabs. If the temperature on the panel is high, give the box ventilation. |
-| No internet (red "offline" on the panel) | Check the WiFi router, then ⏻ → **Reboot**. |
+| No internet (no IP address or WiFi name on the panel) | Click **WiFi** on the panel and choose your network. If it doesn't connect, check the router, then ⏻ → **Reboot**. |
+| "Could not connect …: wrong password?" | Choose the network again and retype the password (letter case matters). |
 
 ## 10. All key combinations
 

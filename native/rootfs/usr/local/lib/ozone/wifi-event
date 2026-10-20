@@ -1,0 +1,14 @@
+#!/bin/sh
+# wpa_cli action script (ozone-wifi): $1 the interface, $2 CONNECTED or DISCONNECTED.
+# An address by DHCP while associated, none when not.
+PF=/run/dhclient.$1.pid
+case "$2" in
+CONNECTED)
+    dhclient -x -pf $PF $1 2> /dev/null
+    # metric 600: with the cable plugged in as well, the cable stays the way out
+    dhclient -nw -e IF_METRIC=600 -pf $PF -lf /var/lib/dhcp/dhclient.$1.leases $1
+    ;;
+DISCONNECTED)
+    dhclient -x -pf $PF $1 2> /dev/null
+    ;;
+esac

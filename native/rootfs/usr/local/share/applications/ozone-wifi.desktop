@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=WiFi
+Comment=Choose a WiFi network
+Exec=ozone-wifi
+Icon=network-wireless
+Terminal=false
+Categories=Settings;Network;

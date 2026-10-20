@@ -2,3 +2,4 @@
 # (Android handles them there). One init script name per line.
 chrony
 ozone-input
+ozone-wifi

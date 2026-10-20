@@ -1,0 +1,207 @@
+#!/usr/bin/python3
+"""ozone-wifi: choose a WiFi network (rofi), type its password once, and it's remembered.
+
+The networks around, strongest first, with the signal, a lock for those with a password, and the
+connected and saved ones marked. A saved network connects again by itself after a reboot. The
+menu also has Rescan, Disconnect and Forget. Behind it: wpa_supplicant on wlan0, started by
+/etc/init.d/ozone-wifi, through wpa_cli as root (passwords live in /etc/wpa_supplicant/ozone.conf,
+which is root's). Messages go to the panel.
+
+  ozone-wifi            the menu
+  ozone-wifi status     the connection, for scripts
+"""
+import re
+import subprocess
+import sys
+import time
+
+IFACE = 'wlan0'
+CONNECT_TIMEOUT = 25   # s for association and an address
+
+
+def notify(text):
+    print(text, flush=True)
+    subprocess.call(['ozone-notify', text], stderr=subprocess.DEVNULL)
+
+
+def cli(*args):
+    r = subprocess.run(['sudo', '-n', 'wpa_cli', '-i', IFACE] + list(args), capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def rofi(lines, prompt, password=False):
+    cmd = ['rofi', '-dmenu', '-i', '-format', 'i', '-p', prompt]
+    if password:
+        cmd = ['rofi', '-dmenu', '-password', '-p', prompt, '-theme-str', 'listview { lines: 0; }']
+    r = subprocess.run(cmd, input='\n'.join(lines), capture_output=True, text=True)
+    if r.returncode:
+        return None
+    return r.stdout.rstrip('\n') if password else int(r.stdout)
+
+
+def status():
+    s = dict(l.split('=', 1) for l in (cli('status') or '').splitlines() if '=' in l)
+    return s
+
+
+def unescape(ssid):
+    """wpa_cli prints non-ASCII bytes of an SSID as \\xNN"""
+    try:
+        return re.sub(rb'\\x([0-9a-f]{2})', lambda m: bytes([int(m.group(1), 16)]),
+                      ssid.encode('latin-1', 'backslashreplace')).decode('utf-8', 'replace')
+    except UnicodeEncodeError:
+        return ssid
+
+
+def scan():
+    cli('scan')
+    time.sleep(3.5)
+    nets = {}
+    for line in (cli('scan_results') or '').splitlines()[1:]:
+        f = line.split('\t')
+        if len(f) < 5 or not f[4]:
+            continue   # hidden networks
+        ssid, signal, flags = unescape(f[4]), int(f[2]), f[3]
+        if not ssid.strip('\0 '):
+            continue   # hidden ones that send their SSID as zero bytes
+        if ssid not in nets or signal > nets[ssid]['signal']:
+            nets[ssid] = {'ssid': ssid, 'raw': f[4], 'signal': signal,
+                          'secure': 'WPA' in flags or 'WEP' in flags, 'wep': 'WEP' in flags and 'WPA' not in flags}
+    return sorted(nets.values(), key=lambda n: -n['signal'])
+
+
+def saved():
+    """ssid -> network id"""
+    out = {}
+    for line in (cli('list_networks') or '').splitlines()[1:]:
+        f = line.split('\t')
+        if len(f) >= 2:
+            out[unescape(f[1])] = f[0]
+    return out
+
+
+def bars(dbm):
+    return '▂▄▆█'[:max(1, min(4, (dbm + 95) // 12))].ljust(4, ' ')
+
+
+def wait_connected(ssid):
+    """'ok' once associated with ssid and given an address; otherwise why not: 'password' (the
+    handshake never completed), 'address' (associated, but DHCP gave nothing) or 'timeout'"""
+    end = time.monotonic() + CONNECT_TIMEOUT
+    seen = set()
+    while time.monotonic() < end:
+        s = status()
+        state = s.get('wpa_state')
+        seen.add(state)
+        if state == 'COMPLETED' and s.get('ssid') and unescape(s['ssid']) == ssid and s.get('ip_address'):
+            return 'ok'
+        time.sleep(1)
+    return 'address' if 'COMPLETED' in seen else 'password' if '4WAY_HANDSHAKE' in seen else 'timeout'
+
+
+def connect(net, known):
+    ssid = net['ssid']
+    if ssid in known:
+        nid, new = known[ssid], False
+    else:
+        new = True
+        psk = None
+        if net['secure']:
+            if net['wep']:
+                notify('%s uses WEP, which is not supported here' % ssid)
+                return
+            pw = rofi([], '  Password for %s' % ssid, password=True)
+            if not pw:
+                return
+            if not 8 <= len(pw.encode()) <= 63:
+                notify('A WiFi password has 8 to 63 characters')
+                return
+            # stored as the derived key, not the password itself
+            r = subprocess.run(['wpa_passphrase', ssid], input=pw + '\n', capture_output=True, text=True)
+            m = re.search(r'^\s*psk=([0-9a-f]{64})$', r.stdout, re.M)
+            if not m:
+                notify('Could not use that password')
+                return
+            psk = m.group(1)
+        nid = cli('add_network')
+        if not nid or not nid.isdigit():
+            notify('WiFi is not running (sudo /etc/init.d/ozone-wifi start)')
+            return
+        cli('set_network', nid, 'ssid', ssid.encode().hex())
+        if psk:
+            cli('set_network', nid, 'psk', psk)
+        else:
+            cli('set_network', nid, 'key_mgmt', 'NONE')
+    notify('Connecting to %s…' % ssid)
+    cli('select_network', nid)
+    result = wait_connected(ssid)
+    # select_network turns the other saved networks off; they stay candidates for next time
+    cli('enable_network', 'all')
+    if result == 'ok':
+        cli('save_config')
+        notify('WiFi: %s, %s' % (ssid, status().get('ip_address', '')))
+        return
+    if result == 'address':   # the password was right: keep it, DHCP may still come
+        cli('save_config')
+        notify('WiFi: connected to %s, but no address from its router yet' % ssid)
+        return
+    if new:
+        cli('remove_network', nid)
+        cli('save_config')
+    notify('Could not connect to %s%s' % (ssid, ': wrong password?' if result == 'password' else ''))
+
+
+def menu():
+    if cli('ping') != 'PONG':
+        notify('WiFi is not running (sudo /etc/init.d/ozone-wifi start)')
+        return 1
+    notify('Looking for WiFi networks…')
+    while True:
+        st = status()
+        current = unescape(st['ssid']) if st.get('wpa_state') == 'COMPLETED' and st.get('ssid') else None
+        known = saved()
+        nets = scan()
+        lines = []
+        for n in nets:
+            mark = '  ✓ connected' if n['ssid'] == current else '  saved' if n['ssid'] in known else ''
+            lines.append('%s  %s%s%s' % (bars(n['signal']), n['ssid'], '  ' if n['secure'] else '', mark))
+        extra = ['⟳  Rescan']
+        if current:
+            extra.append('✕  Disconnect from %s' % current)
+        if known:
+            extra.append('🗑  Forget a network…')
+        prompt = '  WiFi' + (' (%s)' % current if current else '')
+        i = rofi(lines + extra, prompt)
+        if i is None:
+            return 0
+        if i < len(nets):
+            connect(nets[i], known)
+            return 0
+        action = extra[i - len(nets)]
+        if action.startswith('⟳'):
+            continue
+        if action.startswith('✕'):
+            cli('disconnect')
+            notify('WiFi: disconnected')
+            return 0
+        names = sorted(known)
+        j = rofi(names, '  Forget')
+        if j is not None:
+            cli('remove_network', known[names[j]])
+            cli('save_config')
+            notify('WiFi: %s forgotten' % names[j])
+        return 0
+
+
+def main(argv):
+    if len(argv) > 1 and argv[1] == 'status':
+        for k, v in status().items():
+            print('%s=%s' % (k, v))
+        return 0
+    if len(argv) > 1:
+        sys.exit(__doc__)
+    return menu()
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
