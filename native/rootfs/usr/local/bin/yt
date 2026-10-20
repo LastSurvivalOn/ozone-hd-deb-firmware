@@ -1,44 +1,561 @@
-#!/bin/sh
-# YouTube without a browser: search via rofi, playback through the hardware decoder (amplay, up to
-# 1080p60 H.264), or mpv in software if that fails.
-# yt            — prompt for a search query or a link
-# yt <query>    — search right away
+#!/usr/bin/python3
+"""yt: YouTube without a browser.
 
-q=${*:-$(rofi -dmenu -p "  YouTube" -theme-str 'listview { lines: 0; }' < /dev/null)}
-[ -n "$q" ] || exit 0
+Search results come straight from YouTube's own web API (InnerTube, the JSON the site itself loads:
+one request, ~1 s, with channel avatars and publication dates), shown as a grid of cards; yt-dlp
+is the fallback when that API changes (~10 s on this CPU, no avatars). Playback goes through the
+hardware decoder (amplay, H.264 up to 1080p), or mpv in software if that fails.
 
-# yt-dlp needs a JavaScript runtime to solve YouTube's signature challenges
-YTDLP="yt-dlp --no-warnings"
-command -v node > /dev/null && YTDLP="$YTDLP --js-runtimes node"
+  yt              search window
+  yt QUERY        search window with results for QUERY
+  yt URL          play right away (what ozone-web hands over)
 
-case "$q" in
-http://*|https://*)
-    url=$q
-    ;;
-*)
-    ozone-notify "Searching: $q"
-    list=$($YTDLP --flat-playlist \
-        --print "%(title)s	%(channel)s · %(duration_string)s	%(id)s" "ytsearch20:$q") ||
-        { ozone-notify "Search failed"; exit 1; }
-    id=$(printf '%s\n' "$list" |
-        rofi -dmenu -i -p "  $q" -display-columns 1,2 -display-column-separator '	' |
-        cut -f3)
-    [ -n "$id" ] || exit 0
-    url="https://www.youtube.com/watch?v=$id"
-    ;;
-esac
+Window keys: type to search, arrows to move, Enter to play, Esc to close. Results load further
+when scrolled to the end. After a video the window comes back where it was. The quality and frame
+rate picked next to the search (kept in ~/.config/ozone/yt.json) are the most a video plays at:
+lower them when the connection can't keep up.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
-ozone-notify "Loading video…"
-# The decoder takes H.264 (YouTube serves it up to 1080p); separate video and audio streams
-out=$($YTDLP --print title -g -f 'bv*[vcodec^=avc1][height<=1080]+ba[acodec^=mp4a]/b[vcodec^=avc1][height<=1080]' "$url")
-title=$(printf '%s\n' "$out" | sed -n 1p)
-video=$(printf '%s\n' "$out" | sed -n 2p)
-audio=$(printf '%s\n' "$out" | sed -n 3p)
-if [ -n "$video" ]; then
-    amplay --title "$title" ${audio:+--audio "$audio"} "$video"
-    status=$?
-    amplay --reset   # in case it crashed with the desktop hidden
-    [ $status = 0 ] && exit 0
-    ozone-notify "Hardware playback failed, trying mpv"
-fi
-exec mpv --force-window=immediate "$url"
+# Language and region of the results (titles stay as uploaded; this is "views", "2 days ago")
+HL = os.environ.get('YT_HL', 'en')
+GL = os.environ.get('YT_GL', 'UA')
+
+API = 'https://www.youtube.com/youtubei/v1/search?prettyPrint=false'
+CLIENT = {'clientName': 'WEB', 'clientVersion': '2.20260901.00.00', 'hl': HL, 'gl': GL}
+VIDEOS_ONLY = 'EgIQAQ=='   # the "Type: Video" filter: no shorts shelves, channels or playlists
+UA = 'Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0'
+
+COLUMNS = 4
+AVATAR = 36
+
+HEIGHTS = (1080, 720, 480, 360)
+RATES = (60, 30)
+SETTINGS = os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config'), 'ozone', 'yt.json')
+
+
+def load_settings():
+    try:
+        with open(SETTINGS) as f:
+            s = json.load(f)
+        if s.get('height') in HEIGHTS and s.get('fps') in RATES:
+            return s
+    except (OSError, ValueError):
+        pass
+    return {'height': HEIGHTS[0], 'fps': RATES[0]}
+
+
+def save_settings(s):
+    os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
+    with open(SETTINGS, 'w') as f:
+        json.dump(s, f)
+
+
+def video_format(height, fps):
+    """The decoder takes H.264 (YouTube serves it up to 1080p), as separate video and audio streams
+    or one with both. Without a format under the frame rate limit (60 fps videos are 60 fps from 720p
+    up) the best under the height limit."""
+    v = '[vcodec^=avc1][height<=%d]' % height
+    return '/'.join('bv*%s%s+ba[acodec^=mp4a]/b%s%s' % (v, f, v, f) for f in ('[fps<=%d]' % fps, ''))
+
+
+def ytdlp():
+    cmd = ['yt-dlp', '--no-warnings']
+    # yt-dlp needs a JavaScript runtime to solve YouTube's signature challenges
+    if any(os.access(os.path.join(d, 'node'), os.X_OK) for d in os.environ['PATH'].split(':')):
+        cmd += ['--js-runtimes', 'node']
+    return cmd
+
+
+def notify(text):
+    subprocess.call(['ozone-notify', text])
+
+
+def play(url, title='', started=None):
+    """Blocks until the video is over; started() is called when the picture is about to appear"""
+    s = load_settings()
+    notify('Loading video (up to %dp%s)…' % (s['height'], s['fps'] if s['fps'] > 30 else ''))
+    r = subprocess.run(ytdlp() + ['--print', 'title', '--print', '%(height)s %(fps)s', '-g',
+                                  '-f', video_format(s['height'], s['fps']), url],
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    out = r.stdout.split('\n')
+    video = out[2] if len(out) > 2 else ''
+    audio = out[3] if len(out) > 3 else ''
+    # what it plays at, for the player's title: 1080p60, 720p
+    try:
+        h, fps = out[1].split()
+        quality = '%dp%s' % (int(h), round(float(fps)) if float(fps) > 30 else '')
+    except (IndexError, ValueError):   # "NA" when yt-dlp doesn't know
+        quality = ''
+    if not video and 'ERROR:' in r.stderr:
+        # removed, blocked in the region, private...: mpv would only fail the same way
+        err = r.stderr[r.stderr.rindex('ERROR:'):].split('\n')[0]
+        notify(re.sub(r'^ERROR: (\[\w+\] [\w-]+: )?', '', err)[:80])
+        return
+    if started:
+        started()
+    if video:
+        title = ' · '.join(x for x in (title or out[0], quality) if x)
+        cmd = ['amplay', '--title', title] + (['--audio', audio] if audio else []) + [video]
+        status = subprocess.call(cmd)
+        subprocess.call(['amplay', '--reset'])   # in case it crashed with the desktop hidden
+        if status == 0:
+            return
+        notify('Hardware playback failed, trying mpv')
+    subprocess.call(['mpv', '--force-window=immediate', url])
+
+
+# --- Search ----------------------------------------------------------------------------------
+
+def text(o):
+    """InnerTube's text objects: {"simpleText": ...} or {"runs": [{"text": ...}, ...]}"""
+    if not o:
+        return ''
+    return o.get('simpleText') or ''.join(r.get('text', '') for r in o.get('runs', []))
+
+
+def video_entry(v):
+    badges = [b.get('metadataBadgeRenderer', {}).get('style') for b in v.get('badges', [])]
+    avatars = (v.get('channelThumbnailSupportedRenderers', {}).get('channelThumbnailWithLinkRenderer', {})
+               .get('thumbnail', {}).get('thumbnails', []))
+    return {
+        'id': v['videoId'],
+        'title': text(v.get('title')),
+        'channel': text(v.get('ownerText') or v.get('longBylineText')),
+        'duration': text(v.get('lengthText')),
+        'views': text(v.get('shortViewCountText') or v.get('viewCountText')),
+        'published': text(v.get('publishedTimeText')),
+        'live': 'BADGE_STYLE_TYPE_LIVE_NOW' in badges,
+        'avatar': avatars[-1]['url'] if avatars else None,
+    }
+
+
+def innertube(query=None, token=None):
+    """One page of results and the token of the next one"""
+    body = {'context': {'client': CLIENT}}
+    if token:
+        body['continuation'] = token
+    else:
+        body.update(query=query, params=VIDEOS_ONLY)
+    req = urllib.request.Request(API, json.dumps(body).encode(),
+                                 {'Content-Type': 'application/json', 'User-Agent': UA})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.load(r)
+    entries, nxt = [], None
+
+    def walk(o):
+        nonlocal nxt
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k == 'videoRenderer' and 'videoId' in v:
+                    entries.append(video_entry(v))
+                elif k == 'continuationItemRenderer':
+                    nxt = v.get('continuationEndpoint', {}).get('continuationCommand', {}).get('token')
+                else:
+                    walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+    walk(data.get('contents') or data.get('onResponseReceivedCommands'))
+    return entries, nxt
+
+
+def count(n):
+    for div, suffix in ((1e9, 'B'), (1e6, 'M'), (1e3, 'K')):
+        if n >= div:
+            return ('%.1f' % (n / div)).rstrip('0').rstrip('.') + suffix
+    return str(n)
+
+
+def ago(ts):
+    s = time.time() - ts
+    for div, unit in ((365 * 86400, 'year'), (30 * 86400, 'month'), (7 * 86400, 'week'),
+                      (86400, 'day'), (3600, 'hour'), (60, 'minute')):
+        if s >= div:
+            n = int(s // div)
+            return '%d %s%s ago' % (n, unit, 's' if n > 1 else '')
+    return 'just now'
+
+
+def ytdlp_search(query, n=30):
+    """The fallback: the same fields from yt-dlp's flat search (dates are approximate there too)"""
+    out = subprocess.run(ytdlp() + ['--flat-playlist', '-J', '--extractor-args', 'youtubetab:approximate_date',
+                                    'ytsearch%d:%s' % (n, query)],
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=True).stdout
+    entries = []
+    for e in json.loads(out).get('entries', []):
+        d = int(e.get('duration') or 0)
+        entries.append({
+            'id': e['id'], 'title': e.get('title') or '', 'channel': e.get('channel') or '',
+            'duration': ('%d:%02d:%02d' % (d // 3600, d // 60 % 60, d % 60) if d >= 3600 else
+                         '%d:%02d' % (d // 60, d % 60)) if d else '',
+            'views': count(e['view_count']) + ' views' if e.get('view_count') is not None else '',
+            'published': ago(e['timestamp']) if e.get('timestamp') else '',
+            'live': e.get('live_status') == 'is_live',
+            'avatar': None,
+        })
+    return entries
+
+
+def fetch(url):
+    req = urllib.request.Request(url, headers={'User-Agent': UA})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.read()
+
+
+# --- Window ----------------------------------------------------------------------------------
+
+CSS = b'''
+* { font-family: "DejaVu Sans"; font-size: 13px; color: #cdd6f4; }
+window, scrolledwindow, flowbox { background: #11111b; }
+.header { padding: 10px 16px; }
+entry { font-family: "JetBrains Mono"; font-size: 15px; background: #1e1e2e; border: 1px solid #313244;
+        border-radius: 18px; padding: 6px 16px; caret-color: #cba6f7; min-width: 560px; }
+entry:focus { border-color: #cba6f7; }
+combobox button { font-family: "JetBrains Mono"; font-size: 14px; background: #1e1e2e; border: 1px solid #313244;
+                  border-radius: 18px; padding: 5px 14px; box-shadow: none; }
+combobox button:hover, combobox button:focus { border-color: #cba6f7; }
+menu, .menu { background: #1e1e2e; border: 1px solid #313244; padding: 4px 0; }
+menuitem { font-family: "JetBrains Mono"; font-size: 14px; padding: 6px 16px; }
+menuitem:hover { background: #313244; }
+.status { color: #7f849c; }
+.logo { font-family: "FontAwesome"; font-size: 26px; color: #f38ba8; }
+flowboxchild { padding: 6px; border-radius: 12px; outline: none; }
+flowboxchild:selected, flowboxchild:hover { background: #313244; }
+.thumb { background: #1e1e2e; border-radius: 10px; }
+.badge { background: rgba(0, 0, 0, 0.8); border-radius: 4px; padding: 1px 5px; margin: 6px;
+         font-size: 12px; font-weight: bold; color: #ffffff; }
+.badge.live { background: #d20f39; }
+.badge.loading { background: #cba6f7; color: #11111b; }
+.title { font-size: 14px; font-weight: bold; }
+.meta { color: #a6adc8; font-size: 12px; }
+.empty { color: #7f849c; font-size: 16px; }
+'''
+
+
+def window(query):
+    import gi
+    gi.require_version('Gtk', '3.0')
+    gi.require_version('Gdk', '3.0')
+    gi.require_version('GdkPixbuf', '2.0')
+    from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango
+
+    pool = ThreadPoolExecutor(6)
+
+    def scaled(data, w, h):
+        loader = GdkPixbuf.PixbufLoader()
+        loader.connect('size-prepared', lambda l, iw, ih: l.set_size(w, h))  # libjpeg scales while decoding
+        loader.write(data)
+        loader.close()
+        return loader.get_pixbuf()
+
+    # Round avatars without cairo (python3-gi-cairo isn't installed): an antialiased disc in the
+    # alpha channel
+    def disc(n):
+        r = n / 2
+        return bytes(max(0, min(255, int((r - ((x + 0.5 - r) ** 2 + (y + 0.5 - r) ** 2) ** 0.5 + 0.5) * 255)))
+                     for y in range(n) for x in range(n))
+    mask = disc(AVATAR)
+
+    def round_avatar(data):
+        pb = scaled(data, AVATAR, AVATAR).add_alpha(False, 0, 0, 0)
+        px, stride = bytearray(pb.get_pixels()), pb.get_rowstride()
+        for y in range(AVATAR):
+            px[y * stride + 3:y * stride + AVATAR * 4:4] = mask[y * AVATAR:(y + 1) * AVATAR]
+        return GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(px), GdkPixbuf.Colorspace.RGB, True, 8,
+                                               AVATAR, AVATAR, stride)
+
+    def load_image(widget, url, make):
+        """Downloads and decodes in the pool, shows it in the main loop"""
+        def job():
+            try:
+                pb = make(fetch(url))
+            except Exception:
+                return
+            GLib.idle_add(widget.set_from_pixbuf, pb)
+        pool.submit(job)
+
+    class Card(Gtk.FlowBoxChild):
+        def __init__(self, e, tw):
+            super().__init__()
+            self.entry = e
+            th = tw * 9 // 16
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+
+            frame = Gtk.Box()
+            frame.get_style_context().add_class('thumb')
+            frame.set_size_request(tw, th)
+            thumb = Gtk.Image()
+            frame.add(thumb)
+            overlay = Gtk.Overlay()
+            overlay.add(frame)
+            self.badge = Gtk.Label(halign=Gtk.Align.END, valign=Gtk.Align.END)
+            self.badge.get_style_context().add_class('badge')
+            self.set_badge()
+            overlay.add_overlay(self.badge)
+            box.pack_start(overlay, False, False, 0)
+            # the thumbnails in the results are WebP (no loader here); this one is JPEG, 320x180
+            load_image(thumb, 'https://i.ytimg.com/vi/%s/mqdefault.jpg' % e['id'], lambda d: scaled(d, tw, th))
+
+            row = Gtk.Box(spacing=10)
+            avatar = Gtk.Image(valign=Gtk.Align.START)
+            avatar.set_size_request(AVATAR, AVATAR)
+            if e['avatar']:
+                load_image(avatar, e['avatar'], round_avatar)
+            row.pack_start(avatar, False, False, 0)
+            info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            title = Gtk.Label(label=e['title'], xalign=0, wrap=True, lines=2, max_width_chars=1,
+                              ellipsize=Pango.EllipsizeMode.END)
+            title.set_size_request(tw - AVATAR - 10, -1)
+            title.get_style_context().add_class('title')
+            info.pack_start(title, False, False, 0)
+            for line in (e['channel'], ' · '.join(x for x in (e['views'], e['published']) if x)):
+                if line:
+                    lbl = Gtk.Label(label=line, xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=1)
+                    lbl.get_style_context().add_class('meta')
+                    info.pack_start(lbl, False, False, 0)
+            row.pack_start(info, True, True, 0)
+            box.pack_start(row, False, False, 0)
+            self.add(box)
+
+        def set_badge(self, loading=False):
+            ctx = self.badge.get_style_context()
+            for c in ('live', 'loading'):
+                ctx.remove_class(c)
+            if loading:
+                ctx.add_class('loading')
+                self.badge.set_text('LOADING…')
+            elif self.entry['live']:
+                ctx.add_class('live')
+                self.badge.set_text('LIVE')
+            else:
+                self.badge.set_text(self.entry['duration'])
+            self.badge.set_visible(bool(self.badge.get_text()))
+            self.badge.set_no_show_all(not self.badge.get_text())
+
+    class App:
+        def __init__(self):
+            # GTK's CSS parser takes a stale errno for a failed number, and Python leaves ENOSYS
+            # there (no getrandom() on 3.10): the first number in the first stylesheet is lost
+            try:
+                Gtk.CssProvider().load_from_data(b'* { padding: 0px; }')
+            except GLib.Error:
+                pass
+            style = Gtk.CssProvider()
+            style.load_from_data(CSS)
+            Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), style,
+                                                     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            self.win = Gtk.Window(title='YouTube')
+            self.win.set_default_size(1280, 720)
+            self.win.connect('destroy', Gtk.main_quit)
+            self.win.connect('key-press-event', self.on_key)
+
+            top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            header = Gtk.Box(spacing=12)
+            header.get_style_context().add_class('header')
+            logo = Gtk.Label(label='')   # Font Awesome's YouTube play button
+            logo.get_style_context().add_class('logo')
+            header.pack_start(logo, False, False, 0)
+            self.entry = Gtk.Entry(placeholder_text='Search YouTube or paste a link')
+            self.entry.connect('activate', lambda w: self.search(w.get_text().strip()))
+            header.pack_start(self.entry, False, False, 0)
+            self.status = Gtk.Label(xalign=0)
+            self.status.get_style_context().add_class('status')
+            header.pack_start(self.status, True, True, 0)
+            # the most a video plays at
+            settings = load_settings()
+            label = Gtk.Label(label='Quality')
+            label.get_style_context().add_class('status')
+            header.pack_start(label, False, False, 0)
+            self.height = Gtk.ComboBoxText(tooltip_text='Highest resolution to play')
+            for h in HEIGHTS:
+                self.height.append(str(h), '%dp' % h)
+            self.height.set_active_id(str(settings['height']))
+            header.pack_start(self.height, False, False, 0)
+            self.fps = Gtk.ComboBoxText(tooltip_text='Highest frame rate (60 fps needs about twice the bandwidth)')
+            for f in RATES:
+                self.fps.append(str(f), '%d fps' % f)
+            self.fps.set_active_id(str(settings['fps']))
+            header.pack_start(self.fps, False, False, 0)
+            for combo in (self.height, self.fps):
+                combo.connect('changed', lambda w: save_settings({'height': int(self.height.get_active_id()),
+                                                                  'fps': int(self.fps.get_active_id())}))
+            top.pack_start(header, False, False, 0)
+
+            self.scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+            self.scroll.get_vadjustment().connect('value-changed', self.on_scroll)
+            self.grid = Gtk.FlowBox(min_children_per_line=COLUMNS, max_children_per_line=COLUMNS,
+                                    homogeneous=True, column_spacing=12, row_spacing=12,
+                                    valign=Gtk.Align.START, margin=16,
+                                    selection_mode=Gtk.SelectionMode.SINGLE)
+            self.grid.set_activate_on_single_click(True)
+            self.grid.set_vadjustment(self.scroll.get_vadjustment())   # arrows scroll to the card
+            self.grid.connect('child-activated', lambda g, c: self.open(c))
+            self.empty = Gtk.Label(label='Type and press Enter', vexpand=True)
+            self.empty.get_style_context().add_class('empty')
+            stack = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            stack.pack_start(self.grid, False, False, 0)
+            stack.pack_start(self.empty, True, True, 0)
+            self.scroll.add(stack)
+            top.pack_start(self.scroll, True, True, 0)
+            self.win.add(top)
+            self.win.show_all()
+
+            self.query, self.token, self.busy, self.gen, self.playing = None, None, False, 0, False
+            if query:
+                self.entry.set_text(query)
+                self.search(query)
+            else:
+                self.entry.grab_focus()
+
+        # results
+
+        def search(self, q):
+            if not q:
+                return
+            if re.match(r'^https?://', q):
+                return self.open(None, q)
+            self.gen += 1
+            self.query, self.token = q, None
+            for c in self.grid.get_children():
+                c.destroy()
+            self.scroll.get_vadjustment().set_value(0)
+            self.empty.hide()
+            self.load(q, None, self.gen)
+
+        def load(self, q, token, gen):
+            self.busy = True
+            self.status.set_text('Searching…')
+
+            def job():
+                fallback = False
+                try:
+                    entries, nxt = innertube(q, token)
+                    if not entries and not token:
+                        raise ValueError('no results in the reply')
+                except Exception:
+                    if token:   # the fallback has no pages, its first one was the whole list
+                        entries, nxt = [], None
+                    else:
+                        fallback = True
+                        GLib.idle_add(self.status.set_text, 'Searching (yt-dlp)…')
+                        try:
+                            entries, nxt = ytdlp_search(q), None
+                        except Exception:
+                            entries, nxt = None, None
+                GLib.idle_add(self.loaded, gen, entries, nxt, fallback)
+            threading.Thread(target=job, daemon=True).start()
+
+        def loaded(self, gen, entries, nxt, fallback):
+            if gen != self.gen:
+                return   # a newer search took over
+            self.busy, self.token = False, nxt
+            if entries is None:
+                self.status.set_text('Search failed: no connection?')
+                return
+            first = not self.grid.get_children()
+            # thumbnail width: the window in COLUMNS, less the margins, spacing, card padding and
+            # room for a scrollbar
+            tw = (self.scroll.get_allocated_width() - 32 - (COLUMNS - 1) * 12 - 12) // COLUMNS - 12
+            seen = {c.entry['id'] for c in self.grid.get_children()}
+            for e in entries:
+                if e['id'] not in seen:
+                    seen.add(e['id'])
+                    self.grid.add(Card(e, tw))
+            self.grid.show_all()
+            n = len(self.grid.get_children())
+            self.status.set_text(('%d videos' % n if n else 'Nothing found') +
+                                 (' (yt-dlp)' if fallback else ''))
+            if first and n:
+                c = self.grid.get_child_at_index(0)
+                self.grid.select_child(c)
+                c.grab_focus()
+            if not n:
+                self.empty.set_text('Nothing found')
+                self.empty.show()
+
+        def on_scroll(self, adj):
+            if self.token and not self.busy and adj.get_value() + 2 * adj.get_page_size() > adj.get_upper():
+                self.load(self.query, self.token, self.gen)
+
+        # playback
+
+        def open(self, card, url=None):
+            if self.playing:
+                return
+            self.playing = True
+            if card:
+                url = 'https://www.youtube.com/watch?v=' + card.entry['id']
+                title = ' · '.join(x for x in (card.entry['title'], card.entry['channel']) if x)
+                card.set_badge(loading=True)
+            else:
+                title = ''
+
+            def started():
+                GLib.idle_add(self.win.hide)
+
+            def job():
+                try:
+                    play(url, title, started)
+                finally:
+                    GLib.idle_add(self.back, card)
+            threading.Thread(target=job, daemon=True).start()
+
+        def back(self, card):
+            self.playing = False
+            if card:
+                card.set_badge()
+            self.win.show()
+            self.win.present()
+            (card or self.entry).grab_focus()
+
+        # keys
+
+        def on_key(self, w, ev):
+            key = Gdk.keyval_name(ev.keyval)
+            ctrl = ev.state & Gdk.ModifierType.CONTROL_MASK
+            if key == 'Escape':
+                if self.entry.has_focus() and self.grid.get_children():
+                    self.focus_grid()
+                else:
+                    Gtk.main_quit()
+                return True
+            if (ctrl and key == 'l') or key == 'slash' and not self.entry.has_focus():
+                self.entry.grab_focus()
+                return True
+            if self.entry.has_focus():
+                if key == 'Down' and self.grid.get_children():
+                    self.focus_grid()
+                    return True
+                return False
+            # typing anywhere starts a new search: the key then goes on to the focused entry
+            if Gdk.keyval_to_unicode(ev.keyval) > 32 and not ctrl:
+                self.entry.set_text('')
+                self.entry.grab_focus_without_selecting()
+            return False
+
+        def focus_grid(self):
+            sel = self.grid.get_selected_children() or [self.grid.get_child_at_index(0)]
+            sel[0].grab_focus()
+
+    GLib.set_prgname('yt')
+    App()
+    Gtk.main()
+    os._exit(0)   # without waiting for thumbnails still downloading
+
+
+if __name__ == '__main__':
+    arg = ' '.join(sys.argv[1:]).strip()
+    if re.match(r'^https?://', arg):
+        play(arg)
+    else:
+        window(arg)

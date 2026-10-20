@@ -81,6 +81,8 @@ struct dec_sysinfo {
 #define SYNC_TOLERANCE  (PTS_HZ / 25)   /* re-set pcrscr when it drifts more than 40 ms off audio */
 #define PREROLL_BYTES   (512 * 1024)
 #define PREROLL_PTS     (PTS_HZ / 2)    /* or half a second of video, whichever comes first */
+#define BUFFER_LOW      (PTS_HZ / 2)    /* downloaded video ahead of the clock: hold the clock below */
+#define BUFFER_HIGH     (3 * PTS_HZ)    /* and let it run again from here */
 #define SEEK_SHORT      10
 #define SEEK_LONG       60
 #define SYS             "/sys/class/"
@@ -217,8 +219,10 @@ static struct {
 
     /* session state, reset on every (re)start */
     volatile int stop, started, paused, video_done, audio_done;
+    int user_paused, buffering; /* paused is either of them */
     int64_t first_vpts;       /* 90 kHz, -1 until the first packet */
     int64_t last_vpts;
+    int64_t demux_vpts;       /* the latest video timestamp read from the input (under clk_m) */
     int64_t frame_dur;        /* 90 kHz, for streams without timestamps (raw .h264) */
     int no_pts;
     pthread_mutex_t clk_m;
@@ -226,7 +230,7 @@ static struct {
     int64_t aclock;           /* audio clock (90 kHz) when last measured, -1 if unknown */
     int64_t aclock_at;        /* CLOCK_MONOTONIC in us at that moment */
     int64_t wclock, wclock_at; /* the same for the wall clock used when there is no audio */
-    int64_t ready_at, started_at;
+    int64_t ready_at, started_at, resumed_at;
 
     int64_t start_time;       /* 90 kHz: the stream's own start, so the clock shows 0:00 */
     double duration;          /* seconds, 0 if unknown */
@@ -455,6 +459,14 @@ static void *demux_thread(void *arg)
             break;
         }
         struct pq *q = pkt->stream_index == in->vidx ? &P.vq : pkt->stream_index == in->aidx ? &P.aq : NULL;
+        int64_t ts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
+        if (q == &P.vq && ts != AV_NOPTS_VALUE) {
+            int64_t pts = to_pts90(ts, P.vst->time_base);
+            pthread_mutex_lock(&P.clk_m);
+            if (pts > P.demux_vpts)
+                P.demux_vpts = pts;
+            pthread_mutex_unlock(&P.clk_m);
+        }
         if (q && pq_put(q, av_packet_clone(pkt)) < 0)
             break;
         av_packet_unref(pkt);
@@ -638,9 +650,9 @@ static int session_start(void)
     AVCodecParameters *par = P.vst->codecpar;
     AVRational fr = av_guess_frame_rate(P.in[0].fmt, P.vst, NULL);
 
-    P.stop = P.started = P.paused = P.video_done = 0;
+    P.stop = P.started = P.paused = P.user_paused = P.buffering = P.video_done = 0;
     P.audio_done = !P.ast;
-    P.first_vpts = P.last_vpts = -1;
+    P.first_vpts = P.last_vpts = P.demux_vpts = -1;
     P.aclock = P.wclock = -1;
     P.ready_at = 0;
     sysfs_write(SYS "video/disable_video", "2");  /* off until the first new frame */
@@ -817,20 +829,58 @@ static void seek(int seconds)
     seek_to(play_time() + seconds, seconds < 0);
 }
 
-static void toggle_pause(void)
+static void set_paused(int paused)
 {
+    if (paused == P.paused)
+        return;
     if (P.wclock >= 0) {   /* freeze or restart the wall clock */
         P.wclock = master_clock();
         P.wclock_at = now_us();
     }
     pthread_mutex_lock(&P.clk_m);
-    P.paused = !P.paused;
+    P.paused = paused;
     pthread_cond_broadcast(&P.gate);
     pthread_mutex_unlock(&P.clk_m);
     ioctl(P.cntl, AMSTREAM_IOC_VPAUSE, P.paused);
     int64_t a = master_clock();
     if (!P.paused && a >= 0)
         ioctl(P.vfd, AMSTREAM_IOC_SET_PCRSCR, (unsigned long)(uint32_t)a);
+    /* a moment later the kernel moves pcrscr on by the time spent paused; sync_clock takes it
+       back, and should do so before many frames go by */
+    if (!P.paused)
+        P.resumed_at = now_us();
+}
+
+static void toggle_pause(void)
+{
+    P.user_paused = !P.user_paused;
+    set_paused(P.user_paused || P.buffering);
+}
+
+/* A network stream can fall behind the clock: YouTube sends video and audio over separate
+   connections, and the video needs several Mbit/s of a WiFi link that does ~6. Frames that reach
+   the decoder after their time are all dropped and the picture never comes back, so instead the
+   clock is held until a few seconds are downloaded, as other players do. Not for live input,
+   which arrives in real time. */
+static void check_buffer(void)
+{
+    int on = P.buffering;
+    if (!P.started || P.live || P.vq.eof) {
+        on = 0;
+    } else {
+        int64_t c = master_clock();
+        pthread_mutex_lock(&P.clk_m);
+        int64_t lead = P.demux_vpts - c;
+        pthread_mutex_unlock(&P.clk_m);
+        if (c >= 0 && P.demux_vpts >= 0)
+            on = on ? lead < BUFFER_HIGH : lead < BUFFER_LOW;
+    }
+    if (on == P.buffering)
+        return;
+    P.buffering = on;
+    if (P.verbose)
+        logmsg(on ? "buffering" : "buffered");
+    set_paused(P.user_paused || P.buffering);
 }
 
 static void do_action(const struct osd_event *e)
@@ -1082,8 +1132,9 @@ int main(int argc, char **argv)
         P.last_pos = start;
     int status = session_start() < 0;
     while (!P.quit && !status) {
-        /* right after the start the kernel moves pcrscr (see sync_clock), so catch that quickly */
-        int fast = !P.started || now_us() - P.started_at < 2000000;
+        /* right after the start or a pause the kernel moves pcrscr (see sync_clock, set_paused),
+           so catch that quickly */
+        int fast = !P.started || now_us() - P.started_at < 2000000 || now_us() - P.resumed_at < 1000000;
         int ready = poll(kbd, nkbd, fast ? 20 : 100) > 0;
         if (P.x11) {
             struct osd_event ev[8];
@@ -1091,7 +1142,7 @@ int main(int argc, char **argv)
             for (int i = 0; i < n && !P.quit; i++)
                 do_action(&ev[i]);
             struct osd_state st = {
-                .pos = play_time(), .dur = P.duration, .paused = P.paused, .loading = !P.started,
+                .pos = play_time(), .dur = P.duration, .paused = P.user_paused, .loading = !P.started || P.buffering,
                 .volume = saved_volume >= 0 ? saved_volume : volume_get(), .muted = saved_volume >= 0,
                 .title = P.title, .live = P.live,
             };
@@ -1106,6 +1157,7 @@ int main(int argc, char **argv)
             }
         }
         sync_clock();
+        check_buffer();
         if (finished())
             break;
     }

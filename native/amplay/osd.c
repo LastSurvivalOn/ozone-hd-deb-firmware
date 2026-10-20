@@ -8,7 +8,9 @@
  * never passes through the CPU.
  *
  * Text is anti-aliased only over the opaque bars: an edge blended with the key color would no
- * longer match it and show up as a magenta fringe.
+ * longer match it. The hardware scaler (1280x720 desktop to 1080p) blends edges anyway, around the
+ * bars and the cursor, so the key is next to black: the blended pixels are dark, where a bright
+ * key showed as colored fringes.
  */
 #include "osd.h"
 
@@ -24,7 +26,7 @@
 #include <string.h>
 #include <time.h>
 
-#define KEY_COLOR   "#ff00ff"   /* not in the Catppuccin palette used everywhere else */
+#define KEY_COLOR   "#000008"   /* RGB565 0x0001: drawn nowhere else (the cursor is pure black and white) */
 #define BAR_H       64
 #define TOP_H       44
 #define PAD         24
@@ -208,11 +210,15 @@ static void draw(const struct osd_state *s)
     /* top: title and close */
     XftDrawRect(O.top_d, &O.col[C_BG], 0, 0, O.w, TOP_H);
     if (s->title) {
-        char t[200];
-        snprintf(t, sizeof t, "%s", s->title);
+        char t[260];
+        snprintf(t, 256, "%s", s->title);
         int max = O.w - 3 * PAD - 24;
-        for (size_t n = strlen(t); n > 4 && text_width(O.font, t) > max; n--)
-            strcpy(t + n - 4, "…");   /* shorten until it fits */
+        /* shorten until it fits, a whole character at a time: Xft stops at broken UTF-8 */
+        size_t n = strlen(t);
+        for (int cut = n == 255; n > 0 && (cut || text_width(O.font, t) > max); cut = 0) {
+            do n--; while (n > 0 && ((unsigned char)t[n] & 0xc0) == 0x80);
+            strcpy(t + n, "…");
+        }
         text(O.top_d, O.font, C_TEXT, PAD, 28, t);
     }
     text(O.top_d, O.icons, C_SUB, O.w - PAD - 16, 29, ICON_CLOSE);

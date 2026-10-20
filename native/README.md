@@ -46,7 +46,7 @@ workspaces, CPU/memory/temperature/IP/volume/clock, power.
 |---|---|
 | Super+Enter | terminal |
 | Super+D | apps |
-| Super+Y | YouTube (search → mpv) |
+| Super+Y | YouTube (search → amplay) |
 | Super+Shift+E | power (sleep, Android, reboot, power off) |
 | Super+Q / F / S | close / fullscreen / floating |
 | Super+1…5 | workspaces |
@@ -84,6 +84,24 @@ reused as they are:
   `amplay --live --program <sid>`.
 
 Not done: EPG, teletext/subtitles, recording, radio services, scrambled channels (shown with a lock).
+
+## YouTube
+
+`yt` (Super+Y, the YouTube button on the panel, and what `ozone-web` hands YouTube over to) is a
+GTK window with a grid of results: thumbnail, duration (or LIVE), channel avatar and name, views,
+upload date. Type to search, arrows and Enter to play, Esc to close; more results load at the end
+of the list, and the window comes back after the video. `yt URL` plays right away. Next to the
+search: the highest quality and frame rate to play (kept in `~/.config/ozone/yt.json`), for a slow
+connection; the player's title shows what was picked (`1080p60`). YouTube has 60 fps videos at
+30 fps only up to 480p, so 30 fps means 480p for them.
+
+The search goes straight to YouTube's web API (`youtubei/v1/search`, the JSON the site loads
+itself): ~1.3 s for 20 results, where yt-dlp needs ~10 s on this CPU (4.6 s of it just starting up)
+and has no avatars. If the API reply stops parsing, `yt` falls back to yt-dlp's flat search with the
+same fields except avatars. Playing still goes through yt-dlp (`-g`, H.264 up to 1080p), so a
+video takes ~10 s to start. Thumbnails are the plain `mqdefault.jpg`: the URLs in the results serve
+WebP, which this gdk-pixbuf can't load. `YT_HL`/`YT_GL` set the language and region of the
+results (default `en`/`UA`).
 
 ## Browser
 
@@ -141,9 +159,9 @@ Load log (times per page, crashes): `~/.cache/ozone-web/log`.
 MPEG-1/2. FFmpeg demuxes (files, HTTP, separate video and audio streams) and decodes audio for ALSA; the
 elementary video stream goes to Amlogic's amstream driver with a PTS per packet, and the decoder puts
 frames straight on the video layer, so the CPU stays at ~20-40 %. Under X the player is a window in
-fb0's hardware color key (magenta is transparent), so the video shows through it and the controls
-are plain X drawing on top: title and close at the top, buttons, time, a clickable progress bar and
-volume at the bottom. They hide after 3 s; Xorg stays at ~0 % CPU. Without X the desktop is blanked
+fb0's hardware color key (#000008 is transparent: a bright key showed as fringes where the scaler
+blends edges), so the video shows through it and the controls are plain X drawing on top: title
+and close at the top, buttons, time, a clickable progress bar and volume at the bottom. They hide after 3 s; Xorg stays at ~0 % CPU. Without X the desktop is blanked
 and keys are read from evdev.
 
 ```sh
@@ -167,4 +185,9 @@ How the driver is driven, and what breaks it:
   kernel oopses.
 - tsync is always in audio master mode after port init, and audio isn't fed to the DSP, so pcrscr is
   driven from userspace: the kernel sets it 3 s behind the first frame (its wait for audio); amplay
-  starts the clock at that moment and keeps pcrscr within 40 ms of the ALSA clock.
+  starts the clock at that moment and keeps pcrscr within 40 ms of the ALSA clock. After a pause the
+  kernel moves pcrscr on by the paused time, so amplay checks it every 20 ms for a second after.
+- Frames that reach the decoder after their time are all dropped, and with nothing on the video
+  layer the screen shows the color key. YouTube's video comes over its own connection,
+  1080p60 at 3-7 Mbit/s over WiFi that does ~6, so it can fall behind the audio; amplay then
+  holds the clock ("Loading…") until 3 s of video are downloaded ahead.
