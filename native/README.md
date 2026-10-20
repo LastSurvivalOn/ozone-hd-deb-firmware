@@ -39,6 +39,8 @@ libxft-dev`.
 
 ## Desktop
 
+How to use all of it, with every key combination: [MANUAL.md](MANUAL.md).
+
 bspwm + sxhkd + polybar + rofi, Catppuccin Mocha theme. On the panel: app menu, YouTube,
 workspaces, CPU/memory/temperature/IP/volume/clock, power.
 
