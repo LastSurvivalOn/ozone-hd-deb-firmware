@@ -6,4 +6,6 @@ USER_NAME=$(getent passwd 1000 | cut -d: -f1)
 LOG=/var/log/ozone-desktop.log
 
 /usr/local/lib/ozone/gen-xorg-input
+# the boot splash animation (started by ozone-hw) puts the screen back to full brightness on exit
+start-stop-daemon --stop --quiet --retry 2 --pidfile /run/ozone-splash.pid --remove-pidfile
 exec su -l "$USER_NAME" -c 'exec startx -- :0 vt7 -nolisten tcp -keeptty' > $LOG 2>&1

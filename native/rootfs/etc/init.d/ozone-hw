@@ -14,6 +14,7 @@
 
 CPU=/sys/devices/system/cpu/cpu0/cpufreq
 FB=/sys/class/graphics
+SPLASH=/usr/share/ozone/splash.rgb565
 
 case "$1" in
 start)
@@ -30,8 +31,12 @@ start)
     echo 0 0 1919 1079 > $FB/fb0/window_axis
     echo 0x10001 > $FB/fb0/free_scale
     dd if=/dev/zero of=/dev/fb0 bs=1M count=8 2>/dev/null
+    # u-boot's logo sits on fb1 in memory the kernel doesn't reserve, so take it over on fb0
+    [ -f $SPLASH ] && cat $SPLASH > /dev/fb0
     echo 1 > $FB/fb1/blank
     echo 0 > $FB/fb0/blank
+    [ -f $SPLASH ] && start-stop-daemon --start --quiet --background --make-pidfile \
+        --pidfile /run/ozone-splash.pid --exec /usr/bin/python3 -- /usr/local/lib/ozone/splash
 
     # Without udev the kernel creates device nodes for root only; set permissions as in regular Debian
     chgrp -R audio /dev/snd && chmod -R g+rw /dev/snd

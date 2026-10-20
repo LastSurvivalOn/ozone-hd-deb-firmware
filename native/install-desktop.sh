@@ -11,7 +11,7 @@ ssh_box() { ssh -i $KEY -o ConnectTimeout=10 <USER>@$IP "$@"; }
 
 echo ">> system files"
 tar -C "$HERE/rootfs" -czf - \
-    usr/local/lib/ozone/desktop usr/local/lib/ozone/gen-xorg-input usr/local/lib/ozone/kbd-merge \
+    usr/local/lib/ozone/desktop usr/local/lib/ozone/gen-xorg-input usr/local/lib/ozone/kbd-merge usr/local/lib/ozone/splash \
     usr/local/bin/yt usr/local/bin/ozone-power usr/local/bin/ozone-standby usr/local/bin/ozone-notify etc/init.d/ozone-input etc/ozone/native-only \
     etc/X11/xorg.conf.d/00-ozone-screen.conf etc/X11/Xwrapper.config etc/asound.conf |
     ssh_box 'sudo tar -C / --no-same-owner -xzf -'

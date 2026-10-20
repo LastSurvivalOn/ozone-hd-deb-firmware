@@ -1,0 +1,41 @@
+#!/usr/bin/python3
+"""Boot splash animation: makes the picture on fb0 slowly brighten and dim until X starts.
+
+ozone-hw draws /usr/share/ozone/splash.rgb565 (the boot logo, see install-logo.sh) into fb0 and
+starts this in the background; the desktop script stops it right before X. Nothing is redrawn: the
+OSD layer's global alpha is varied, and with the video layer off the screen behind it is black.
+"""
+import fcntl
+import math
+import os
+import signal
+import struct
+import sys
+import time
+
+FBIOPUT_OSD_SET_GBL_ALPHA = 0x4500   # Amlogic OSD driver; 0 = transparent, 255 = opaque
+PERIOD = 2.4                         # seconds per pulse
+LOW = 0.45                           # dimmest point, fraction of full brightness
+TIMEOUT = 180                        # give up if X never comes
+
+
+def set_alpha(fd, a):
+    fcntl.ioctl(fd, FBIOPUT_OSD_SET_GBL_ALPHA, struct.pack('I', a))
+
+
+def main():
+    fd = os.open('/dev/fb0', os.O_RDWR)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    start = time.monotonic()
+    try:
+        while time.monotonic() - start < TIMEOUT:
+            t = (time.monotonic() - start) / PERIOD
+            k = LOW + (1 - LOW) * (0.5 + 0.5 * math.cos(2 * math.pi * t))
+            set_alpha(fd, round(255 * k))
+            time.sleep(1 / 30)
+    finally:
+        set_alpha(fd, 255)
+
+
+if __name__ == '__main__':
+    main()
