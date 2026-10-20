@@ -1,0 +1,516 @@
+#!/usr/bin/python3
+"""ozone-tv: DVB-T/T2 television in native Linux.
+
+The frontend (AVL6762 demodulator + MxL608 tuner) is driven by dtvfe, which runs the TV app's own
+Android libraries (see ozone-dtv). Everything after the demodulator is the kernel's regular DVB
+demux: section filters for the tables (PAT, PMT, SDT, NIT), and PES filters with TS output on the
+chosen service's PIDs, read from dvr0 and piped into amplay, which decodes the video in hardware.
+
+  ozone-tv                        channel list (rofi), then watch
+  ozone-tv scan [FROM TO]         scan UHF channels FROM..TO (default 21..60, 8 MHz)
+  ozone-tv scan --freq KHZ [BW]   scan one multiplex
+  ozone-tv play N                 watch channel N of the list
+  ozone-tv status KHZ [BW]        tune and print the signal once a second (aiming the antenna)
+  ozone-tv log                    the frontend libraries' messages (Android log)
+
+  --test FILE: instead of the tuner, FILE (a TS) is fed into the demux from memory, as a single
+  multiplex at 0 kHz; tests the scanner and player without an antenna.
+Channels are kept in ~/.local/share/ozone-tv/channels.json.
+"""
+import fcntl
+import json
+import os
+import select
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+DTVFE = '/usr/local/lib/ozone/dtvfe'
+DEMUX = '/dev/dvb/adapter0/demux0'
+DVR = '/dev/dvb/adapter0/dvr0'
+DEMUX_SOURCE = '/sys/class/stb/demux0_source'
+DATA = os.path.join(os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share'), 'ozone-tv')
+CHANNELS = os.path.join(DATA, 'channels.json')
+
+# linux/dvb/dmx.h
+DMX_START = 0x6f29
+DMX_STOP = 0x6f2a
+DMX_SET_FILTER = 0x403c6f2b       # struct dmx_sct_filter_params, 60 bytes
+DMX_SET_PES_FILTER = 0x40146f2c   # struct dmx_pes_filter_params, 20 bytes
+DMX_SET_BUFFER_SIZE = 0x6f2d
+DMX_CHECK_CRC, DMX_IMMEDIATE_START = 1, 4
+DMX_IN_FRONTEND, DMX_OUT_TS_TAP, DMX_PES_OTHER = 0, 2, 20
+
+VIDEO_TYPES = {0x01: 'mpeg1', 0x02: 'mpeg2', 0x1b: 'h264', 0x24: 'hevc'}
+AUDIO_TYPES = {0x03: 'mp1', 0x04: 'mp2', 0x0f: 'aac', 0x11: 'aac-latm', 0x81: 'ac3', 0x87: 'eac3'}
+TV_SERVICE_TYPES = {0x01, 0x11, 0x16, 0x19, 0x1f}
+
+
+def notify(text):
+    print(text, flush=True)
+    if os.environ.get('DISPLAY'):
+        subprocess.call(['ozone-notify', text], stderr=subprocess.DEVNULL)
+
+
+# ---- frontend -------------------------------------------------------------------------------------
+
+class Frontend:
+    """dtvfe, as root: the I2C bus, GPIOs and DVB nodes it opens are root's"""
+
+    def __init__(self):
+        # (Android's linker finds the libraries in /system/lib by itself)
+        cmd = [DTVFE] if os.geteuid() == 0 else ['sudo', '-n', DTVFE]
+        self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        reply = self.p.stdout.readline().split()
+        if not reply or reply[0] != 'ready':
+            raise RuntimeError('frontend: ' + (' '.join(reply) or 'dtvfe did not start'))
+        self.khz = None
+
+    def _ask(self, line):
+        self.p.stdin.write(line + '\n')
+        reply = self.p.stdout.readline().split()
+        if len(reply) != 4:
+            raise RuntimeError('frontend: ' + (' '.join(reply) or 'dtvfe died'))
+        return int(reply[1]), int(reply[2]), int(reply[3])
+
+    def tune(self, khz, bw=8, plp=0):
+        """(locked, strength %, quality %). The driver waits up to ~2.5 s for a lock itself;
+        DVB-T2 sometimes needs a little longer"""
+        self.khz = khz
+        st = self._ask('tune %d %d %d' % (khz, bw, plp))
+        for _ in range(3):
+            if st[0]:
+                break
+            time.sleep(0.5)
+            st = self._ask('status')
+        return st
+
+    def status(self):
+        return self._ask('status')
+
+    def close(self):
+        try:
+            self.p.stdin.write('quit\n')
+            self.p.stdin.close()
+            self.p.wait(5)
+        except (OSError, subprocess.TimeoutExpired):
+            self.p.kill()
+
+
+class TestFrontend:
+    """--test: a TS file fed into demux0 from memory, looping, paced at OZONE_TV_TEST_RATE bit/s
+    (default 7 M, the rate of the generated test multiplex)"""
+
+    def __init__(self, path):
+        self.path = path
+        self.khz = None
+        with open(DEMUX_SOURCE, 'w') as f:
+            f.write('hiu')
+        self.stop = threading.Event()
+        threading.Thread(target=self._feed, daemon=True).start()
+
+    def _feed(self):
+        dvr = os.open(DVR, os.O_WRONLY)
+        rate = float(os.environ.get('OZONE_TV_TEST_RATE', 7e6))
+        start, sent = time.monotonic(), 0
+        while not self.stop.is_set():
+            with open(self.path, 'rb') as f:
+                while not self.stop.is_set():
+                    data = f.read(188 * 348)
+                    if not data:
+                        break
+                    os.write(dvr, data)
+                    sent += len(data)
+                    time.sleep(max(0, start + sent * 8 / rate - time.monotonic()))
+        os.close(dvr)
+
+    def tune(self, khz, bw=8, plp=0):
+        self.khz = khz
+        return (1, 100, 100) if khz == 0 else (0, 0, 0)
+
+    def status(self):
+        return (1, 100, 100)
+
+    def close(self):
+        self.stop.set()
+        with open(DEMUX_SOURCE, 'w') as f:
+            f.write('ts0')   # back to the tuner's TS input
+
+
+# ---- tables -------------------------------------------------------------------------------------
+
+def read_sections(pid, table_id, ext=None, timeout=3.0):
+    """All sections of one table (current version), as a list of bytes, or [] on timeout"""
+    fd = os.open(DEMUX, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        filt, mask = bytearray(16), bytearray(16)
+        filt[0], mask[0] = table_id, 0xff
+        if ext is not None:   # table_id_extension: the program number of a PMT
+            filt[1], filt[2], mask[1], mask[2] = ext >> 8, ext & 0xff, 0xff, 0xff
+        fcntl.ioctl(fd, DMX_SET_FILTER, struct.pack('<H16s16s16s2xII', pid, bytes(filt), bytes(mask), bytes(16),
+                                                    int(timeout * 1000), DMX_CHECK_CRC | DMX_IMMEDIATE_START))
+        got, last, end = {}, None, time.monotonic() + timeout
+        while time.monotonic() < end:
+            if not select.select([fd], [], [], end - time.monotonic())[0]:
+                break
+            try:
+                sec = os.read(fd, 4096)
+            except OSError:   # timeout or overflow reported by the driver
+                break
+            if len(sec) < 12 or not sec[5] & 1:   # not current_next
+                continue
+            got[sec[6]] = sec
+            last = sec[7]
+            if last is not None and len(got) > last:
+                break
+        return [got[k] for k in sorted(got)]
+    finally:
+        os.close(fd)
+
+
+def dvb_text(b):
+    """DVB SI text (EN 300 468 annex A) to str; Cyrillic usually comes as ISO 8859-5 (0x01)"""
+    if not b:
+        return ''
+    enc, first = 'iso6937', b[0]
+    if 0x01 <= first <= 0x0b:
+        enc, b = 'iso8859-%d' % (first + 4), b[1:]
+    elif first == 0x10 and len(b) >= 3:
+        enc, b = 'iso8859-%d' % b[2], b[3:]
+    elif first == 0x11:
+        enc, b = 'utf-16-be', b[1:]
+    elif first == 0x15:
+        enc, b = 'utf-8', b[1:]
+    elif first < 0x20:
+        b = b[1:]
+    try:
+        text = b.decode(enc if enc != 'iso6937' else 'latin-1', errors='replace')
+    except LookupError:
+        text = b.decode('latin-1', errors='replace')
+    # emphasis and control codes (0x80-0x9f) out
+    return ''.join(c for c in text if not 0x80 <= ord(c) <= 0x9f).strip()
+
+
+def descriptors(b):
+    i = 0
+    while i + 2 <= len(b):
+        tag, n = b[i], b[i + 1]
+        yield tag, b[i + 2:i + 2 + n]
+        i += 2 + n
+
+
+def parse_pat(secs):
+    progs = {}
+    for s in secs:
+        end = 3 + (((s[1] & 0x0f) << 8) | s[2]) - 4
+        for i in range(8, end, 4):
+            num, pid = (s[i] << 8) | s[i + 1], ((s[i + 2] & 0x1f) << 8) | s[i + 3]
+            if num:
+                progs[num] = pid
+    return progs
+
+
+def parse_pmt(s):
+    end = 3 + (((s[1] & 0x0f) << 8) | s[2]) - 4
+    pcr = ((s[8] & 0x1f) << 8) | s[9]
+    i = 12 + (((s[10] & 0x0f) << 8) | s[11])
+    video, audio = None, []
+    while i + 5 <= end:
+        stype, pid = s[i], ((s[i + 1] & 0x1f) << 8) | s[i + 2]
+        n = ((s[i + 3] & 0x0f) << 8) | s[i + 4]
+        desc = dict(descriptors(s[i + 5:i + 5 + n]))
+        lang = desc[0x0a][:3].decode('latin-1', errors='replace') if 0x0a in desc else ''
+        if stype in VIDEO_TYPES and video is None:
+            video = {'pid': pid, 'codec': VIDEO_TYPES[stype]}
+        elif stype in AUDIO_TYPES:
+            audio.append({'pid': pid, 'codec': AUDIO_TYPES[stype], 'lang': lang})
+        elif stype == 0x06 and (0x6a in desc or 0x7a in desc):   # AC-3 / E-AC-3 in private data
+            audio.append({'pid': pid, 'codec': 'ac3' if 0x6a in desc else 'eac3', 'lang': lang})
+        i += 5 + n
+    return pcr, video, audio
+
+
+def parse_sdt(secs):
+    services = {}
+    for s in secs:
+        end = 3 + (((s[1] & 0x0f) << 8) | s[2]) - 4
+        i = 11
+        while i + 5 <= end:
+            sid = (s[i] << 8) | s[i + 1]
+            free_ca = bool(s[i + 3] & 0x10)
+            n = ((s[i + 3] & 0x0f) << 8) | s[i + 4]
+            info = {'scrambled': free_ca}
+            for tag, d in descriptors(s[i + 5:i + 5 + n]):
+                if tag == 0x48 and len(d) >= 3:   # service_descriptor
+                    plen = d[1]
+                    info['type'] = d[0]
+                    info['provider'] = dvb_text(d[2:2 + plen])
+                    info['name'] = dvb_text(d[3 + plen:3 + plen + d[2 + plen]])
+            services[sid] = info
+            i += 5 + n
+    return services
+
+
+def parse_nit_lcn(secs):
+    """Logical channel numbers (EACEM descriptor 0x83), service_id -> number"""
+    lcn = {}
+    for s in secs:
+        end = 3 + (((s[1] & 0x0f) << 8) | s[2]) - 4
+        i = 10 + (((s[8] & 0x0f) << 8) | s[9])
+        i += 2   # transport_stream_loop_length
+        while i + 6 <= end:
+            n = ((s[i + 4] & 0x0f) << 8) | s[i + 5]
+            for tag, d in descriptors(s[i + 6:i + 6 + n]):
+                if tag == 0x83:
+                    for j in range(0, len(d) - 3, 4):
+                        lcn[(d[j] << 8) | d[j + 1]] = ((d[j + 2] & 0x03) << 8) | d[j + 3]
+            i += 6 + n
+    return lcn
+
+
+def read_mux(khz, bw, plp):
+    """The services of the multiplex the frontend is locked to"""
+    progs = parse_pat(read_sections(0x00, 0x00))
+    if not progs:
+        return []
+    sdt = parse_sdt(read_sections(0x11, 0x42, timeout=4))
+    lcn = parse_nit_lcn(read_sections(0x10, 0x40, timeout=4))
+    found = []
+    for sid, pmt_pid in sorted(progs.items()):
+        secs = read_sections(pmt_pid, 0x02, ext=sid, timeout=2)
+        if not secs:
+            continue
+        pcr, video, audio = parse_pmt(secs[0])
+        info = sdt.get(sid, {})
+        found.append({
+            'name': info.get('name') or 'Service %d' % sid,
+            'provider': info.get('provider', ''),
+            'scrambled': info.get('scrambled', False),
+            'radio': video is None,
+            'freq_khz': khz, 'bandwidth': bw, 'plp': plp,
+            'sid': sid, 'pmt_pid': pmt_pid, 'pcr_pid': pcr,
+            'video': video, 'audio': audio,
+            'lcn': lcn.get(sid),
+        })
+    return found
+
+
+# ---- channel list ---------------------------------------------------------------------------------
+
+def load_channels():
+    try:
+        with open(CHANNELS) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def save_channels(channels):
+    os.makedirs(DATA, exist_ok=True)
+    with open(CHANNELS + '.tmp', 'w') as f:
+        json.dump(channels, f, ensure_ascii=False, indent=1)
+    os.replace(CHANNELS + '.tmp', CHANNELS)
+
+
+def sort_channels(channels):
+    # broadcaster's numbering first, then by multiplex and service
+    return sorted(channels, key=lambda c: (c['lcn'] is None, c['lcn'] or 0, c['freq_khz'], c['sid']))
+
+
+def open_frontend(test):
+    return TestFrontend(test) if test else Frontend()
+
+
+def scan(freqs, test=None):
+    """freqs: [(kHz, bandwidth MHz)]"""
+    fe = open_frontend(test)
+    found = []
+    try:
+        for n, (khz, bw) in enumerate(freqs, 1):
+            locked, strength, quality = fe.tune(khz, bw)
+            label = '%d MHz (%d/%d)' % (khz // 1000, n, len(freqs))
+            if not locked:
+                print('%s: no signal, level %d%%' % (label, strength), flush=True)
+                continue
+            services = read_mux(khz, bw, 0)
+            found += services
+            tv = sum(1 for s in services if not s['radio'])
+            notify('%s: signal %d%%, quality %d%%: %d TV, %d radio' %
+                   (label, strength, quality, tv, len(services) - tv))
+    finally:
+        fe.close()
+    # a rescan replaces the multiplexes it found, keeps the others
+    done = {s['freq_khz'] for s in found}
+    channels = sort_channels([c for c in load_channels() if c['freq_khz'] not in done] + found)
+    save_channels(channels)
+    notify('Scan finished: %d channels' % sum(1 for c in channels if not c['radio']))
+    return channels
+
+
+# ---- watching ---------------------------------------------------------------------------------------
+
+class Service:
+    """PES filters with TS output on one service's PIDs; while they exist, its packets reach dvr0"""
+
+    def __init__(self, ch):
+        pids = {0x00, ch['pmt_pid'], ch['pcr_pid'], ch['video']['pid']} | {a['pid'] for a in ch['audio']}
+        self.fds = []
+        for pid in sorted(pids):
+            fd = os.open(DEMUX, os.O_RDWR)
+            fcntl.ioctl(fd, DMX_SET_PES_FILTER, struct.pack('<H2xiiiI', pid, DMX_IN_FRONTEND, DMX_OUT_TS_TAP,
+                                                             DMX_PES_OTHER, DMX_IMMEDIATE_START))
+            self.fds.append(fd)
+
+    def close(self):
+        for fd in self.fds:
+            os.close(fd)
+
+
+def watch(index, test=None):
+    """Plays channel `index`; amplay's exit status 10/11 moves to the next/previous channel"""
+    channels = [c for c in load_channels() if not c['radio']]
+    if not channels:
+        notify('No channels yet: scan first')
+        return 1
+    fe = open_frontend(test)
+    try:
+        index %= len(channels)
+        while True:
+            ch = channels[index]
+            if fe.khz != ch['freq_khz']:
+                locked, strength, _q = fe.tune(ch['freq_khz'], ch['bandwidth'], ch['plp'])
+                if not locked:
+                    notify('%s: no signal (%d%%)' % (ch['name'], strength))
+            status = play(ch, index)
+            if status == 10:
+                index = (index + 1) % len(channels)
+            elif status == 11:
+                index = (index - 1) % len(channels)
+            else:
+                return status
+    finally:
+        fe.close()
+
+
+def play(ch, index):
+    service = Service(ch)
+    dvr = os.open(DVR, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        fcntl.ioctl(dvr, DMX_SET_BUFFER_SIZE, 4 << 20)
+    except OSError:
+        pass
+    title = '%d  %s%s' % (ch['lcn'] or index + 1, ch['name'], '  \U0001f512' if ch['scrambled'] else '')
+    player = subprocess.Popen(['amplay', '--live', '--program', str(ch['sid']), '--title', title, 'pipe:0'],
+                              stdin=subprocess.PIPE)
+    out = player.stdin.fileno()
+    try:
+        while player.poll() is None:
+            if not select.select([dvr], [], [], 0.5)[0]:
+                continue
+            try:
+                data = os.read(dvr, 188 * 1024)
+            except BlockingIOError:
+                continue
+            except OSError:   # EOVERFLOW: the reader fell behind, the driver dropped data
+                continue
+            try:
+                os.write(out, data)
+            except BrokenPipeError:
+                break
+    finally:
+        os.close(dvr)
+        service.close()
+        try:
+            player.stdin.close()
+        except OSError:
+            pass
+    status = player.wait()
+    subprocess.call(['amplay', '--reset'])
+    return status
+
+
+def menu(test=None):
+    channels = [c for c in load_channels() if not c['radio']]
+    lines = ['%3d  %s%s' % (c['lcn'] or i + 1, c['name'], '  \U0001f512' if c['scrambled'] else '')
+             for i, c in enumerate(channels)]
+    lines.append('     ⟳  Scan channels')
+    r = subprocess.run(['rofi', '-dmenu', '-i', '-format', 'i', '-p', '  TV'], input='\n'.join(lines),
+                       capture_output=True, text=True)
+    if r.returncode or not r.stdout.strip():
+        return 0
+    i = int(r.stdout)
+    if i == len(channels):
+        scan(uhf(21, 60), test) if not test else scan([(0, 8)], test)
+        return menu(test)
+    return watch(i, test)
+
+
+def uhf(first, last):
+    """UHF channel numbers to (centre kHz, 8 MHz): channel 21 is 474 MHz"""
+    return [(306000 + 8000 * ch, 8) for ch in range(first, last + 1)]
+
+
+def show_log():
+    """Android logger v1 entries from /dev/log/main"""
+    fd = os.open('/dev/log/main', os.O_RDONLY | os.O_NONBLOCK)
+    while True:
+        try:
+            buf = os.read(fd, 5 * 1024)
+        except BlockingIOError:
+            break
+        if not buf:
+            break
+        n, _pad, pid, _tid, sec, nsec = struct.unpack_from('<HHiiii', buf)
+        payload = buf[20:20 + n]
+        tag, _, msg = payload[1:].partition(b'\0')
+        print('%s %s(%d): %s' % (time.strftime('%H:%M:%S', time.localtime(sec)), tag.decode(errors='replace'),
+                                 pid, msg.rstrip(b'\0\n').decode(errors='replace')))
+
+
+def main(argv):
+    test = None
+    if '--test' in argv:
+        i = argv.index('--test')
+        test = argv[i + 1]
+        del argv[i:i + 2]
+    cmd = argv[1] if len(argv) > 1 else 'menu'
+    if cmd == 'menu':
+        return menu(test)
+    if cmd == 'scan':
+        if test:
+            freqs = [(0, 8)]
+        elif len(argv) > 2 and argv[2] == '--freq':
+            freqs = [(int(argv[3]), int(argv[4]) if len(argv) > 4 else 8)]
+        else:
+            first, last = (int(argv[2]), int(argv[3])) if len(argv) > 3 else (21, 60)
+            freqs = uhf(first, last)
+        for c in scan(freqs, test):
+            print('%4s  %-28s %4d MHz  sid %-5d %s %s' % (c['lcn'] or '', c['name'], c['freq_khz'] // 1000, c['sid'],
+                  'radio' if c['radio'] else c['video']['codec'],
+                  ' '.join('%s/%s' % (a['codec'], a['lang'] or '-') for a in c['audio'])))
+        return 0
+    if cmd == 'play' and len(argv) > 2:
+        return watch(int(argv[2]) - 1, test)
+    if cmd == 'status' and len(argv) > 2:
+        fe = open_frontend(test)
+        try:
+            print(fe.tune(int(argv[2]), int(argv[3]) if len(argv) > 3 else 8))
+            while True:
+                time.sleep(1)
+                locked, strength, quality = fe.status()
+                print('locked' if locked else 'no lock', 'level %d%%' % strength, 'quality %d%%' % quality, flush=True)
+        except KeyboardInterrupt:
+            return 0
+        finally:
+            fe.close()
+    if cmd == 'log':
+        show_log()
+        return 0
+    sys.exit(__doc__)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

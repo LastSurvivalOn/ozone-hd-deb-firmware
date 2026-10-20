@@ -14,10 +14,13 @@
  * grabbed).
  *
  *   amplay [--audio URL] [--start SECONDS] [--title TEXT] URL     URL: a file or anything FFmpeg opens
+ *   amplay --live [--program N] [--title TEXT] URL       broadcast TS, e.g. pipe:0 from ozone-tv
  *   amplay --reset                                 put the desktop back after a crash
  *
  * Keys: Space/P pause, Left/Right -/+10 s, PgDn/PgUp -/+60 s, Up/Down volume, M mute, Q/Esc quit.
  * Mouse (under X): click the progress bar to seek, the picture to pause, the wheel for volume.
+ * Live: Left/Right and PgDn/PgUp (and the remote's channel keys) ask for the previous/next channel:
+ * amplay exits with status 11/10 and the caller retunes.
  * Exit status 3 means the video codec has no hardware decoder (the caller can fall back to mpv).
  */
 #define _GNU_SOURCE
@@ -229,6 +232,8 @@ static struct {
     double duration;          /* seconds, 0 if unknown */
     double last_pos;
     const char *title;
+    int live, program;        /* --live, --program (-1: any) */
+    int exit_status;
     int x11;                  /* controls drawn under X, or evdev without */
 
     volatile sig_atomic_t quit;
@@ -832,8 +837,18 @@ static void do_action(const struct osd_event *e)
 {
     switch (e->action) {
     case OSD_PAUSE: toggle_pause(); break;
-    case OSD_SEEK_REL: seek((int)e->value); break;
-    case OSD_SEEK_ABS: seek_to(e->value, e->value < play_time()); break;
+    case OSD_SEEK_REL:
+        if (P.live) {   /* no timeline to move along: change the channel */
+            P.exit_status = e->value > 0 ? 10 : 11;
+            P.quit = 1;
+        } else {
+            seek((int)e->value);
+        }
+        break;
+    case OSD_SEEK_ABS:
+        if (!P.live)
+            seek_to(e->value, e->value < play_time());
+        break;
     case OSD_VOLUME: volume_change((int)e->value); break;
     case OSD_MUTE: mute_toggle(); break;
     case OSD_QUIT: P.quit = 1; break;
@@ -851,6 +866,8 @@ static void handle_key(int code, int repeat)
     case KEY_RIGHT: case KEY_FASTFORWARD: e = (struct osd_event){ OSD_SEEK_REL, SEEK_SHORT }; break;
     case KEY_PAGEDOWN: case KEY_PREVIOUSSONG: e = (struct osd_event){ OSD_SEEK_REL, -SEEK_LONG }; break;
     case KEY_PAGEUP: case KEY_NEXTSONG: e = (struct osd_event){ OSD_SEEK_REL, SEEK_LONG }; break;
+    case KEY_CHANNELUP: e = (struct osd_event){ OSD_SEEK_REL, SEEK_LONG }; break;
+    case KEY_CHANNELDOWN: e = (struct osd_event){ OSD_SEEK_REL, -SEEK_LONG }; break;
     case KEY_UP: case KEY_VOLUMEUP: e = (struct osd_event){ OSD_VOLUME, 5 }; break;
     case KEY_DOWN: case KEY_VOLUMEDOWN: e = (struct osd_event){ OSD_VOLUME, -5 }; break;
     case KEY_M: case KEY_MUTE: e = (struct osd_event){ OSD_MUTE, 0 }; break;
@@ -874,6 +891,10 @@ static int open_input(struct input *in, const char *url)
     av_dict_set(&opts, "reconnect", "1", 0);
     av_dict_set(&opts, "reconnect_streamed", "1", 0);
     av_dict_set(&opts, "reconnect_delay_max", "5", 0);
+    if (P.live) {   /* zapping: two seconds of broadcast are enough to find the streams */
+        av_dict_set(&opts, "analyzeduration", "2000000", 0);
+        av_dict_set(&opts, "probesize", "2000000", 0);
+    }
     int r = avformat_open_input(&in->fmt, url, NULL, &opts);
     av_dict_free(&opts);
     if (r < 0 || avformat_find_stream_info(in->fmt, NULL) < 0) {
@@ -924,6 +945,7 @@ static void on_signal(int sig)
 static void usage(void)
 {
     fputs("usage: amplay [-v] [--audio URL] [--start SECONDS] [--title TEXT] URL\n"
+          "       amplay --live [--program N] [--title TEXT] URL\n"
           "       amplay --reset\n", stderr);
     exit(2);
 }
@@ -935,18 +957,23 @@ int main(int argc, char **argv)
         { "start", required_argument, NULL, 's' },
         { "reset", no_argument, NULL, 'r' },
         { "title", required_argument, NULL, 't' },
+        { "live", no_argument, NULL, 'l' },
+        { "program", required_argument, NULL, 'p' },
         { "verbose", no_argument, NULL, 'v' },
         { 0 }
     };
     const char *audio_url = NULL;
     double start = 0;
     int c;
-    while ((c = getopt_long(argc, argv, "a:s:rt:v", opts, NULL)) != -1) {
+    P.program = -1;
+    while ((c = getopt_long(argc, argv, "a:s:rt:vlp:", opts, NULL)) != -1) {
         switch (c) {
         case 'a': audio_url = optarg; break;
         case 's': start = atof(optarg); break;
         case 'r': display_off(); return 0;
         case 't': P.title = optarg; break;
+        case 'l': P.live = 1; break;
+        case 'p': P.program = atoi(optarg); break;
         case 'v': P.verbose = 1; break;
         default: usage();
         }
@@ -961,7 +988,21 @@ int main(int argc, char **argv)
     if (open_input(&P.in[0], argv[optind]) < 0)
         return 1;
     P.nin = 1;
-    int v = av_find_best_stream(P.in[0].fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    int v = -1;
+    if (P.program >= 0) {   /* a service of a multiplex: its first video stream */
+        for (unsigned i = 0; i < P.in[0].fmt->nb_programs && v < 0; i++) {
+            AVProgram *prg = P.in[0].fmt->programs[i];
+            for (unsigned j = 0; prg->id == P.program && j < prg->nb_stream_indexes && v < 0; j++)
+                if (P.in[0].fmt->streams[prg->stream_index[j]]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+                    v = prg->stream_index[j];
+        }
+        if (v < 0) {
+            logmsg("no video in program %d", P.program);
+            return 3;
+        }
+    } else {
+        v = av_find_best_stream(P.in[0].fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    }
     if (v < 0) {
         logmsg("no video stream");
         return 3;
@@ -982,7 +1023,8 @@ int main(int argc, char **argv)
             return 1;
         ain = &P.in[P.nin++];
     }
-    int a = av_find_best_stream(ain->fmt, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
+    /* related to the video stream: the audio of the same program */
+    int a = av_find_best_stream(ain->fmt, AVMEDIA_TYPE_AUDIO, -1, ain == &P.in[0] ? v : -1, NULL, 0);
     if (a >= 0) {
         ain->aidx = a;
         P.ast = ain->fmt->streams[a];
@@ -1051,7 +1093,7 @@ int main(int argc, char **argv)
             struct osd_state st = {
                 .pos = play_time(), .dur = P.duration, .paused = P.paused, .loading = !P.started,
                 .volume = saved_volume >= 0 ? saved_volume : volume_get(), .muted = saved_volume >= 0,
-                .title = P.title,
+                .title = P.title, .live = P.live,
             };
             osd_update(&st);
         } else if (ready) {
@@ -1075,5 +1117,5 @@ int main(int argc, char **argv)
         kbd_close();
     }
     display_off();
-    return status;
+    return status ? status : P.exit_status;
 }

@@ -5,6 +5,7 @@
 struct osd_state {
     double pos, dur;          /* seconds; dur <= 0 if unknown */
     int paused, loading;
+    int live;                 /* broadcast: no timeline, back/forward switch channels */
     int volume, muted;        /* percent */
     const char *title;
 };

@@ -7,6 +7,8 @@ super + y
     yt
 super + w
     ozone-web-show
+super + t
+    ozone-tv
 super + shift + e
     ozone-power
 super + Escape

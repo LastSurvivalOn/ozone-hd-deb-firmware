@@ -40,6 +40,8 @@
 #define ICON_VOL    "\xef\x80\xa8"   /* f028 */
 #define ICON_MUTE   "\xef\x80\xa6"   /* f026 */
 #define ICON_CLOSE  "\xef\x80\x8d"   /* f00d */
+#define ICON_PREV   "\xef\x81\x88"   /* f048 */
+#define ICON_NEXT   "\xef\x81\x91"   /* f051 */
 
 enum { C_KEY, C_BG, C_TRACK, C_FILL, C_TEXT, C_SUB, NCOLORS };
 static const char *COLOR_NAMES[NCOLORS] = { KEY_COLOR, "#11111b", "#45475a", "#cba6f7", "#cdd6f4", "#a6adc8" };
@@ -187,6 +189,8 @@ static void draw(const struct osd_state *s)
     clock_text(total, sizeof total, s->dur);
     if (s->loading)
         snprintf(line, sizeof line, "Loading…");
+    else if (s->live)
+        snprintf(line, sizeof line, "LIVE");
     else if (s->dur > 0)
         snprintf(line, sizeof line, "%s / %s", now, total);
     else
@@ -195,7 +199,8 @@ static void draw(const struct osd_state *s)
 
     /* redraw only when something visible changed */
     char sig[sizeof O.sig];
-    snprintf(sig, sizeof sig, "%d|%s|%d|%d|%s|%d|%s", fill, line, s->paused, s->muted, vol, O.w, s->title ? s->title : "");
+    snprintf(sig, sizeof sig, "%d|%s|%d|%d|%s|%d|%d|%s", fill, line, s->paused, s->muted, vol, O.w, s->live,
+             s->title ? s->title : "");
     if (!strcmp(sig, O.sig))
         return;
     strcpy(O.sig, sig);
@@ -214,13 +219,16 @@ static void draw(const struct osd_state *s)
 
     /* bottom: progress, buttons, time, volume */
     XftDrawRect(O.bar_d, &O.col[C_BG], 0, 0, O.w, BAR_H);
-    XftDrawRect(O.bar_d, &O.col[C_TRACK], PAD, TRACK_Y, track_w, TRACK_H);
-    XftDrawRect(O.bar_d, &O.col[C_FILL], PAD, TRACK_Y, fill, TRACK_H);
-    if (s->dur > 0)
+    if (!s->live) {
+        XftDrawRect(O.bar_d, &O.col[C_TRACK], PAD, TRACK_Y, track_w, TRACK_H);
+        XftDrawRect(O.bar_d, &O.col[C_FILL], PAD, TRACK_Y, fill, TRACK_H);
+    }
+    if (s->dur > 0 && !s->live)
         XftDrawRect(O.bar_d, &O.col[C_TEXT], PAD + fill - 2, TRACK_Y - 5, 4, TRACK_H + 10);
 
     int x = PAD, y = 50;
-    const char *icons[3] = { ICON_BACK, s->paused ? ICON_PLAY : ICON_PAUSE, ICON_FWD };
+    const char *icons[3] = { s->live ? ICON_PREV : ICON_BACK, s->paused ? ICON_PLAY : ICON_PAUSE,
+                             s->live ? ICON_NEXT : ICON_FWD };
     for (int i = 0; i < 3; i++) {
         O.hit[i][0] = x - 8;
         O.hit[i][1] = x + 28;

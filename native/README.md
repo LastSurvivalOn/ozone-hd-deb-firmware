@@ -51,6 +51,40 @@ workspaces, CPU/memory/temperature/IP/volume/clock, power.
 | Super+Q / F / S | close / fullscreen / floating |
 | Super+1…5 | workspaces |
 
+## Television (DVB-T/T2)
+
+`./install-tv.sh <ip>` (needs the Android NDK here, `~/Android/Sdk/ndk/*`). Super+T or the TV button
+on the panel: channel list, "Scan channels" the first time. In the player ←/→ or PgDn/PgUp switch
+channels, the rest as in amplay.
+
+```sh
+ozone-tv scan                    # UHF 21..60 (474-786 MHz, 8 MHz), prints level and services per multiplex
+ozone-tv scan --freq 570000      # one multiplex
+ozone-tv status 570000           # signal level/quality once a second: for aiming the antenna
+ozone-tv play 3                  # channel 3 of the list
+ozone-tv log                     # what the frontend libraries say
+ozone-tv --test mux.ts scan      # without an antenna: a TS file fed into the demux from memory
+```
+
+How it works. The kernel has the DVB demux but no frontend driver: on Android the TV app
+(`th.dtv`) drives the Availink **AVL6762** demodulator and MaxLinear **MxL608** tuner itself, from
+its libraries (`libth_dtv_external_c.so` and friends), over `/dev/i2c-2`, demodulator reset on GPIO 74,
+TS into demux0 through the parallel `ts0` input. Those libraries, firmware patch included, are
+reused as they are:
+
+- `dtv/dtvfe.c` is an Android (bionic) program, built with the NDK for Android 4.4's linker (SysV
+  hash, no packed relocations). It `dlopen`s the libraries from `/system/lib` and calls
+  `External_Init`, `PI_System_Start`, `PI_Tuner_Init`, then `PI_Tuner_DVB_T_StartLock` /
+  `CheckSignalStatus` (interfaces taken from the disassembly), answering `tune`/`status` on stdin.
+- `/etc/init.d/ozone-dtv` gives it what Android's init would: `/system` mounted read-only, an
+  empty KitKat property area at `/dev/__properties__` (bionic crashes without one), the kernel
+  logger nodes in `/dev/log`, and the Android names of the DVB nodes (`/dev/dvb0.demux0`...).
+- `ozone-tv` reads PAT/SDT/NIT/PMT through demux section filters (names usually ISO 8859-5, LCN from
+  NIT), then for watching sets TS-tap PES filters on the service's PIDs and pipes `dvr0` into
+  `amplay --live --program <sid>`.
+
+Not done: EPG, teletext/subtitles, recording, radio services, scrambled channels (shown with a lock).
+
 ## Browser
 
 `ozone-web` (Super+W, the globe on the panel): Python + GTK3 on WebKitGTK 2.50, with tabs, an

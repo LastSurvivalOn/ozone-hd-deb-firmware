@@ -1,0 +1,51 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          ozone-dtv
+# Required-Start:    ozone-hw
+# Required-Stop:
+# Default-Start:     S
+# Default-Stop:
+# Short-Description: Android environment for the DVB-T2 frontend libraries
+# Description:       dtvfe runs the TV app's own frontend libraries (bionic) from the Android
+#                    system partition; this gives them what Android's init would have.
+### END INIT INFO
+
+# Under Android, Android does all of this itself
+/etc/ozone/is-native || exit 0
+
+case "$1" in
+start)
+    # The libraries and Android's linker, read-only
+    mkdir -p /system
+    mountpoint -q /system || mount -o ro /dev/system /system
+
+    # bionic dereferences NULL at start-up without a property area: an empty one in the KitKat
+    # format (bytes_used = one root trie node, serial, magic "PROP", version 0xfc6ed0ab), 128 KB
+    if [ ! -s /dev/__properties__ ]; then
+        { printf '\024\000\000\000\000\000\000\000PROP\253\320\156\374'; head -c 131056 /dev/zero; } > /dev/__properties__
+        chmod 444 /dev/__properties__
+    fi
+
+    # Android's kernel logger, so the libraries' messages can be read (ozone-tv --log)
+    mkdir -p /dev/log
+    for n in main events radio system; do
+        [ -e /dev/log/$n ] || mknod /dev/log/$n c $(tr : ' ' < /sys/class/misc/log_$n/dev)
+        chmod 666 /dev/log/$n
+    done
+
+    # The Android names of the DVB nodes (ueventd's /dev/dvb0.demux0 etc.)
+    for d in /dev/dvb/adapter0/*; do
+        ln -sf $d /dev/dvb0.${d##*/}
+    done
+    # demux and dvr are used by the scanner and player as the regular user
+    chgrp video /dev/dvb/adapter0/* && chmod g+rw /dev/dvb/adapter0/*
+    # and ozone-tv --test switches demux0 to memory input
+    chgrp video /sys/class/stb/demux0_source && chmod g+w /sys/class/stb/demux0_source
+    ;;
+stop|restart|force-reload|status)
+    ;;
+*)
+    echo "usage: $0 start" >&2
+    exit 3
+    ;;
+esac
