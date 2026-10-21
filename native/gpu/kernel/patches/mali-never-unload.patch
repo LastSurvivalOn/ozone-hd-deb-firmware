@@ -1,0 +1,14 @@
+--- a/drivers/gpu/arm/mali/linux/mali_kernel_linux.c	2016-04-11 22:08:59.000000000 +0300
++++ b/drivers/gpu/arm/mali/linux/mali_kernel_linux.c	2026-10-21 20:46:58.184556860 +0300
+@@ -421,6 +421,11 @@
+ #endif
+ 
+ 	mpgpu_class_init();
++	/*
++	 * Never unload: the vendor aml_thermal keeps calling the GPU cooling
++	 * device after it is unregistered, which oopses into the freed module.
++	 */
++	__module_get(THIS_MODULE);
+ 	MALI_PRINT(("Mali device driver loaded\n"));
+ 
+ 	return 0; /* Success */

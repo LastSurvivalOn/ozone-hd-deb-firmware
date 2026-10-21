@@ -1,0 +1,66 @@
+--- a/drivers/gpu/arm/ump/Kbuild	2016-04-11 22:08:59.000000000 +0300
++++ b/drivers/gpu/arm/ump/Kbuild	2026-10-21 20:46:58.181990088 +0300
+@@ -85,7 +85,12 @@
+ 	linux/ump_osk_atomics.o \
+ 	linux/ump_osk_low_level_mem.o \
+ 	linux/ump_osk_misc.o \
+-	linux/ump_kernel_random_mapping.o 
++	linux/ump_kernel_random_mapping.o \
++	osk/mali_osk_atomics.o \
++	osk/mali_osk_math.o \
++	osk/mali_osk_memory.o \
++	osk/mali_osk_misc.o \
++	osk/ump_map_errcode.o
+ 
+ obj-$(CONFIG_UMP) := ump.o
+ 
+--- a/drivers/gpu/arm/ump/osk/mali_osk_atomics.c	1970-01-01 03:00:00.000000000 +0300
++++ b/drivers/gpu/arm/ump/osk/mali_osk_atomics.c	2026-10-21 20:46:58.183251894 +0300
+@@ -0,0 +1,2 @@
++/* The Mali OS layer, built into ump.ko too when both are modules */
++#include "../../mali/linux/mali_osk_atomics.c"
+--- a/drivers/gpu/arm/ump/osk/mali_osk_math.c	1970-01-01 03:00:00.000000000 +0300
++++ b/drivers/gpu/arm/ump/osk/mali_osk_math.c	2026-10-21 20:46:58.183293137 +0300
+@@ -0,0 +1,2 @@
++/* The Mali OS layer, built into ump.ko too when both are modules */
++#include "../../mali/linux/mali_osk_math.c"
+--- a/drivers/gpu/arm/ump/osk/mali_osk_memory.c	1970-01-01 03:00:00.000000000 +0300
++++ b/drivers/gpu/arm/ump/osk/mali_osk_memory.c	2026-10-21 20:46:58.183324201 +0300
+@@ -0,0 +1,2 @@
++/* The Mali OS layer, built into ump.ko too when both are modules */
++#include "../../mali/linux/mali_osk_memory.c"
+--- a/drivers/gpu/arm/ump/osk/mali_osk_misc.c	1970-01-01 03:00:00.000000000 +0300
++++ b/drivers/gpu/arm/ump/osk/mali_osk_misc.c	2026-10-21 20:46:58.183361115 +0300
+@@ -0,0 +1,2 @@
++/* The Mali OS layer, built into ump.ko too when both are modules */
++#include "../../mali/linux/mali_osk_misc.c"
+--- a/drivers/gpu/arm/ump/osk/ump_map_errcode.c	1970-01-01 03:00:00.000000000 +0300
++++ b/drivers/gpu/arm/ump/osk/ump_map_errcode.c	2026-10-21 20:46:58.183390159 +0300
+@@ -0,0 +1,27 @@
++/* map_errcode() lives in mali_kernel_linux.c, which a modular ump.ko can't link against */
++#include <linux/errno.h>
++#include "mali_osk.h"
++
++int map_errcode(_mali_osk_errcode_t err)
++{
++	switch (err) {
++	case _MALI_OSK_ERR_OK:
++		return 0;
++	case _MALI_OSK_ERR_FAULT:
++		return -EFAULT;
++	case _MALI_OSK_ERR_INVALID_FUNC:
++		return -ENOTTY;
++	case _MALI_OSK_ERR_INVALID_ARGS:
++		return -EINVAL;
++	case _MALI_OSK_ERR_NOMEM:
++		return -ENOMEM;
++	case _MALI_OSK_ERR_TIMEOUT:
++		return -ETIMEDOUT;
++	case _MALI_OSK_ERR_RESTARTSYSCALL:
++		return -ERESTARTSYS;
++	case _MALI_OSK_ERR_ITEM_NOT_FOUND:
++		return -ENOENT;
++	default:
++		return -EFAULT;
++	}
++}
