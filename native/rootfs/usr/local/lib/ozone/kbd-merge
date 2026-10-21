@@ -49,6 +49,9 @@ class LegacyUInput:
 ui = LegacyUInput(NAME, KEYS)
 sel = selectors.DefaultSelector()
 devices = {}
+# Keys each device holds down, by path: a device that goes away with a key down (unplugged, or a
+# virtual one like ozone-remote's stopping) would leave X autorepeating that key for ever
+held = {}
 # Devices that aren't keyboards, by path, with the node's ctime: a new device can get a freed path.
 # Opening and probing them on every event made typing lag by up to 250 ms under load.
 ignored = {}
@@ -81,6 +84,9 @@ def scan():
 def drop(dev):
     sel.unregister(dev)
     devices.pop(dev.path, None)
+    for code in held.pop(dev.path, ()):
+        ui.write(ecodes.EV_KEY, code, 0)
+    ui.syn()
     try:
         dev.close()
     except OSError:
@@ -99,6 +105,8 @@ while True:
             for ev in dev.read():
                 if ev.type == ecodes.EV_KEY and (ev.code < 0x100 or ev.code >= 0x160):
                     ui.write(ev.type, ev.code, ev.value)
+                    keys = held.setdefault(dev.path, set())
+                    (keys.add if ev.value else keys.discard)(ev.code)
             ui.syn()
         except OSError:
             # device was unplugged

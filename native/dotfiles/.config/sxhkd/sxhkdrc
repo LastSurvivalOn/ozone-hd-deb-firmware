@@ -39,3 +39,23 @@ XF86Audio{Raise,Lower}Volume
     ozone-volume {up,down}
 XF86AudioMute
     ozone-volume mute
+
+# The IR remote (its keys: /etc/ozone/remote.conf; ozone-remote handles mouse, text, exit and
+# Power). Arrows, OK, digits, page+/- and the playback keys reach the apps as they are; these
+# start things.
+# A keyboard's power key, or the remote's without ozone-remote. On release: sleep grabs the
+# keyboards, and X would never see the key go up
+@XF86PowerOff
+    sudo -n ozone-standby
+# home: the open windows, then the apps
+XF86HomePage
+    rofi -show combi -modi combi -combi-modi window,drun -display-combi "  Home"
+# browse
+XF86WWW
+    ozone-web-show
+# red
+XF86Launch1
+    yt
+# epg, dvb, TV/radio
+XF86Launch{6,8,9}
+    ozone-tv

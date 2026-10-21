@@ -7,6 +7,8 @@ Android's early suspend instead: writing "mem" to /sys/power/state while holding
 early-suspend handlers (HDMI, OSD, CPU clock down) but never suspends the kernel. USB keyboards,
 mice and the network keep working. Input devices are grabbed while asleep, so the wake-up press
 never reaches X.
+
+The IR remote is ozone-remote's (it holds the device): it wakes the box with "ozone-standby wake".
 """
 import fcntl
 import os
@@ -66,12 +68,26 @@ def main():
         sys.exit('standby only works in native Linux (under Android, use Android)')
     if os.geteuid():
         os.execvp('sudo', ['sudo', sys.argv[0]] + sys.argv[1:])
+    if sys.argv[1:] == ['wake']:
+        try:
+            with open(f'/run/{NAME}.lock') as f:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    return   # nobody holds it: not asleep (the pid in it is an old one)
+                except BlockingIOError:
+                    os.kill(int(f.read()), signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
+        return
 
-    lock = open(f'/run/{NAME}.lock', 'w')
+    lock = open(f'/run/{NAME}.lock', 'a+')
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         sys.exit('already in standby')
+    lock.truncate(0)
+    lock.write(str(os.getpid()))
+    lock.flush()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
     # Nobody is watching: stop video instead of decoding it into a switched-off screen

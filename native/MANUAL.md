@@ -16,7 +16,8 @@ sleep and Android. You need a USB keyboard and a mouse. There's no remote.
 7. [The browser](#7-the-browser)
 8. [Sound](#8-sound)
 9. [When something goes wrong](#9-when-something-goes-wrong)
-10. [All key combinations](#10-all-key-combinations)
+10. [The remote control](#10-the-remote-control)
+11. [All key combinations](#11-all-key-combinations)
 
 ---
 
@@ -30,7 +31,7 @@ item with the arrows and Enter, or click it. Esc closes the menu.
 
 | Item | What it does |
 |---|---|
-| Sleep | Turns the screen off. Press any key or click a mouse button to wake it. Waking is instant. The network keeps working while it sleeps. Quit the video player first: it doesn't stop by itself. |
+| Sleep | Turns the screen off. Press any key or click a mouse button to wake it (or any button on the remote; its Power button also puts the box to sleep). Waking is instant. The network keeps working while it sleeps. Quit the video player first: it doesn't stop by itself. |
 | Android | Closes Linux and starts the original Android (the stock TV app, SmartTube). |
 | Restart desktop | Restarts the graphical session. Open windows close. Use it when something hangs (see section 9). |
 | Screen size | Fits the picture to a screen that cuts off its edges, see below. |
@@ -50,6 +51,7 @@ menu). A purple frame with arrows in the corners appears:
 | **Enter** | save |
 | **Esc** | cancel |
 
+The buttons on the screen do the same with the mouse (or the remote's mouse mode).
 Make the frame and the corner arrows just visible at the edges, then press Enter. The setting is
 kept across reboots, and videos fit into the same area. For another screen, adjust it again.
 
@@ -81,12 +83,14 @@ The panel is the bar along the top of the screen. From left to right:
 | Screen icon | television (section 6) |
 | 1 2 3 4 5 | workspaces (section 3). The current one is highlighted; the ones with windows are coloured. |
 | yellow text | short messages: "Loading video…", "Scan finished", errors. They disappear after 6 s. |
-| centre | the title of the active window |
+| centre | the title of the active window. Click it for a list of the open windows, to switch to one. |
+| pointer and keyboard icons | the remote's mouse mode and the on-screen keyboard (section 10): green when on, a click switches them |
 | CPU %, memory, temperature | system load |
 | IP address | the cable connection (shown only with the cable plugged in) |
 | WiFi | the WiFi network the box is on. Click it to choose a network. It stays grey when not connected. |
 | 🔈 percentage | volume. Click to mute, scroll the wheel over it to change the volume. |
 | date and time | |
+| ✕ | closes the active window |
 | ⏻ | power menu |
 
 **The app menu** opens with **Super+D** or the grid button. Start typing a name ("term", "files"…)
@@ -313,7 +317,50 @@ Sound comes out of the TV over HDMI.
 | No internet (no IP address or WiFi name on the panel) | Click **WiFi** on the panel and choose your network. If it doesn't connect, check the router, then ⏻ → **Reboot**. |
 | "Could not connect …: wrong password?" | Choose the network again and retype the password (letter case matters). |
 
-## 10. All key combinations
+## 10. The remote control
+
+The box's own remote can run everything by itself: point it at the box.
+
+| Button | What it does |
+|---|---|
+| **Power** | sleep; any button wakes the box again |
+| **↑ ↓ ← →**, **OK** | move and choose, like the arrows and Enter |
+| **exit** | back: closes a menu, the on-screen keyboard or the channel list, stops the player, closes the TV window; any other window (YouTube, the browser) it closes |
+| **home** | the open windows and all the apps (YouTube, TV, the browser, Power, Screen size, WiFi…) |
+| **browse** | the browser |
+| red | YouTube |
+| **epg**, **dvb**, **TV/radio** | the TV window |
+| **vol+ / vol−**, **mute** | volume |
+| **page+ / page−** | in the player on TV: next / previous channel; in lists, a page up / down |
+| **0–9** | the channel number: in the TV window it selects the channel (OK watches), in the player it switches to it after a moment (or at once with OK) |
+| **pause**, **unpause** | pause / play in the player |
+| **stop** | stop watching |
+| **<<** | back 10 s in the player |
+| **delete** | deletes a character when typing |
+| **mouse** | mouse mode, see below |
+| **text** | the on-screen keyboard, see below |
+
+**Mouse mode** (for the browser, or anything made for a mouse). Press **mouse**: the pointer icon
+on the panel lights up green. The arrows now move the pointer, faster the longer you hold them;
+**OK** clicks, **info** is the right button, **page+ / page−** scroll. The other buttons work as
+usual. Press **mouse** again to go back.
+
+**The on-screen keyboard**, for typing a search or an address. Press **text** (or click the
+keyboard icon on the panel): a keyboard appears at the bottom and the icon lights up. Move over it
+with the arrows and type the key with **OK**; **delete** erases, the digit buttons type digits.
+**УКР / ENG** switches the letters, **⇧** gives one capital letter. **exit** or **Hide** hides it.
+What it types goes to the window that was being used, so first choose the search field or the
+address bar. It can be clicked with the mouse too.
+
+Green, yellow, blue, usb and record do nothing yet. The **>>**, **|<<**, **>>|** and **menu**
+buttons send the same signal as **<<**, so for now they all go back 10 s.
+
+**With the mouse alone** everything works too: the panel buttons start YouTube, the browser, TV,
+the app menu and the power menu; a click on the window title in the middle of the panel lists the
+open windows; **✕** at the right closes the focused window; the keyboard icon gives the on-screen
+keyboard for typing.
+
+## 11. All key combinations
 
 ### Anywhere
 | Keys | Action |

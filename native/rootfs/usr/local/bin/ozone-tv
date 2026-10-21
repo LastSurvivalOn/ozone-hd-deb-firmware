@@ -1046,6 +1046,9 @@ window, scrolledwindow, list, viewport { background: #11111b; }
 button { background: #1e1e2e; border: 1px solid #313244; border-radius: 16px; padding: 4px 14px;
          box-shadow: none; }
 button:hover, button:focus { border-color: #cba6f7; }
+button.close { font-family: "FontAwesome"; font-size: 16px; background: transparent; border: none;
+               padding: 4px 10px; color: #a6adc8; }
+button.close:hover { background: #f38ba8; color: #11111b; }
 .channels { border-right: 1px solid #313244; }
 row { padding: 6px 12px; outline: none; }
 row:selected { background: #313244; }
@@ -1100,6 +1103,7 @@ def window(test=None):
             self.guide = Guide()
             self.busy = False
             self.cancel, self.waiting, self.after = None, False, None   # see watch()
+            self.typed, self.typed_at = '', 0   # a channel number from the remote's digits
             self.win = Gtk.Window(title='TV')
             self.win.set_default_size(1280, 720)
             self.win.connect('destroy', Gtk.main_quit)
@@ -1116,6 +1120,11 @@ def window(test=None):
                 b = Gtk.Button(label=text)
                 b.connect('clicked', lambda w, a=action: a())
                 header.pack_start(b, False, False, 0)
+            # bspwm draws no title bars, so the window closes here (or with Esc, the panel's ✕)
+            close = Gtk.Button(label='\uf00d', tooltip_text='Close')
+            close.get_style_context().add_class('close')
+            close.connect('clicked', lambda w: self.win.destroy())
+            header.pack_start(close, False, False, 0)
             top.pack_start(header, False, False, 0)
 
             body = Gtk.Box()
@@ -1319,6 +1328,16 @@ def window(test=None):
 
         def on_key(self, w, ev):
             k = Gdk.keyval_name(ev.keyval)
+            name = (k or '').replace('KP_', '')
+            digit = name if len(name) == 1 and name.isdigit() else None
+            if digit and not self.busy:
+                # digits typed within 1.5 s make one number: that channel is selected (OK watches)
+                now = time.monotonic()
+                self.typed = (self.typed if now - self.typed_at < 1.5 else '')[-2:] + digit
+                self.typed_at = now
+                if 1 <= int(self.typed) <= len(self.list):
+                    self.select(int(self.typed) - 1)
+                return True
             if k == 'Escape' and self.busy and self.waiting:
                 self.cancel.set()
                 self.status.set_text('Stopping…')

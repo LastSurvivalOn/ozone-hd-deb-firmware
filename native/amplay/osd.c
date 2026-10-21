@@ -40,6 +40,7 @@
 #define LIST_W      460         /* the channel list */
 #define ROW_H       54
 #define LIST_AFTER  15000       /* ms without input before the list closes too */
+#define DIGITS_AFTER 1500       /* ms after the last digit of a channel number before switching */
 
 /* Font Awesome 4 */
 #define ICON_PLAY   "\xef\x81\x8b"   /* f04b */
@@ -76,6 +77,8 @@ static struct {
     /* live: the channel list */
     struct channel { char num[8], name[96], now[160]; } *ch;
     int nch, cur, sel, top_row, list_open, list_dirty, list_h;
+    int digits;                /* a channel number being typed (the remote's digits), 0 if none */
+    int64_t digits_at;
     struct osd_state shown;    /* what the bars show now */
     double dur;
     char sig[256];
@@ -114,6 +117,7 @@ static void list_show(void)
 
 static void list_hide(void)
 {
+    O.digits = 0;
     if (!O.list_open)
         return;
     XUnmapWindow(O.dpy, O.list);
@@ -370,6 +374,21 @@ void osd_update(const struct osd_state *s)
     XFlush(O.dpy);
 }
 
+/* A digit of a channel number: the list opens on the channel with the number typed so far;
+   osd_poll switches to it once no digit has come for DIGITS_AFTER */
+static void digit_key(int d)
+{
+    if (now_ms() - O.digits_at > DIGITS_AFTER || O.digits >= 100)
+        O.digits = 0;
+    O.digits = O.digits * 10 + d;
+    O.digits_at = now_ms();
+    list_show();
+    for (int i = 0; i < O.nch; i++)
+        if (atoi(O.ch[i].num) == O.digits)
+            O.sel = i;
+    O.list_dirty = 1;
+}
+
 /* Keys while the channel list is open: 1 if the key was the list's (an event may be stored) */
 static int list_key(KeySym k, struct osd_event *e, int *made)
 {
@@ -485,6 +504,13 @@ static int click_action(XButtonEvent *b, struct osd_event *e)
 int osd_poll(struct osd_event *ev, int max)
 {
     int n = 0;
+    if (O.digits && now_ms() - O.digits_at > DIGITS_AFTER) {
+        int typed = O.digits;
+        for (int i = 0; i < O.nch && n < max; i++)
+            if (atoi(O.ch[i].num) == typed && i != O.cur)
+                ev[n++] = (struct osd_event){ OSD_CHANNEL, i };
+        list_hide();
+    }
     while (XPending(O.dpy)) {
         XEvent x;
         XNextEvent(O.dpy, &x);
@@ -496,6 +522,10 @@ int osd_poll(struct osd_event *ev, int max)
             show();
             KeySym k = XLookupKeysym(&x.xkey, 0);
             int made;
+            if (O.nch && !repeat && k >= XK_0 && k <= XK_9) {
+                digit_key(k - XK_0);
+                break;
+            }
             if (O.list_open && list_key(k, &ev[n < max ? n : max - 1], &made)) {
                 n += made && n < max;
                 break;

@@ -229,6 +229,9 @@ menuitem { font-family: "JetBrains Mono"; font-size: 14px; padding: 6px 16px; }
 menuitem:hover { background: #313244; }
 .status { color: #7f849c; }
 .logo { font-family: "FontAwesome"; font-size: 26px; color: #f38ba8; }
+.close { font-family: "FontAwesome"; font-size: 16px; background: transparent; border: none;
+         box-shadow: none; border-radius: 16px; padding: 4px 10px; color: #a6adc8; }
+.close:hover { background: #f38ba8; color: #11111b; }
 flowboxchild { padding: 6px; border-radius: 12px; outline: none; }
 flowboxchild:selected, flowboxchild:hover { background: #313244; }
 .thumb { background: #1e1e2e; border-radius: 10px; }
@@ -386,6 +389,11 @@ def window(query):
                 self.fps.append(str(f), '%d fps' % f)
             self.fps.set_active_id(str(settings['fps']))
             header.pack_start(self.fps, False, False, 0)
+            # bspwm draws no title bars, so windows close here (or with the panel's ✕, Super+Q)
+            close = Gtk.Button(label='\uf00d', tooltip_text='Close')
+            close.get_style_context().add_class('close')
+            close.connect('clicked', lambda w: self.win.destroy())
+            header.pack_start(close, False, False, 0)
             for combo in (self.height, self.fps):
                 combo.connect('changed', lambda w: save_settings({'height': int(self.height.get_active_id()),
                                                                   'fps': int(self.fps.get_active_id())}))

@@ -318,6 +318,8 @@ class Browser(Gtk.ApplicationWindow):
         bar.pack_start(self.entry, True, True, 6)
         for w in (self.find, self.fast, self.reader, self.shield):
             bar.pack_start(w, False, False, 0)
+        # bspwm draws no title bars: the window closes here too (as with Super+Q, it stays ready)
+        bar.pack_start(flat_button('close', 'Close the browser (Super+Q)', self.close), False, False, 8)
 
         self.notebook = Gtk.Notebook(scrollable=True, show_border=False)
         new = flat_button('new', 'New tab (Ctrl+T)', self.new_tab, HOME_PAGE)

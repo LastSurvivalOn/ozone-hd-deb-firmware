@@ -3,6 +3,7 @@
 # alsa module shows such a control as muted forever), so mute here is volume 0, and the level from
 # before is kept in ~/.cache/ozone-volume to come back to.
 #   ozone-volume              for the panel: the level, or "mute"
+#   ozone-volume watch        the same, and again on every change (polybar's module, at once)
 #   ozone-volume up|down      5 % more or less
 #   ozone-volume mute         mute / unmute
 SAVED=${XDG_CACHE_HOME:-$HOME/.cache}/ozone-volume
@@ -11,7 +12,32 @@ level() {
     amixer get Master 2> /dev/null | grep -o '\[[0-9]*%\]' | head -1 | tr -d '[]%'
 }
 
+show() {
+    now=$(level)
+    # the control only exists once something has played since boot
+    if [ -z "$now" ]; then
+        echo "%{F#f9e2af}%{F-} –"
+    elif [ "$now" -eq 0 ]; then
+        echo "%{F#6c7086} mute%{F-}"
+    else
+        echo "%{F#f9e2af}%{F-} $now%"
+    fi
+}
+
 case "$1" in
+watch)
+    # amixer prints a line for every change of a mixer control (softvol's included); without the
+    # control yet (nothing played since boot), look again every few seconds
+    while true; do
+        show
+        if amixer get Master > /dev/null 2>&1; then
+            stdbuf -oL amixer events 2> /dev/null | while read -r line; do
+                case "$line" in *Master*) show ;; esac
+            done
+        fi
+        sleep 3
+    done
+    ;;
 up|down)
     amixer -q set Master 5%$([ "$1" = up ] && echo + || echo -)
     ;;
@@ -25,18 +51,10 @@ mute)
     fi
     ;;
 '')
-    now=$(level)
-    # the control only exists once something has played since boot
-    if [ -z "$now" ]; then
-        echo "%{F#f9e2af}%{F-} –"
-    elif [ "$now" -eq 0 ]; then
-        echo "%{F#6c7086} mute%{F-}"
-    else
-        echo "%{F#f9e2af}%{F-} $now%"
-    fi
+    show
     ;;
 *)
-    echo "usage: ozone-volume [up|down|mute]" >&2
+    echo "usage: ozone-volume [up|down|mute|watch]" >&2
     exit 1
     ;;
 esac

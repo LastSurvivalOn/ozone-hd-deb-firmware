@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Power
+Comment=Sleep, Android, restart, power off
+Exec=ozone-power
+Icon=system-shutdown
+Terminal=false
+Categories=System;

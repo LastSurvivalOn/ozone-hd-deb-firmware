@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=TV
+Comment=Television: channels and the programme guide
+Exec=ozone-tv
+Icon=video-display
+Terminal=false
+Categories=AudioVideo;TV;

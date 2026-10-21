@@ -57,6 +57,8 @@ start)
     chgrp video /etc/ozone/screen $FB/fb0/window_axis $FB/fb0/free_scale &&
         chmod g+w /etc/ozone/screen $FB/fb0/window_axis $FB/fb0/free_scale
     chgrp input /dev/input/* && chmod g+rw /dev/input/*
+    # ozone-remote (in the X session) passes the remote on through virtual devices of its own
+    chgrp input /dev/uinput && chmod g+rw /dev/uinput
 
     # Hardware video decoder (amplay): the stream ports and the sysfs knobs it drives
     chgrp video /dev/amstream_* /dev/amvideo && chmod g+rw /dev/amstream_* /dev/amvideo

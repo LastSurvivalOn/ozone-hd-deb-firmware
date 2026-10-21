@@ -19,7 +19,12 @@ configuration {
     text-color: @text;
 }
 
+/* Placed from the top: centred, rofi starts the window at the middle of this screen (fbdev, no
+   RandR) and the list runs off the bottom */
 window {
+    location: north;
+    anchor: north;
+    y-offset: 70px;
     width: 640px;
     background-color: @base;
     border: 3px;
@@ -42,5 +47,10 @@ entry { placeholder: "search…"; placeholder-color: @subtext; }
 listview { lines: 10; spacing: 4px; fixed-height: false; }
 
 element { padding: 8px 14px; }
-element selected { background-color: @mauve; text-color: @base; }
-element-text { text-color: inherit; }
+/* every state, or rofi's built-in theme shows through (light rows) */
+element normal.normal, element alternate.normal, element normal.active, element alternate.active,
+element normal.urgent, element alternate.urgent { background-color: transparent; text-color: @text; }
+element selected.normal, element selected.active, element selected.urgent {
+    background-color: @mauve; text-color: @base; }
+element-text { background-color: transparent; text-color: inherit; }
+scrollbar { handle-color: @mauve; handle-width: 4px; background-color: @surface0; }

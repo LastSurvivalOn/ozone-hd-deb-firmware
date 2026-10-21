@@ -1,7 +1,13 @@
 #!/bin/sh
 # Catppuccin Mocha
 
+# X gives its XTEST keyboard (xdotool, the on-screen keyboard) the old xfree86 key codes; the
+# real keyboard has evdev ones. Whichever typed last lends the core keyboard its keymap, and sxhkd
+# grabbing keys under the wrong one leaves the media keys dead. Both get the same keymap here.
+setxkbmap -rules evdev -model pc105 -layout us,ua -option -option grp:alt_shift_toggle
 pgrep -x sxhkd > /dev/null || sxhkd &
+# the IR remote: mouse mode, on-screen keyboard, exit and Power
+pgrep -x ozone-remote > /dev/null || ozone-remote &
 
 bspc monitor -d 1 2 3 4 5
 

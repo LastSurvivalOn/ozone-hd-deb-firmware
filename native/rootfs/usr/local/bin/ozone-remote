@@ -1,0 +1,568 @@
+#!/usr/bin/python3
+"""ozone-remote: the IR remote as the only thing needed to run the box.
+
+The remote's buttons come from the kernel's decoder (aml_keypad, keys from /etc/ozone/remote.conf).
+This takes that device for itself and passes the buttons on through a virtual keyboard of its own,
+which kbd-merge merges into X's keyboard like any other. On the way it adds:
+
+  mouse    mouse mode: the arrows move the pointer (faster the longer they are held), OK clicks,
+           info is the right button, page+/page- scroll. mouse again ends it. (The decoder's own
+           mouse mode, which moves a few pixels per press, is switched off in remote.conf.)
+  text     the on-screen keyboard, for typing: the arrows move over it, OK types the key, delete
+           erases, exit hides it; it can be clicked with the mouse too.
+  exit     back: closes menus, the on-screen keyboard, the channel list, stops the player and
+           closes the TV window (Esc); any other window it closes.
+  Power    sleep (ozone-standby); any button wakes the box (ozone-standby can't see the remote,
+           which is held here, so this wakes it).
+
+The panel shows both modes and switches them with a click (ozone-remote status | mouse | osk).
+If this isn't running, kbd-merge still passes the remote on as plain keys.
+
+  ozone-remote          the daemon (started by bspwmrc)
+  ozone-remote mouse    switch mouse mode
+  ozone-remote osk      show / hide the on-screen keyboard
+  ozone-remote status   the panel's indicator
+"""
+import fcntl
+import os
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+NAME = 'ozone-remote'
+REMOTE = 'aml_keypad'
+STATE = os.path.join(os.environ.get('XDG_RUNTIME_DIR') or '/tmp', 'ozone-remote-%d.state' % os.getuid())
+STANDBY_LOCK = '/run/ozone-standby.lock'
+LOG = os.path.expanduser('~/.cache/ozone-remote.log')
+DEBUG = os.path.expanduser('~/.cache/ozone-remote.debug')   # if it exists, every button goes to the log
+
+# Panel colors (Catppuccin Mocha), FontAwesome 4 icons
+ON, OFF = '#a6e3a1', '#6c7086'
+ICON_MOUSE, ICON_KEYBOARD = '', ''
+
+
+def daemon_pid():
+    r = subprocess.run(['pgrep', '-o', '-x', NAME], capture_output=True, text=True)
+    pids = [int(p) for p in r.stdout.split() if int(p) != os.getpid()]
+    return pids[0] if pids else None
+
+
+def status():
+    try:
+        with open(STATE) as f:
+            mouse, osk = f.read().split()
+    except (OSError, ValueError):
+        mouse = osk = '0'
+    print('%%{A1:ozone-remote mouse:}%%{F%s}%s%%{F-}%%{A}  %%{A1:ozone-remote osk:}%%{F%s}%s%%{F-}%%{A}'
+          % (ON if mouse == '1' else OFF, ICON_MOUSE, ON if osk == '1' else OFF, ICON_KEYBOARD))
+
+
+def command(argv):
+    if argv[1] == 'status':
+        status()
+        return 0
+    pid = daemon_pid()
+    if not pid:
+        subprocess.call(['ozone-notify', 'The remote service is not running'])
+        return 1
+    os.kill(pid, signal.SIGUSR2 if argv[1] == 'mouse' else signal.SIGUSR1)
+    return 0
+
+
+if __name__ == '__main__' and len(sys.argv) > 1:
+    if sys.argv[1] not in ('status', 'mouse', 'osk'):
+        sys.exit(__doc__)
+    sys.exit(command(sys.argv))
+
+# ---- the daemon -------------------------------------------------------------------------------
+
+import gi                                          # noqa: E402
+gi.require_version('Gtk', '3.0')
+gi.require_version('Gdk', '3.0')
+from gi.repository import Gdk, GLib, Gtk           # noqa: E402
+from evdev import InputDevice, ecodes, list_devices  # noqa: E402
+
+E = ecodes
+MOUSE_KEY = E.KEY_F19      # the "mouse" button, see remote.conf
+OSK_KEY = E.KEY_F14        # "text"
+RIGHT_CLICK_KEY = E.KEY_F13   # "info", in mouse mode
+
+
+def log(text):
+    try:
+        with open(LOG, 'a') as f:
+            f.write('%s %s\n' % (time.strftime('%F %T'), text))
+    except OSError:
+        pass
+
+
+class LegacyUInput:
+    """A virtual input device through the old uinput setup (write a uinput_user_dev), as kernel 3.10
+    has no UI_DEV_SETUP; see kbd-merge"""
+    UI_DEV_CREATE = 0x5501
+    UI_SET_EVBIT = 0x40045564
+    UI_SET_KEYBIT = 0x40045565
+    UI_SET_RELBIT = 0x40045566
+    BUS_VIRTUAL = 0x06
+
+    def __init__(self, name, keys, rels=()):
+        self.fd = os.open('/dev/uinput', os.O_WRONLY | os.O_NONBLOCK)
+        fcntl.ioctl(self.fd, self.UI_SET_EVBIT, E.EV_KEY)
+        for k in keys:
+            fcntl.ioctl(self.fd, self.UI_SET_KEYBIT, k)
+        if rels:
+            fcntl.ioctl(self.fd, self.UI_SET_EVBIT, E.EV_REL)
+            for r in rels:
+                fcntl.ioctl(self.fd, self.UI_SET_RELBIT, r)
+        # name[80], input_id{bustype, vendor, product, version}, ff_effects_max, abs*[64] x4
+        os.write(self.fd, struct.pack('80sHHHHi256i', name.encode(), self.BUS_VIRTUAL,
+                                      0x1, 0x2 if rels else 0x3, 1, 0, *([0] * 256)))
+        fcntl.ioctl(self.fd, self.UI_DEV_CREATE)
+
+    def emit(self, *events):
+        """(type, code, value) ..., then a SYN_REPORT. One write per event: this kernel's uinput takes
+        only the first event of a write, and events without their SYN_REPORT reach no one"""
+        for t, c, v in events + ((E.EV_SYN, E.SYN_REPORT, 0),):
+            os.write(self.fd, struct.pack('llHHi', 0, 0, t, c, v))
+
+    def key(self, code, value):
+        self.emit((E.EV_KEY, code, value))
+
+    def tap(self, code):
+        self.key(code, 1)
+        self.key(code, 0)
+
+
+class Pointer:
+    """Mouse mode's pointer: moves while an arrow is held, faster and faster"""
+    TICK = 16                    # ms
+    START, TOP, RAMP = 4.0, 26.0, 0.8   # px per tick at first, at most, s from one to the other
+
+    def __init__(self, mouse):
+        self.mouse = mouse
+        self.dx = self.dy = 0
+        self.since = 0
+        self.timer = None
+
+    def press(self, code):
+        self.dx, self.dy = {E.KEY_LEFT: (-1, 0), E.KEY_RIGHT: (1, 0), E.KEY_UP: (0, -1), E.KEY_DOWN: (0, 1)}[code]
+        self.since = time.monotonic()
+        self.step()
+        if not self.timer:
+            self.timer = GLib.timeout_add(self.TICK, self.step)
+
+    def release(self):
+        self.dx = self.dy = 0
+        if self.timer:
+            GLib.source_remove(self.timer)
+            self.timer = None
+
+    def step(self):
+        if not (self.dx or self.dy):
+            self.timer = None
+            return False
+        t = min(1.0, (time.monotonic() - self.since) / self.RAMP)
+        v = round(self.START + (self.TOP - self.START) * t)
+        self.mouse.emit((E.EV_REL, E.REL_X, self.dx * v), (E.EV_REL, E.REL_Y, self.dy * v))
+        return True
+
+
+# ---- the on-screen keyboard -------------------------------------------------------------------
+
+# (label, what it types: a character, or an xdotool key name in <>, or an action in [], width)
+ROWS = {
+    'en': [
+        ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', ('⌫', '<BackSpace>', 1.6)],
+        ['q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', ('/', '/', 1.6)],
+        ['a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', "'", ('Enter', '<Return>', 2.6)],
+        [('⇧', '[shift]', 1.6), 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '@', ('⇧', '[shift]', 2.0)],
+        [('УКР', '[layout]', 1.6), ('Space', ' ', 6.0), ('←', '<Left>', 1.2), ('→', '<Right>', 1.2),
+         ('Tab', '<Tab>', 1.4), ('Hide', '[hide]', 1.6)],
+    ],
+    'ua': [
+        ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', "'", ('⌫', '<BackSpace>', 1.6)],
+        ['й', 'ц', 'у', 'к', 'е', 'н', 'г', 'ш', 'щ', 'з', 'х', 'ї', ('ґ', 'ґ', 1.6)],
+        ['ф', 'і', 'в', 'а', 'п', 'р', 'о', 'л', 'д', 'ж', 'є', ('Enter', '<Return>', 2.6)],
+        [('⇧', '[shift]', 1.6), 'я', 'ч', 'с', 'м', 'и', 'т', 'ь', 'б', 'ю', '.', ('⇧', '[shift]', 2.0)],
+        [('ENG', '[layout]', 1.6), ('Пробіл', ' ', 6.0), ('←', '<Left>', 1.2), ('→', '<Right>', 1.2),
+         ('Tab', '<Tab>', 1.4), ('Сховати', '[hide]', 1.6)],
+    ],
+}
+SHIFTED = dict(zip("1234567890-=[];',./", '!@#$%^&*()_+{}:"<>?'))
+
+OSK_CSS = b"""
+* { font-family: "DejaVu Sans"; font-size: 18px; color: #cdd6f4; }
+window { background: #181825; border-top: 2px solid #cba6f7; }
+button { background: #313244; border: none; border-radius: 8px; box-shadow: none; padding: 0;
+         margin: 3px; min-height: 40px; }
+button:hover { background: #45475a; }
+button.sel { background: #cba6f7; }
+button.sel label { color: #11111b; }
+button.on label { color: #a6e3a1; }
+"""
+
+
+def norm(key):
+    return key if isinstance(key, tuple) else (key, key, 1.0)
+
+
+class Keyboard:
+    """A window at the bottom of the screen that never takes the focus: what it types goes to the
+    window that has it, through XTEST (xdotool)"""
+    HEIGHT = 270
+
+    def __init__(self, on_change):
+        self.on_change = on_change
+        self.layout, self.shift = 'en', False
+        self.row = self.col = 0
+        self.win = Gtk.Window(type=Gtk.WindowType.POPUP)
+        self.win.set_accept_focus(False)
+        self.win.set_keep_above(True)
+        scr = Gdk.Screen.get_default()
+        self.win.move(0, scr.get_height() - self.HEIGHT)
+        self.win.set_size_request(scr.get_width(), self.HEIGHT)
+        self.grid = None
+        self.build()
+
+    @property
+    def visible(self):
+        return self.win.get_visible()
+
+    def build(self):
+        if self.grid:
+            self.win.remove(self.grid)
+        self.grid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin=6)
+        self.buttons = []
+        for r, keys in enumerate(ROWS[self.layout]):
+            line = Gtk.Box(homogeneous=False)
+            row = []
+            for c, key in enumerate(keys):
+                label, value, width = norm(key)
+                if len(label) == 1 and self.shift:
+                    label = SHIFTED.get(label, label.upper())
+                b = Gtk.Button(label=label)
+                b.set_can_focus(False)
+                b.set_size_request(int(width * 80), -1)
+                b.connect('clicked', lambda w, rc=(r, c): self.press(*rc))
+                if value == '[shift]' and self.shift:
+                    b.get_style_context().add_class('on')
+                line.pack_start(b, True, True, 0)
+                row.append(b)
+            self.grid.pack_start(line, True, True, 0)
+            self.buttons.append(row)
+        self.win.add(self.grid)
+        self.grid.show_all()
+        self.mark()
+
+    def mark(self):
+        for r, row in enumerate(self.buttons):
+            for c, b in enumerate(row):
+                ctx = b.get_style_context()
+                (ctx.add_class if (r, c) == (self.row, self.col) else ctx.remove_class)('sel')
+
+    def toggle(self):
+        if self.visible:
+            self.win.hide()
+        else:
+            self.win.show()
+        self.on_change()
+
+    def hide(self):
+        if self.visible:
+            self.win.hide()
+            self.on_change()
+
+    def move(self, code):
+        """An arrow: to the next key, or to the one above / below the middle of this one"""
+        if code in (E.KEY_LEFT, E.KEY_RIGHT):
+            n = len(self.buttons[self.row])
+            self.col = (self.col + (1 if code == E.KEY_RIGHT else -1)) % n
+        else:
+            b = self.buttons[self.row][self.col].get_allocation()
+            middle = b.x + b.width / 2
+            self.row = (self.row + (1 if code == E.KEY_DOWN else -1)) % len(self.buttons)
+            spans = [x.get_allocation() for x in self.buttons[self.row]]
+            self.col = min(range(len(spans)), key=lambda i: abs(spans[i].x + spans[i].width / 2 - middle))
+        self.mark()
+
+    def press(self, r=None, c=None):
+        if r is not None:
+            self.row, self.col = r, c
+            self.mark()
+        _label, value, _w = norm(ROWS[self.layout][self.row][self.col])
+        if value == '[hide]':
+            self.hide()
+        elif value == '[shift]':
+            self.shift = not self.shift
+            self.build()
+        elif value == '[layout]':
+            self.layout = 'ua' if self.layout == 'en' else 'en'
+            self.build()
+        elif value.startswith('<'):
+            self.xdotool('key', '--clearmodifiers', value[1:-1])
+        else:
+            text = value
+            if self.shift and len(value) == 1:
+                text = SHIFTED.get(value, value.upper())
+                self.shift = False
+                self.build()
+            self.xdotool('type', '--clearmodifiers', '--', text)
+
+    def type_digit(self, d):
+        self.xdotool('type', '--', str(d))
+
+    def backspace(self):
+        self.xdotool('key', 'BackSpace')
+
+    @staticmethod
+    def xdotool(*args):
+        # the session's locale is POSIX, in which xdotool takes anything but ASCII for broken text
+        subprocess.Popen(['xdotool'] + list(args), env=dict(os.environ, LC_ALL='C.UTF-8'))
+
+
+# ---- the daemon -------------------------------------------------------------------------------
+
+DIGITS = {E.KEY_1: 1, E.KEY_2: 2, E.KEY_3: 3, E.KEY_4: 4, E.KEY_5: 5, E.KEY_6: 6, E.KEY_7: 7, E.KEY_8: 8,
+          E.KEY_9: 9, E.KEY_0: 0}
+ARROWS = (E.KEY_UP, E.KEY_DOWN, E.KEY_LEFT, E.KEY_RIGHT)
+# windows where exit means Esc (they handle it); other windows it closes
+ESC_CLASSES = ('ozone-tv', 'ozone-screen')
+
+
+class Remote:
+    def __init__(self):
+        self.dev = self.find()
+        self.dev.grab()
+        log('grabbed %s (%s)' % (self.dev.path, self.dev.name))
+        keys = [c for c in range(1, E.KEY_MAX) if c < 0x100 or c >= 0x160]
+        self.kbd = LegacyUInput('ozone-remote', keys)
+        self.mouse = LegacyUInput('ozone-remote-mouse', [E.BTN_LEFT, E.BTN_RIGHT, E.BTN_MIDDLE],
+                                  [E.REL_X, E.REL_Y, E.REL_WHEEL])
+        self.pointer = Pointer(self.mouse)
+        self.mouse_mode = False
+        self.osk = Keyboard(self.changed)
+        self.woke_at = self.wake_sent = 0
+        self.down = set()   # keys passed on and not released yet
+        self.vol_since = self.vol_last = 0
+        self.debug = os.path.exists(DEBUG)
+        GLib.io_add_watch(self.dev.fd, GLib.PRIORITY_HIGH, GLib.IO_IN | GLib.IO_ERR | GLib.IO_HUP, self.on_input)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self.on_signal, 'osk')
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2, self.on_signal, 'mouse')
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self.quit)
+        self.changed()
+
+    @staticmethod
+    def find():
+        for path in list_devices():
+            dev = InputDevice(path)
+            if dev.name == REMOTE:
+                return dev
+            dev.close()
+        raise SystemExit('no %s input device' % REMOTE)
+
+    def quit(self):
+        Gtk.main_quit()
+        return False
+
+    def release_all(self):
+        for code in list(self.down):
+            self.kbd.key(code, 0)
+        self.down.clear()
+        self.pointer.release()
+
+    def changed(self):
+        try:
+            with open(STATE, 'w') as f:
+                f.write('%d %d\n' % (self.mouse_mode, self.osk.visible))
+        except OSError:
+            pass
+        subprocess.Popen(['polybar-msg', 'action', '#remote.hook.0'], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+
+    def on_signal(self, what):
+        if what == 'osk':
+            self.osk.toggle()
+        else:
+            self.set_mouse(not self.mouse_mode)
+        return True
+
+    def set_mouse(self, on):
+        self.mouse_mode = on
+        self.release_all()
+        self.changed()
+
+    def asleep(self):
+        """True while ozone-standby runs, and for the press that wakes the box"""
+        try:
+            with open(STANDBY_LOCK) as f:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    self.woke_at = time.monotonic()
+                    return True
+        except OSError:
+            pass
+        return time.monotonic() - self.woke_at < 0.5
+
+    def on_input(self, fd, cond):
+        if cond & (GLib.IO_ERR | GLib.IO_HUP):
+            log('the remote device went away')
+            Gtk.main_quit()
+            return False
+        try:
+            events = list(self.dev.read())
+        except BlockingIOError:
+            return True
+        except OSError as e:
+            log('read: %s' % e)
+            return True
+        for ev in events:
+            if self.debug and ev.type != E.EV_SYN:
+                log('event %d %d %d (mouse mode %d, keyboard %d)' % (ev.type, ev.code, ev.value,
+                                                                    self.mouse_mode, self.osk.visible))
+            try:
+                if ev.type == E.EV_KEY:
+                    self.key(ev.code, ev.value)
+                elif ev.type == E.EV_REL and not self.asleep():
+                    # the decoder's own mouse mode, should it be on (its fn key is gone from remote.conf)
+                    self.mouse.emit((E.EV_REL, ev.code, ev.value))
+            except Exception as e:   # never stop: the remote would be dead until X restarts
+                log('event %d %d: %r' % (ev.type, ev.code, e))
+        return True
+
+    def key(self, code, value):
+        if self.asleep():
+            # ozone-standby waits for a press on its own devices, and it can't see this one
+            if value == 1 and time.monotonic() - self.wake_sent > 1:
+                self.wake_sent = time.monotonic()
+                subprocess.Popen(['sudo', '-n', 'ozone-standby', 'wake'])
+            return
+        press = value == 1
+        if code == E.KEY_POWER:
+            if press:
+                subprocess.Popen(['sudo', '-n', 'ozone-standby'])
+            return
+        if code == MOUSE_KEY:
+            if press:
+                self.set_mouse(not self.mouse_mode)
+            return
+        if code == OSK_KEY:
+            if press:
+                self.osk.toggle()
+            return
+        if code in (E.KEY_VOLUMEUP, E.KEY_VOLUMEDOWN):
+            self.volume(code, value)
+            return
+        if self.osk.visible and self.osk_key(code, value):
+            return
+        if self.mouse_mode and self.mouse_key(code, value):
+            return
+        if code == E.KEY_ESC:
+            if press:
+                self.back()
+            return
+        self.kbd.key(code, value)
+        (self.down.add if value else self.down.discard)(code)
+
+    def volume(self, code, value):
+        """A step per press and, held, one every 0.2 s or so after 0.4 s (X's autorepeat, 25 a
+        second, would go from silence to full in half a second)"""
+        now = time.monotonic()
+        if value == 1:
+            self.vol_since = now
+        elif value != 2 or now - self.vol_since < 0.4 or now - self.vol_last < 0.18:
+            return
+        self.vol_last = now
+        subprocess.Popen(['ozone-volume', 'up' if code == E.KEY_VOLUMEUP else 'down'])
+
+    def osk_key(self, code, value):
+        """While the on-screen keyboard is up, the arrows, OK, digits, delete and exit are its own"""
+        press = value in (1, 2)
+        if code in ARROWS and not self.mouse_mode:
+            if press:
+                self.osk.move(code)
+            return True
+        if code == E.KEY_ENTER and not self.mouse_mode:
+            if value == 1:
+                self.osk.press()
+            return True
+        if code in DIGITS:
+            if value == 1:
+                self.osk.type_digit(DIGITS[code])
+            return True
+        if code == E.KEY_BACKSPACE:
+            if press:
+                self.osk.backspace()
+            return True
+        if code == E.KEY_ESC:
+            if value == 1:
+                self.osk.hide()
+            return True
+        return False
+
+    def mouse_key(self, code, value):
+        if code in ARROWS:
+            if value == 1:
+                self.pointer.press(code)
+            elif value == 0:
+                self.pointer.release()
+            return True
+        button = {E.KEY_ENTER: E.BTN_LEFT, RIGHT_CLICK_KEY: E.BTN_RIGHT}.get(code)
+        if button:
+            if value in (0, 1):
+                self.mouse.key(button, value)
+            return True
+        if code in (E.KEY_PAGEUP, E.KEY_PAGEDOWN):
+            if value in (1, 2):
+                self.mouse.emit((E.EV_REL, E.REL_WHEEL, 1 if code == E.KEY_PAGEUP else -1))
+            return True
+        return False
+
+    def back(self):
+        """exit: Esc where it means back, otherwise close the window"""
+        if self.running('rofi') or self.running('amplay'):
+            self.kbd.tap(E.KEY_ESC)
+            return
+        r = subprocess.run(['bspc', 'query', '-N', '-n', 'focused.window'], capture_output=True, text=True)
+        node = r.stdout.strip()
+        if not node:
+            self.kbd.tap(E.KEY_ESC)
+            return
+        cls = subprocess.run(['xprop', '-id', node, 'WM_CLASS'], capture_output=True, text=True).stdout
+        if any('"%s"' % c in cls for c in ESC_CLASSES):
+            self.kbd.tap(E.KEY_ESC)
+        else:
+            log('exit closes %s %s' % (node, cls.strip()))
+            subprocess.call(['bspc', 'node', node, '-c'])
+
+    @staticmethod
+    def running(name):
+        return subprocess.call(['pgrep', '-x', name], stdout=subprocess.DEVNULL) == 0
+
+
+def main():
+    if daemon_pid():
+        sys.exit('%s is already running' % NAME)
+    try:
+        Gtk.CssProvider().load_from_data(b'* { padding: 0px; }')   # see yt: the first stylesheet's
+    except GLib.Error:                                             # first number fails to parse
+        pass
+    css = Gtk.CssProvider()
+    css.load_from_data(OSK_CSS)
+    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css,
+                                             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    remote = Remote()
+    try:
+        Gtk.main()
+    finally:
+        remote.release_all()
+        remote.mouse_mode = False
+        remote.osk.win.hide()
+        remote.changed()
+        log('stopped')
+
+
+if __name__ == '__main__':
+    main()

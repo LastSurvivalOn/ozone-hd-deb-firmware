@@ -110,6 +110,9 @@ def window():
     value = Gtk.Label()
     value.get_style_context().add_class('value')
     box.pack_start(value, False, False, 0)
+    # the same with the mouse
+    sizes = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
+    box.pack_start(sizes, False, False, 0)
     buttons = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
     box.pack_start(buttons, False, False, 0)
     overlay.add_overlay(box)
@@ -143,6 +146,12 @@ def window():
         b = Gtk.Button(label=label)
         b.connect('clicked', action)
         buttons.pack_start(b, False, False, 0)
+
+    for label, (dh, dv) in (('← Narrower', (STEP, 0)), ('Wider →', (-STEP, 0)), ('↓ Shorter', (0, STEP)),
+                             ('Taller ↑', (0, -STEP)), ('− Smaller', (STEP, STEP)), ('Bigger +', (-STEP, -STEP))):
+        b = Gtk.Button(label=label)
+        b.connect('clicked', lambda w, d=(dh, dv): change(*d))
+        sizes.pack_start(b, False, False, 0)
 
     keys = {'Left': (STEP, 0), 'Right': (-STEP, 0), 'Up': (0, -STEP), 'Down': (0, STEP),
             'plus': (-STEP, -STEP), 'equal': (-STEP, -STEP), 'KP_Add': (-STEP, -STEP),
