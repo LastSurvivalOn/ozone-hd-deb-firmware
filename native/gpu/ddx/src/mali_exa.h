@@ -49,5 +49,8 @@ typedef struct
 } PrivPixmap;
 
 extern Bool maliSetupExa(ScreenPtr pScreen, ExaDriverPtr exa);
+/* CPU access to a pixmap outside EXA (devPrivate.ptr is valid in between) */
+extern Bool maliBeginCPUAccess(PixmapPtr pPix);
+extern void maliEndCPUAccess(PixmapPtr pPix);
 
 #endif /* _MALI_EXA_H_ */

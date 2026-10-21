@@ -552,6 +552,16 @@ static void maliFinishAccess(PixmapPtr pPix, int index)
 	privPixmap->refs--;
 }
 
+Bool maliBeginCPUAccess(PixmapPtr pPix)
+{
+	return maliPrepareAccess(pPix, EXA_PREPARE_SRC);
+}
+
+void maliEndCPUAccess(PixmapPtr pPix)
+{
+	maliFinishAccess(pPix, EXA_PREPARE_SRC);
+}
+
 static Bool maliCheckComposite(int op, PicturePtr pSrcPicture, PicturePtr pMaskPicture, PicturePtr pDstPicture)
 {
 	IGNORE(op);

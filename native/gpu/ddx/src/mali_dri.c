@@ -33,6 +33,9 @@
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 #include "xorgVersion.h"
 #include "xf86.h"
@@ -344,6 +347,133 @@ static void platform_wait_for_vsync(ScrnInfoPtr pScrn, int fb_lcd_fd)
 #endif
 }
 
+/*
+ * ShadowFB: a swap of a window that draws to the screen goes from the back buffer straight to the
+ * framebuffer, where the window is visible, instead of into the shadow and from there to the
+ * framebuffer: one copy of the frame instead of two, which full-screen games at 60 fps need on this
+ * memory bus (two copies of 720p took Xorg 60 % of a core and capped them at 57 fps). The shadow
+ * keeps the old content there, which only matters if something reads the window back.
+ * A 32-bit window (an 8888 config, as RetroArch insists on) is redirected by Composite on the
+ * 16-bit screen, and X then converts it with pixman from its own pixmap: here the frame goes to
+ * the framebuffer converted to RGB565 at once, where it shows (inside the window, outside what
+ * covers it), and the window pixmap keeps the old frame.
+ */
+static void MaliConvert8888To565(uint16_t *dst, const uint32_t *src, int n)
+{
+#ifdef __ARM_NEON
+	/* 8 pixels at a time: B, G, R apart, then R:G:B packed by shifting in from the right */
+	for (; n >= 8; n -= 8, src += 8, dst += 8)
+	{
+		uint8x8x4_t p = vld4_u8((const uint8_t *)src);
+		uint16x8_t out = vshll_n_u8(p.val[2], 8);
+
+		out = vsriq_n_u16(out, vshll_n_u8(p.val[1], 8), 5);
+		out = vsriq_n_u16(out, vshll_n_u8(p.val[0], 8), 11);
+		vst1q_u16(dst, out);
+	}
+#endif
+	for (; n--; src++)
+	{
+		uint32_t p = *src;
+		*dst++ = ((p >> 8) & 0xf800) | ((p >> 5) & 0x07e0) | ((p >> 3) & 0x001f);
+	}
+}
+
+static Bool MaliDRI2CopyToFramebuffer(DrawablePtr pDraw, RegionPtr pRegion, PixmapPtr srcPixmap)
+{
+	ScreenPtr pScreen = pDraw->pScreen;
+	ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
+	MaliPtr fPtr = MALIPTR(pScrn);
+	WindowPtr pWin = (WindowPtr)pDraw;
+	RegionRec clip;
+	int bpp = pScrn->bitsPerPixel / 8, stride = fPtr->fb_lcd_fix.line_length, n;
+	BoxPtr box;
+
+	Bool convert;
+
+	if (!fPtr->use_shadow || !fPtr->shadow_damage || !pScrn->vtSema || pDraw->type != DRAWABLE_WINDOW)
+	{
+		return FALSE;
+	}
+
+	if (pScreen->GetWindowPixmap(pWin) == pScreen->GetScreenPixmap(pScreen) &&
+	    srcPixmap->drawable.bitsPerPixel == pScrn->bitsPerPixel)
+	{
+		convert = FALSE;
+	}
+	else if (pWin->redirectDraw == RedirectDrawAutomatic && pWin->parent == pScreen->root &&
+	         pScreen->GetWindowPixmap(pWin->parent) == pScreen->GetScreenPixmap(pScreen) &&
+	         srcPixmap->drawable.bitsPerPixel == 32 && pScrn->bitsPerPixel == 16)
+	{
+		convert = TRUE;
+	}
+	else
+	{
+		return FALSE;
+	}
+
+	RegionNull(&clip);
+	RegionCopy(&clip, pRegion);
+	RegionTranslate(&clip, pDraw->x, pDraw->y);
+
+	if (convert)
+	{
+		/* the clip lists of a redirected window are for its pixmap: on screen it shows inside
+		 * its box, but for the windows over it */
+		BoxRec win = { pDraw->x, pDraw->y, pDraw->x + pDraw->width, pDraw->y + pDraw->height };
+		RegionRec winRegion;
+		WindowPtr pSib;
+
+		RegionInit(&winRegion, &win, 1);
+		RegionIntersect(&clip, &clip, &winRegion);
+		RegionUninit(&winRegion);
+
+		for (pSib = pWin->prevSib; pSib; pSib = pSib->prevSib)
+		{
+			if (pSib->viewable)
+			{
+				RegionSubtract(&clip, &clip, &pSib->borderSize);
+			}
+		}
+	}
+	else
+	{
+		RegionIntersect(&clip, &clip, &pWin->clipList);
+	}
+
+	if (!maliBeginCPUAccess(srcPixmap))
+	{
+		RegionUninit(&clip);
+		return FALSE;
+	}
+
+	for (n = RegionNumRects(&clip), box = RegionRects(&clip); n--; box++)
+	{
+		int sbpp = srcPixmap->drawable.bitsPerPixel / 8, y;
+		unsigned char *dst = fPtr->fbmem + fPtr->fboff + box->y1 * stride + box->x1 * bpp;
+		unsigned char *src = (unsigned char *)srcPixmap->devPrivate.ptr +
+		                     (box->y1 - pDraw->y) * srcPixmap->devKind + (box->x1 - pDraw->x) * sbpp;
+
+		for (y = box->y1; y < box->y2; y++, dst += stride, src += srcPixmap->devKind)
+		{
+			if (convert)
+			{
+				MaliConvert8888To565((uint16_t *)dst, (const uint32_t *)src, box->x2 - box->x1);
+			}
+			else
+			{
+				memcpy(dst, src, (box->x2 - box->x1) * bpp);
+			}
+		}
+	}
+
+	maliEndCPUAccess(srcPixmap);
+	/* what is pending in the shadow there is older than this frame */
+	RegionSubtract(DamageRegion(fPtr->shadow_damage), DamageRegion(fPtr->shadow_damage), &clip);
+	RegionUninit(&clip);
+	return TRUE;
+}
+
 static void MaliDRI2CopyRegion(DrawablePtr pDraw, RegionPtr pRegion, DRI2BufferPtr pDstBuffer, DRI2BufferPtr pSrcBuffer)
 {
 	GCPtr pGC;
@@ -363,6 +493,11 @@ static void MaliDRI2CopyRegion(DrawablePtr pDraw, RegionPtr pRegion, DRI2BufferP
 	DrawablePtr dstDrawable = pDraw;
 
 	DEBUG_STR(1, "Blitting!");
+
+	if (DRI2BufferFrontLeft == pDstBuffer->attachment && MaliDRI2CopyToFramebuffer(pDraw, pRegion, srcPixmap))
+	{
+		return;
+	}
 
 	pGC = GetScratchGC(pDraw->depth, pScreen);
 	copyRegion = REGION_CREATE(pScreen, NULL, 0);

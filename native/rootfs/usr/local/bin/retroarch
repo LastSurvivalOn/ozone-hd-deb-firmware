@@ -1,0 +1,4 @@
+#!/bin/sh
+# RetroArch on the GPU (see ozone-gl), with the settings this box needs on top of the user's
+# config: /etc/ozone/retroarch.cfg (drivers, sound through SDL2, paths).
+exec ozone-gl /usr/bin/retroarch --appendconfig /etc/ozone/retroarch.cfg "$@"

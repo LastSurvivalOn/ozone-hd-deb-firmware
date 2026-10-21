@@ -5,7 +5,8 @@ MALI_LIB ?= /usr/local/lib/mali
 MODULEDIR := $(shell pkg-config --variable=moduledir xorg-server)
 
 CFLAGS ?= -O2 -g
-CFLAGS += -fPIC -Wall -Wno-unused -include src/config.h \
+# the S805's Cortex-A5 has NEON (format conversion in mali_dri.c)
+CFLAGS += -mfpu=neon -fPIC -Wall -Wno-unused -include src/config.h \
 	$(shell pkg-config --cflags xorg-server libdrm) -I$(MALI_INC)
 LDLIBS = -L$(MALI_LIB) -Wl,-rpath,$(MALI_LIB) -lUMP -ldrm
 
