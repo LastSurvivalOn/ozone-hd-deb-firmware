@@ -39,7 +39,8 @@ libxft-dev`.
 
 ## Desktop
 
-How to use all of it, with every key combination: [MANUAL.md](MANUAL.md).
+How to use all of it, with every key combination: [MANUAL.md](MANUAL.md). What stock Android does and
+this doesn't yet, by difficulty: [TODO.md](TODO.md).
 
 bspwm + sxhkd + polybar + rofi, Catppuccin Mocha theme. On the panel: app menu, YouTube,
 workspaces, CPU/memory/temperature/IP/volume/clock, power.
@@ -182,6 +183,8 @@ Load log (times per page, crashes): `~/.cache/ozone-web/log`.
 | `HUNG_TASK_PANIC`/`SOFTLOCKUP_PANIC` in the kernel: slow NAND crashed the system | `/etc/sysctl.d/ozone.conf`, as in Android |
 | 32-bit OSD formats have alpha, X writes 0 → black screen; Xorg doesn't support 24 bits | 16-bit framebuffer (RGB565) |
 | udev doesn't work on 3.10 | input config is generated before X starts; device permissions are set in `ozone-hw` |
+| no udev to mount drives | `ozone-media` (init script, native only) reads kernel uevents from netlink and mounts USB/SD drives in `/media`: vfat, NTFS (ntfs-3g), exFAT (exfat-fuse), ext, iso9660/udf |
+| the kernel's CIFS speaks SMB1 only (`vers=2.x/3.0`: "Unknown vers= option"), and `mount.cifs` drops its capabilities, so `ANDROID_PARANOID_NETWORK` refuses its socket (error 13) | network folders go over SMB2/3 with rclone from rclone.org (Debian's 1.60 creates a folder named "．" in the share); kernel CIFS (with the `aid_inet` group) only for SMB1-only servers |
 | `mpv --ao=alsa` enables silence padding → the HDMI audio driver hangs the kernel | `ao=sdl` |
 | no volume control, no mmap (dmix) | softvol `Master`, one sound at a time |
 | no `getrandom()`/seccomp | Dropbear instead of OpenSSH, chrony with `-F 0` |

@@ -1,0 +1,653 @@
+#!/usr/bin/python3
+"""ozone-media: USB drives, SD cards and network folders (Samba) in /media.
+
+There is no udev, so the daemon (/etc/init.d/ozone-media, native Linux only) reads the kernel's
+uevents itself and mounts every drive that is plugged in: FAT, NTFS (ntfs-3g), exFAT (exfat-fuse),
+ext2/3/4, CD/DVD images. Files on them belong to the desktop user. Network folders that were added
+are mounted whenever the network is up, and come back by themselves after the server or the
+network was away.
+
+  ozone-media              the panel's indicator
+  ozone-media menu         the drives and folders: eject, open in a terminal, add a network folder
+  ozone-media daemon       the daemon (root)
+  ozone-media eject PATH   unmount PATH and everything else on its drive (root)
+  ozone-media forget PATH  unmount a network folder and forget it (or by its name; root)
+  ozone-media add          mount a network folder and remember it: JSON on stdin, from menu (root)
+  ozone-media stop         unmount everything, at shutdown (root)
+"""
+import json
+import os
+import pwd
+import re
+import select
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+MEDIA = '/media'
+SHARES = '/etc/ozone/shares.json'   # root only: it holds passwords
+RUN = '/run/ozone-media'
+PAUSED = RUN + '/disconnected'   # network folders disconnected from the menu, until a restart
+LOG = '/var/log/ozone-media.log'
+DRIVES = re.compile(r'^(sd[a-z]+[0-9]*|mmcblk[0-9]+(p[0-9]+)?)$')   # not the NAND, not loops
+SHARE_RETRY = 20    # s between attempts at a network folder that isn't mounted
+NET_TYPES = ('cifs', 'fuse.rclone')
+AID_INET = 3003
+
+# FontAwesome 4: hdd, usb, sitemap (network), sd card has no icon of its own
+ICON_DRIVE, ICON_USB, ICON_NET = '', '', ''
+ON, OFF = '#89b4fa', '#6c7086'
+
+
+def log(text):
+    try:
+        with open(LOG, 'a') as f:
+            f.write('%s %s\n' % (time.strftime('%F %T'), text))
+    except OSError:
+        pass
+
+
+def desktop_user():
+    """Who gets the files: the first ordinary user (debian-setup.sh makes one)"""
+    users = sorted((p for p in pwd.getpwall() if 1000 <= p.pw_uid < 60000), key=lambda p: p.pw_uid)
+    return users[0] if users else pwd.getpwuid(0)
+
+
+def as_user(*cmd):
+    """Run a desktop command (the panel's IPC sockets are per user) from the root daemon"""
+    user = desktop_user().pw_name
+    try:
+        subprocess.Popen(['runuser', '-u', user, '--'] + list(cmd), stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+def notify(text):
+    if os.geteuid() == 0:
+        as_user('ozone-notify', text)
+        as_user('polybar-msg', 'action', '#media.hook.0')
+    else:
+        subprocess.Popen(['ozone-notify', text])
+        subprocess.Popen(['polybar-msg', 'action', '#media.hook.0'], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+
+
+def unescape(path):
+    """/proc/mounts writes spaces and the like as octal escapes"""
+    return re.sub(r'\\([0-7]{3})', lambda m: chr(int(m.group(1), 8)), path)
+
+
+def mounts():
+    """{mount point: (source, type)} under /media"""
+    out = {}
+    with open('/proc/mounts') as f:
+        for line in f:
+            src, mnt, fstype = line.split()[:3]
+            mnt = unescape(mnt)
+            if mnt.startswith(MEDIA + '/'):
+                out[mnt] = (unescape(src), fstype)
+    return out
+
+
+def run(*cmd):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return r.returncode, (r.stderr or r.stdout).strip()
+
+
+def free_point(name):
+    """/media/NAME, or NAME-2... if that is taken; '/' and leading dots are dropped from labels"""
+    name = name.replace('/', '-').lstrip('.').strip() or 'drive'
+    taken = mounts()
+    point, n = os.path.join(MEDIA, name), 1
+    while point in taken or (os.path.exists(point) and os.listdir(point)):
+        n += 1
+        point = os.path.join(MEDIA, '%s-%d' % (name, n))
+    return point
+
+
+def unmount(point, lazy=False):
+    run('sync')
+    code, err = run(*(['umount', '-l', point] if lazy else ['umount', point]))
+    if code == 0:
+        try:
+            os.rmdir(point)
+        except OSError:
+            pass
+    return code, err
+
+
+# ---- drives --------------------------------------------------------------------------------------
+
+def probe(dev):
+    """{'TYPE', 'LABEL'} of a device's filesystem ({'PTTYPE'} alone for a disk with partitions), or
+    {}. blkid's udev format, as its export format escapes labels for the shell and the locale"""
+    code, out = run('blkid', '-p', '-o', 'udev', dev)
+    if code:
+        return {}
+    v = dict(line.split('=', 1) for line in out.splitlines() if '=' in line)
+    info = {}
+    if v.get('ID_FS_TYPE'):
+        info['TYPE'] = v['ID_FS_TYPE']
+    if v.get('ID_FS_LABEL_ENC'):
+        raw = re.sub(rb'\\x([0-9a-fA-F]{2})', lambda m: bytes([int(m.group(1), 16)]),
+                     v['ID_FS_LABEL_ENC'].encode('utf-8', 'surrogateescape'))
+        info['LABEL'] = raw.decode('utf-8', 'replace').strip()
+    if v.get('ID_PART_TABLE_TYPE'):
+        info['PTTYPE'] = v['ID_PART_TABLE_TYPE']
+    return info
+
+
+def mount_options(fstype):
+    u = desktop_user()
+    owner = 'uid=%d,gid=%d' % (u.pw_uid, u.pw_gid)
+    if fstype == 'vfat':
+        # flush: written data goes out at once, so a stick pulled out without Eject loses little
+        return 'vfat', owner + ',fmask=0133,dmask=0022,iocharset=utf8,shortname=mixed,flush,noatime'
+    if fstype == 'ntfs':
+        return 'ntfs-3g', owner + ',fmask=0133,dmask=0022,noatime'
+    if fstype == 'exfat':
+        return 'exfat-fuse', owner + ',fmask=0133,dmask=0022,noatime'
+    if fstype in ('ext2', 'ext3', 'ext4'):
+        # Linux filesystems keep their own owners and permissions
+        return fstype, 'noatime'
+    if fstype in ('iso9660', 'udf'):
+        return fstype, 'ro'
+    return None, None
+
+
+def kind(name):
+    return 'SD card' if name.startswith('mmcblk') else 'USB drive'
+
+
+def mount_drive(name):
+    dev = '/dev/' + name
+    if any(src == dev for src, _ in mounts().values()):
+        return
+    # the device node (devtmpfs) and the partition table can lag the uevent a little
+    info = {}
+    for _ in range(10):
+        if os.path.exists(dev):
+            info = probe(dev)
+            if info:
+                break
+        time.sleep(0.3)
+    if 'TYPE' not in info:
+        return   # its partitions come as uevents of their own
+    fstype, opts = mount_options(info['TYPE'])
+    if not fstype:
+        log('%s: %s, not mounted' % (dev, info['TYPE']))
+        return
+    point = free_point(info.get('LABEL') or ('%s-%s' % (kind(name).split()[0].lower(), name)))
+    os.makedirs(point, exist_ok=True)
+    code, err = run('mount', '-t', fstype, '-o', opts, dev, point)
+    if code:
+        os.rmdir(point)
+        log('%s: mount %s failed: %s' % (dev, fstype, err))
+        notify('%s %s: could not mount (%s)' % (kind(name), os.path.basename(point), info['TYPE']))
+        return
+    log('%s (%s) on %s' % (dev, info['TYPE'], point))
+    notify('%s %s connected' % (kind(name), os.path.basename(point)))
+
+
+def disk_of(name):
+    """sda1 -> sda, mmcblk0p1 -> mmcblk0"""
+    m = re.match(r'^(mmcblk[0-9]+)p[0-9]+$', name) or re.match(r'^(sd[a-z]+)[0-9]+$', name)
+    return m.group(1) if m else name
+
+
+def scan(disk=None):
+    for name in sorted(os.listdir('/sys/class/block')):
+        if DRIVES.match(name) and (disk is None or disk_of(name) == disk):
+            mount_drive(name)
+
+
+def gone(name):
+    """A drive pulled out (or a card taken out): whatever was mounted from it goes too"""
+    for point, (src, _) in mounts().items():
+        if src == '/dev/' + name:
+            unmount(point, lazy=True)
+            log('%s removed while mounted on %s' % (src, point))
+            notify('%s %s was removed without Eject' % (kind(name), os.path.basename(point)))
+
+
+def eject(point):
+    point = os.path.realpath(point)
+    have = mounts()
+    if point not in have:
+        sys.exit('%s is not mounted' % point)
+    src = have[point][0]
+    if src.startswith('/dev/'):
+        disk = disk_of(os.path.basename(src))
+        points = [p for p, (s, _) in have.items()
+                  if s.startswith('/dev/') and disk_of(os.path.basename(s)) == disk]
+    else:
+        points = [point]
+        # or the daemon would connect it again at once
+        os.makedirs(RUN, mode=0o700, exist_ok=True)
+        with open(PAUSED, 'a') as f:
+            f.write(point + '\n')
+    for p in points:
+        code, err = unmount(p)
+        if code:
+            msg = '%s is in use: close what has files open there' % os.path.basename(p) \
+                if 'busy' in err else '%s: %s' % (os.path.basename(p), err)
+            notify(msg)
+            sys.exit(msg)
+    log('ejected %s' % ', '.join(points))
+    notify('%s: safe to remove' % os.path.basename(point) if src.startswith('/dev/')
+           else '%s disconnected' % os.path.basename(point))
+
+
+# ---- network folders -----------------------------------------------------------------------------
+
+def load_shares():
+    try:
+        with open(SHARES) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def save_shares(shares):
+    os.makedirs(os.path.dirname(SHARES), exist_ok=True)
+    fd = os.open(SHARES + '.new', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(shares, f, indent=1)
+    os.replace(SHARES + '.new', SHARES)
+
+
+def parse_address(text):
+    """'\\\\PC\\Movies', 'smb://nas/Movies/Films', '192.168.1.5/Movies' -> (host, 'Movies/Films')"""
+    text = text.strip().replace('\\', '/')
+    text = re.sub(r'^smb:', '', text, flags=re.I).strip('/')
+    host, _, path = text.partition('/')
+    if not host or not path.strip('/'):
+        return None, None
+    return host, path.strip('/')
+
+
+def nbns(name, timeout=1.5):
+    """The address of a Windows-style (NetBIOS) name, asked by broadcast: there's no other way
+    without Samba's nmblookup, and routers seldom know these names"""
+    n = name.upper()[:15].ljust(15) + '\x20'
+    enc = bytes([32]) + bytes(c for ch in n.encode('latin-1') for c in (0x41 + (ch >> 4), 0x41 + (ch & 15)))
+    query = struct.pack('>HHHHHH', 0x4f5a, 0x0110, 1, 0, 0, 0) + enc + b'\0' + struct.pack('>HH', 0x20, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    s.settimeout(timeout)
+    try:
+        s.sendto(query, ('255.255.255.255', 137))
+        data, _ = s.recvfrom(1024)
+        if len(data) >= 62 and data[:2] == query[:2]:
+            return socket.inet_ntoa(data[58:62])
+    except OSError:
+        pass
+    finally:
+        s.close()
+    return None
+
+
+def resolve(host):
+    try:
+        return socket.gethostbyname(host)
+    except OSError:
+        return nbns(host)
+
+
+def rclone_conf(share, ip):
+    """A config of one remote, named after the host (it shows in /proc/mounts as HOST:PATH)"""
+    os.makedirs(RUN, mode=0o700, exist_ok=True)
+    remote = re.sub(r'[^A-Za-z0-9_.-]', '_', share['host'])
+    obscured = subprocess.run(['rclone', 'obscure', '-'], input=share.get('password', ''),
+                              capture_output=True, text=True).stdout.strip()
+    conf = os.path.join(RUN, '%s.conf' % re.sub(r'[^A-Za-z0-9_.-]', '_', share['name']))
+    fd = os.open(conf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write('[%s]\ntype = smb\nhost = %s\nuser = %s\npass = %s\n'
+                % (remote, ip, share.get('user') or 'guest', obscured))
+    return conf, '%s:%s' % (remote, share['path'])
+
+
+def smb2_error(err):
+    """What went wrong, from rclone's message; None if it's worth trying SMB1"""
+    hints = (('logon is invalid', 'wrong user name or password'),
+             ('LOGON_FAILURE', 'wrong user name or password'),
+             ('Access is denied', 'wrong user name or password, or no access to it'),
+             ('permission denied', 'no access to it: check the user name and password'),
+             ('Network Name Not Found', 'no such folder on the computer'),
+             ('BAD_NETWORK_NAME', 'no such folder on the computer'),
+             ('directory not found', 'no such folder on the computer'),
+             ('no route to host', 'the computer does not answer'),
+             ('i/o timeout', 'the computer does not answer'),
+             ('network is unreachable', 'the computer does not answer'),
+             ('connection refused', 'the computer has no shared folders (nothing listens on port 445)'))
+    return next((h for k, h in hints if k.lower() in err.lower()), None)
+
+
+def mount_smb2(share, ip, point):
+    """SMB 2 and 3 through rclone: this kernel's CIFS only speaks SMB1"""
+    conf, remote = rclone_conf(share, ip)
+    base = ['rclone', '--config', conf, '--contimeout', '5s']
+    # a quick look first: mount itself would succeed with a wrong password and fail on every read
+    r = subprocess.run(base + ['--retries', '1', '--low-level-retries', '1', '--max-depth', '1', 'lsf', remote],
+                       capture_output=True, text=True)
+    if r.returncode:
+        err = r.stderr.strip().splitlines()[-1] if r.stderr.strip() else 'rclone failed'
+        return smb2_error(err) or 'SMB1?', err
+    u = desktop_user()
+    os.makedirs(point, exist_ok=True)
+    r = subprocess.run(base + ['mount', remote, point, '--allow-other', '--uid', str(u.pw_uid),
+                               '--gid', str(u.pw_gid), '--umask', '022',
+                               # files added on the server show within 15 s (rclone's default is 5 min)
+                               '--dir-cache-time', '15s', '--vfs-cache-mode', 'writes',
+                               '--cache-dir', '/var/cache/ozone-media', '--daemon', '--daemon-wait', '20s',
+                               '--log-file', '/var/log/ozone-media-rclone.log', '--log-level', 'NOTICE'],
+                       # not pipes: the daemonized rclone would hold them open, and this would wait forever
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if r.returncode or point not in mounts():
+        os.rmdir(point)
+        return 'could not mount it', 'rclone mount: exit %d, see /var/log/ozone-media-rclone.log' % r.returncode
+    return None, None
+
+
+def mount_smb1(share, ip, point):
+    """The kernel's CIFS, for old servers (routers' USB sharing, old NAS) that only speak SMB1"""
+    os.makedirs(RUN, mode=0o700, exist_ok=True)
+    cred = os.path.join(RUN, 'cred')
+    fd = os.open(cred, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        if share.get('user'):
+            f.write('username=%s\npassword=%s\n' % (share['user'], share.get('password', '')))
+    u = desktop_user()
+    opts = 'uid=%d,gid=%d,file_mode=0644,dir_mode=0755,iocharset=utf8,soft,vers=1.0,ip=%s' % (
+        u.pw_uid, u.pw_gid, ip)
+    opts += ',credentials=' + cred if share.get('user') else ',guest'
+    os.makedirs(point, exist_ok=True)
+    try:
+        # mount.cifs drops its capabilities, and then ANDROID_PARANOID_NETWORK lets only aid_inet
+        # open the socket
+        r = subprocess.run(['mount', '-t', 'cifs', '-o', opts, '//%s/%s' % (share['host'], share['path']), point],
+                           capture_output=True, text=True, preexec_fn=lambda: os.setgroups(os.getgroups() + [AID_INET]))
+    finally:
+        os.unlink(cred)
+    if r.returncode == 0:
+        return None, None
+    os.rmdir(point)
+    err = next((line for line in r.stderr.splitlines() if 'error(' in line), r.stderr.strip() or 'mount failed')
+    hints = {'error(13)': 'wrong user name or password', 'error(2)': 'no such folder on the computer',
+             'error(112)': 'the computer does not answer', 'error(115)': 'the computer does not answer',
+             'error(111)': 'the computer has no shared folders (nothing listens on port 445)'}
+    return next((h for k, h in hints.items() if k in err), err), err
+
+
+def mount_share(share):
+    """Mount one network folder at its own place in /media; (point, None) or (None, error)"""
+    ip = resolve(share['host'])
+    if not ip:
+        return None, 'no computer called %s on the network' % share['host']
+    point = share.get('point')
+    if not point or point in mounts() or (os.path.isdir(point) and os.listdir(point)):
+        point = free_point(share['name'])
+    err = detail = None
+    if share.get('proto') != 'smb1':
+        err, detail = mount_smb2(share, ip, point)
+        if not err:
+            share.update(point=point, proto='smb2')
+            log('//%s/%s on %s (SMB2/3)' % (share['host'], share['path'], point))
+            return point, None
+    if share.get('proto') == 'smb1' or err == 'SMB1?':
+        err, detail = mount_smb1(share, ip, point)
+        if not err:
+            share.update(point=point, proto='smb1')
+            log('//%s/%s on %s (SMB1)' % (share['host'], share['path'], point))
+            return point, None
+    log('//%s/%s: %s' % (share['host'], share['path'], detail))
+    return None, err
+
+
+def share_point(share):
+    point = share.get('point')
+    return point if point and mounts().get(point, ('', ''))[1] in NET_TYPES else None
+
+
+def network_up():
+    with open('/proc/net/route') as f:
+        return any(line.split()[1] == '00000000' for line in f.readlines()[1:])
+
+
+def add_share():
+    """From the menu (through sudo): mount it now, and keep it if that worked"""
+    share = json.load(sys.stdin)
+    shares = load_shares()
+    if any(s['host'].lower() == share['host'].lower() and s['path'].lower() == share['path'].lower()
+           for s in shares):
+        sys.exit('%s/%s is already there' % (share['host'], share['path']))
+    point, err = mount_share(share)
+    if err:
+        sys.exit(err)
+    shares.append(share)
+    save_shares(shares)
+    notify('Network folder %s connected' % os.path.basename(point))
+    print(point)
+
+
+def forget(which):
+    """WHICH: the folder's mount point, or its name"""
+    shares = load_shares()
+    point = os.path.realpath(which) if which.startswith('/') else None
+    drop = [s for s in shares if (share_point(s) == point if point else s['name'] == which)]
+    if not drop:
+        sys.exit('no network folder %s' % which)
+    for s in drop:
+        if share_point(s):
+            unmount(share_point(s), lazy=True)
+    save_shares([s for s in shares if s not in drop])
+    log('forgot %s' % ', '.join('//%s/%s' % (s['host'], s['path']) for s in drop))
+    notify('Network folder %s removed' % drop[0]['name'])
+
+
+def shares_pass(failed):
+    """Mount what isn't mounted; tell about a folder only when its state changes"""
+    if not network_up():
+        return
+    shares = load_shares()
+    try:
+        with open(PAUSED) as f:
+            paused = set(f.read().split('\n'))
+    except OSError:
+        paused = set()
+    changed = False
+    for share in shares:
+        key = share['name']
+        if share.get('point') in paused:
+            continue
+        if share_point(share):
+            failed.pop(key, None)
+            continue
+        before = dict(share)
+        point, err = mount_share(share)
+        changed |= share != before
+        if point:
+            notify('Network folder %s connected' % os.path.basename(point))
+            failed.pop(key, None)
+        elif failed.get(key) != err:
+            failed[key] = err
+    if changed:
+        save_shares(shares)
+
+
+# ---- the daemon ----------------------------------------------------------------------------------
+
+def uevents():
+    s = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, 15)   # NETLINK_KOBJECT_UEVENT
+    s.bind((os.getpid(), 1))
+    return s
+
+
+def daemon():
+    os.makedirs(MEDIA, exist_ok=True)
+    # mount points left from before a crash or power loss
+    for name in os.listdir(MEDIA):
+        p = os.path.join(MEDIA, name)
+        if p not in mounts() and os.path.isdir(p) and not os.listdir(p):
+            os.rmdir(p)
+    sock = uevents()
+    log('started')
+    scan()
+    failed, next_shares = {}, 0
+    while True:
+        wait = max(0, next_shares - time.monotonic())
+        if select.select([sock], [], [], wait)[0]:
+            msg = sock.recv(16384).split(b'\0')
+            ev = dict(f.decode(errors='replace').split('=', 1) for f in msg[1:] if b'=' in f)
+            name = ev.get('DEVNAME', '').rsplit('/', 1)[-1]
+            if ev.get('SUBSYSTEM') == 'block' and DRIVES.match(name):
+                action = ev.get('ACTION')
+                if action == 'add':
+                    mount_drive(name)
+                elif action == 'remove':
+                    gone(name)
+                elif action == 'change' and ev.get('DEVTYPE') == 'disk':
+                    # a card reader with a card put in or taken out
+                    if not os.path.exists('/sys/class/block/%s/size' % name) or \
+                            open('/sys/class/block/%s/size' % name).read().strip() == '0':
+                        for part in os.listdir('/sys/class/block'):
+                            if disk_of(part) == name:
+                                gone(part)
+                    else:
+                        scan(name)
+            as_user('polybar-msg', 'action', '#media.hook.0')
+        if time.monotonic() >= next_shares:
+            shares_pass(failed)
+            next_shares = time.monotonic() + SHARE_RETRY
+
+
+def stop_all():
+    """At shutdown, before sendsigs kills the FUSE daemons of NTFS and exFAT drives"""
+    for point in mounts():
+        unmount(point)
+
+
+# ---- the desktop side ----------------------------------------------------------------------------
+
+def describe():
+    """[(label, point, is_drive)] of what is mounted"""
+    out = []
+    for point, (src, fstype) in sorted(mounts().items()):
+        try:
+            st = os.statvfs(point)
+            size = '%.1f GB, %.1f GB free' % (st.f_blocks * st.f_frsize / 1e9, st.f_bavail * st.f_frsize / 1e9)
+        except OSError:
+            size = 'not answering'
+        name = os.path.basename(point)
+        if fstype in NET_TYPES:
+            host = src.split('/')[2] if fstype == 'cifs' else src.split(':')[0]
+            out.append(('%s  %s on %s  (%s)' % (ICON_NET, name, host, size), point, False))
+        else:
+            icon = ICON_DRIVE if 'mmcblk' in src else ICON_USB
+            out.append(('%s  %s  (%s)' % (icon, name, size), point, True))
+    return out
+
+
+def status():
+    n = len(mounts())
+    action = '%%{A1:ozone-media menu &:}%s%%{A}'
+    print(action % ('%%{F%s}%s%%{F-}%s' % (ON if n else OFF, ICON_DRIVE, ' %d' % n if n else '')))
+
+
+def rofi(prompt, lines=(), password=False, message=None):
+    cmd = ['rofi', '-dmenu', '-i', '-p', prompt, '-theme-str', 'listview { lines: %d; }' % max(1, min(len(lines), 8))]
+    if password:
+        cmd += ['-password']
+    if message:
+        cmd += ['-mesg', message]
+    if not lines:
+        cmd += ['-theme-str', 'listview { enabled: false; }']
+    r = subprocess.run(cmd, input='\n'.join(lines), capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def say(text):
+    subprocess.run(['rofi', '-e', text])
+
+
+def menu():
+    items = describe()
+    labels = [label for label, _, _ in items] + ['  Add a network folder…']
+    choice = rofi('  Drives', labels,
+                  message=None if items else 'No drives: plug in a USB drive or an SD card')
+    if choice is None:
+        return
+    if choice.endswith('network folder…'):
+        add_menu()
+        return
+    for label, point, drive in items:
+        if label == choice:
+            what = rofi(os.path.basename(point), ['  Open in a terminal',
+                                                   '  Eject' if drive else '  Disconnect',
+                                                   ] + ([] if drive else ['  Forget this folder']))
+            if what is None:
+                return
+            if 'terminal' in what:
+                subprocess.Popen(['urxvt', '-cd', point])
+            elif 'Forget' in what:
+                subprocess.run(['sudo', '-n', sys.argv[0], 'forget', point])
+            else:
+                r = subprocess.run(['sudo', '-n', sys.argv[0], 'eject', point], capture_output=True, text=True)
+                if r.returncode:
+                    say(r.stderr.strip() or 'Could not eject')
+            return
+
+
+def add_menu():
+    text = rofi('  Address', message='The computer and the folder, for example 192.168.1.10/Movies '
+                'or \\\\PC\\Movies (the name of a Windows PC works too)')
+    if not text:
+        return
+    host, path = parse_address(text)
+    if not host:
+        say('That is not a folder address: it needs the computer and the folder, e.g. 192.168.1.10/Movies')
+        return
+    user = rofi('  User', message='The user name on %s; leave it empty for a folder open to all' % host)
+    if user is None:
+        return
+    password = ''
+    if user:
+        password = rofi('  Password', password=True, message='The password of %s on %s' % (user, host))
+        if password is None:
+            return
+    subprocess.Popen(['ozone-notify', 'Connecting to %s…' % host])
+    share = {'name': path.rsplit('/', 1)[-1], 'host': host, 'path': path, 'user': user, 'password': password}
+    r = subprocess.run(['sudo', '-n', sys.argv[0], 'add'], input=json.dumps(share), capture_output=True, text=True)
+    if r.returncode:
+        say('Could not connect %s/%s: %s' % (host, path, r.stderr.strip() or 'unknown error'))
+
+
+def main():
+    args = sys.argv[1:]
+    root_only = {'daemon', 'eject', 'add', 'forget', 'stop'}
+    if args and args[0] in root_only and os.geteuid():
+        sys.exit('%s %s: run as root' % (os.path.basename(sys.argv[0]), args[0]))
+    if not args:
+        status()
+    elif args == ['menu']:
+        menu()
+    elif args == ['daemon']:
+        daemon()
+    elif args == ['stop']:
+        stop_all()
+    elif args[0] == 'eject' and len(args) == 2:
+        eject(args[1])
+    elif args == ['add']:
+        add_share()
+    elif args[0] == 'forget' and len(args) == 2:
+        forget(args[1])
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == '__main__':
+    main()

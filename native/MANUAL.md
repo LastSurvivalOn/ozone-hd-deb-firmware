@@ -1,7 +1,8 @@
 # OzoneHD box: user manual
 
 How to use the box in native Linux: the desktop, YouTube, TV, the browser, the video player,
-sleep and Android. You need a USB keyboard and a mouse. There's no remote.
+sleep and Android. The box's own remote runs everything (section 10); a USB keyboard and a
+mouse work too.
 
 **Super** is the key with the Windows logo. "Super+Q" means hold Super and press Q.
 
@@ -17,14 +18,15 @@ sleep and Android. You need a USB keyboard and a mouse. There's no remote.
 8. [Sound](#8-sound)
 9. [When something goes wrong](#9-when-something-goes-wrong)
 10. [The remote control](#10-the-remote-control)
-11. [All key combinations](#11-all-key-combinations)
+11. [USB drives, SD cards and network folders](#11-usb-drives-sd-cards-and-network-folders)
+12. [All key combinations](#12-all-key-combinations)
 
 ---
 
 ## 1. Turning on, sleep, power off, Android
 
-**Turning on.** Plug the box in. The pulsing Ozone HD logo shows while Linux starts, until the desktop
-appears.
+**Turning on.** Plug the box in, or, after **Power off**, press **Power** on the remote. The pulsing
+Ozone HD logo shows while Linux starts, until the desktop appears.
 
 **The power menu** is **Super+Shift+E** or the ⏻ button at the right end of the panel. Choose an
 item with the arrows and Enter, or click it. Esc closes the menu.
@@ -85,6 +87,7 @@ The panel is the bar along the top of the screen. From left to right:
 | yellow text | short messages: "Loading video…", "Scan finished", errors. They disappear after 6 s. |
 | centre | the title of the active window. Click it for a list of the open windows, to switch to one. |
 | pointer and keyboard icons | the remote's mouse mode and the on-screen keyboard (section 10): green when on, a click switches them |
+| drive icon | USB drives, SD cards and network folders (section 11): how many are open; a click gives the list |
 | CPU %, memory, temperature | system load |
 | IP address | the cable connection (shown only with the cable plugged in) |
 | WiFi | the WiFi network the box is on. Click it to choose a network. It stays grey when not connected. |
@@ -333,6 +336,7 @@ The box's own remote can run everything by itself: point it at the box.
 | **exit** | back: closes a menu, the on-screen keyboard or the channel list, stops the player, closes the TV window; any other window (YouTube, the browser) it closes |
 | **home** | the open windows and all the apps (YouTube, TV, the browser, Power, Screen size, WiFi…) |
 | **browse** | the browser |
+| **usb** | the drives and network folders (section 11) |
 | **info** | the panel, over a full-screen window too (in mouse mode: the right mouse button) |
 | red | YouTube |
 | **epg**, **dvb**, **TV/radio** | the TV window |
@@ -358,15 +362,54 @@ with the arrows and type the key with **OK**; **delete** erases, the digit butto
 What it types goes to the window that was being used, so first choose the search field or the
 address bar. It can be clicked with the mouse too.
 
-Green, yellow, blue, usb and record do nothing yet. The **>>**, **|<<**, **>>|** and **menu**
-buttons send the same signal as **<<**, so for now they all go back 10 s.
+Green, yellow, blue and record do nothing yet. The **>>**, **|<<**, **>>|** and **menu**
+buttons send exactly the same signal as **<<** (the remote is made that way), so they all go
+back 10 s.
 
 **With the mouse alone** everything works too: the panel buttons start YouTube, the browser, TV,
 the app menu and the power menu; a click on the window title in the middle of the panel lists the
 open windows; **✕** at the right closes the focused window; the keyboard icon gives the on-screen
 keyboard for typing.
 
-## 11. All key combinations
+## 11. USB drives, SD cards and network folders
+
+**USB drives and SD cards** open by themselves: plug one in (a USB stick, a USB hard disk, a card
+in the box's SD slot) and after a second or two the panel says "USB drive NAME connected". Its
+files are in the folder **/media/NAME**, where NAME is the drive's label (or something like
+`usb-sda1` for a drive without one); a drive with several partitions gives a folder for each.
+Drives formatted on Windows or a Mac (FAT32, exFAT, NTFS) can be read and written. Linux drives
+(ext4) and CD/DVD images can be read; writing to a Linux drive works where its own permissions
+allow it.
+
+The **drive icon** on the panel (to the right of the remote's icons) shows how many drives and
+folders are open, and grey when there are none. Click it, press **usb** on the remote, or choose
+"Drives and network folders" in the app menu:
+
+| In the list | What it does |
+|---|---|
+| a drive | **Eject** (wait for "NAME: safe to remove", then pull it out), or **Open in a terminal** |
+| a network folder | **Disconnect** (until the box restarts), **Forget this folder** (disconnect it for good), **Open in a terminal** |
+| **Add a network folder…** | see below |
+
+Pull a USB stick out only after **Eject**. Pulled out without it, the panel says "…was removed
+without Eject": what was being written at that moment may be lost. If Eject says "NAME is in use",
+close the program that has a file open there (the player, a terminal standing in that folder).
+
+**Network folders** are the shared folders of a computer or a NAS on the home network (Windows
+"sharing", Samba, a router with a USB disk). **Add a network folder…** asks three things:
+1. **Address**: the computer and the folder, for example `192.168.1.10/Movies`,
+   `\\DESKTOP-PC\Movies` or `smb://nas/Movies/Films`. The computer can be its IP address or its
+   name on the network.
+2. **User**: the user name on that computer. Leave it empty for a folder open to all.
+3. **Password** of that user.
+
+If it connects, the panel says "Network folder Movies connected" and the files are in
+**/media/Movies**. The box remembers the folder and connects it again by itself after a restart,
+and whenever the network or that computer comes back. If it doesn't connect, a message says why:
+a wrong user name or password, no such folder, the computer doesn't answer, or there's no computer
+by that name.
+
+## 12. All key combinations
 
 ### Anywhere
 | Keys | Action |

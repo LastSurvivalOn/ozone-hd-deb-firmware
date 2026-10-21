@@ -14,7 +14,7 @@ tar -C "$HERE/rootfs" -czf - \
     usr/local/lib/ozone/desktop usr/local/lib/ozone/gen-xorg-input usr/local/lib/ozone/kbd-merge usr/local/lib/ozone/splash \
     usr/local/lib/ozone/hdmi-watch etc/init.d/ozone-hw \
     usr/local/bin/yt usr/local/bin/ozone-web usr/local/bin/ozone-web-show usr/local/share/applications/ozone-web.desktop usr/local/bin/ozone-power usr/local/bin/ozone-screen usr/local/share/applications/ozone-screen.desktop usr/local/bin/ozone-standby usr/local/bin/ozone-notify etc/init.d/ozone-input etc/ozone/remote.conf etc/ozone/native-only \
-    usr/local/bin/ozone-wifi usr/local/bin/ozone-volume usr/local/bin/ozone-remote usr/local/bin/ozone-panel usr/local/share/applications/ozone-wifi.desktop usr/local/share/applications/yt.desktop usr/local/share/applications/ozone-tv.desktop usr/local/share/applications/ozone-power.desktop etc/init.d/ozone-wifi usr/local/lib/ozone/wifi-event usr/local/lib/ozone/netwatch \
+    usr/local/bin/ozone-wifi usr/local/bin/ozone-volume usr/local/bin/ozone-remote usr/local/bin/ozone-panel usr/local/bin/ozone-media usr/local/share/applications/ozone-media.desktop etc/init.d/ozone-media usr/local/share/applications/ozone-wifi.desktop usr/local/share/applications/yt.desktop usr/local/share/applications/ozone-tv.desktop usr/local/share/applications/ozone-power.desktop etc/init.d/ozone-wifi usr/local/lib/ozone/wifi-event usr/local/lib/ozone/netwatch \
     etc/X11/xorg.conf.d/00-ozone-screen.conf etc/X11/Xwrapper.config etc/asound.conf |
     ssh_box 'sudo tar -C / --no-same-owner -xzf -'
 
@@ -29,6 +29,12 @@ echo ">> yt-dlp (latest release: the Debian version stopped working with YouTube
 ssh_box 'sudo curl -fsSL -o /usr/local/bin/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp &&
          sudo chmod 755 /usr/local/bin/yt-dlp && yt-dlp --version'
 
+echo ">> rclone (network folders over SMB2/3; Debian's 1.60 litters shares with a folder named \"．\")"
+ssh_box 'set -e; d=$(mktemp -d)
+         curl -fsSL -o $d/rclone.zip https://downloads.rclone.org/rclone-current-linux-arm-v7.zip
+         python3 -I -c "import sys, zipfile; z = zipfile.ZipFile(sys.argv[1]); n = [x for x in z.namelist() if x.endswith(\"/rclone\")][0]; open(sys.argv[2], \"wb\").write(z.read(n))" $d/rclone.zip $d/rclone
+         sudo install -m 755 $d/rclone /usr/local/bin/rclone; rm -r $d; rclone version | head -1'
+
 echo ">> permissions and autostart"
 ssh_box 'set -e
     sudo usermod -a -G video,audio,input,tty "$(id -un)"
@@ -42,6 +48,9 @@ ssh_box 'set -e
     # WiFi (wpa_supplicant; the networks are chosen with ozone-wifi)
     sudo apt-get install -y -qq --no-install-recommends wpasupplicant > /dev/null
     sudo update-rc.d ozone-wifi defaults
+    # drives and network folders (ozone-media: FAT, NTFS, exFAT, ext; cifs-utils for SMB1 servers)
+    sudo apt-get install -y -qq --no-install-recommends ntfs-3g exfat-fuse cifs-utils > /dev/null
+    sudo update-rc.d ozone-media defaults
     # ozone-web opens links from other programs
     sudo update-alternatives --install /usr/bin/x-www-browser x-www-browser /usr/local/bin/ozone-web 60 > /dev/null
     fc-list : family | grep -i -E "jetbrains|fontawesome" | sort -u'

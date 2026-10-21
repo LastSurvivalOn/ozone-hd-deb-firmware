@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Drives and network folders
+Comment=USB drives, SD cards and Samba folders: eject, open, add a network folder
+Exec=ozone-media menu
+Icon=drive-removable-media
+Terminal=false
+Categories=System;Utility;

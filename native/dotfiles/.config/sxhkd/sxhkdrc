@@ -53,6 +53,9 @@ XF86HomePage
 # browse
 XF86WWW
     ozone-web-show
+# usb: the drives and network folders
+XF86Launch7
+    ozone-media menu
 # red
 XF86Launch1
     yt

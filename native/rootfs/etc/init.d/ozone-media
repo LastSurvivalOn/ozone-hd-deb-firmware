@@ -1,0 +1,38 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          ozone-media
+# Required-Start:    $local_fs $remote_fs
+# Required-Stop:     $local_fs $remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: USB drives, SD cards and network folders in /media (no udev)
+### END INIT INFO
+
+# Under Android, Android's vold mounts the drives
+/etc/ozone/is-native || exit 0
+
+DAEMON=/usr/local/bin/ozone-media
+PIDFILE=/run/ozone-media.pid
+
+case "$1" in
+start)
+    start-stop-daemon --start --quiet --background --make-pidfile --pidfile $PIDFILE \
+        --startas /bin/sh -- -c "exec /usr/bin/python3 $DAEMON daemon 2>> /var/log/ozone-media.log"
+    ;;
+stop)
+    start-stop-daemon --stop --quiet --pidfile $PIDFILE --remove-pidfile
+    # now, while the FUSE daemons of NTFS and exFAT drives still run (sendsigs comes next)
+    /usr/bin/python3 $DAEMON stop
+    ;;
+restart|force-reload)
+    start-stop-daemon --stop --quiet --pidfile $PIDFILE --remove-pidfile
+    $0 start
+    ;;
+status)
+    start-stop-daemon --status --pidfile $PIDFILE
+    ;;
+*)
+    echo "usage: $0 start|stop|restart|status" >&2
+    exit 3
+    ;;
+esac
