@@ -39,19 +39,19 @@ tar -C "$D" -czf - . | ssh_box 'set -e; d=$(mktemp -d); tar -C $d -xzf -
     sudo cp -r $d/mali_headers/. $I/
     # build tools and headers for the X driver
     sudo apt-get install -y -qq --no-install-recommends gcc make xserver-xorg-dev libdrm-dev libx11-dev > /dev/null
-    # our libEGL.so.1 in front of libMali.so; GLES straight from libMali.so
-    gcc -O2 -Wall -shared -fPIC -Wl,-soname,libEGL.so.1 -I $I $d/egl-fix/egl-fix.c \
-        -o $d/libEGL.so.1 -L $L -lMali -lX11 -ldl
+    # our libEGL.so.1 (and libGLESv2.so.2) in front of libMali.so; GLES 1 straight from libMali.so
+    gcc -O2 -Wall -shared -fPIC -Wl,-soname,libEGL.so.1 -Wl,-Bsymbolic -I $I \
+        $d/egl-fix/egl-fix.c $d/egl-fix/gles-fix.c -o $d/libEGL.so.1 -L $L -Wl,--no-as-needed -lMali -Wl,--as-needed -lUMP -lX11 -lXext -ldl -lpthread
     sudo install -m 755 $d/libEGL.so.1 $L/
     cd $L
-    sudo ln -sf libEGL.so.1 libEGL.so
-    for l in libGLESv2.so.2 libGLESv2.so libGLESv1_CM.so.1 libGLESv1_CM.so; do sudo ln -sf libMali.so $l; done
+    for l in libEGL.so libGLESv2.so.2 libGLESv2.so; do sudo ln -sf libEGL.so.1 $l; done
+    for l in libGLESv1_CM.so.1 libGLESv1_CM.so; do sudo ln -sf libMali.so $l; done
     # for programs of your own: gcc prog.c $(pkg-config --cflags --libs mali-gles), run with ozone-gl
     sudo mkdir -p /usr/local/lib/pkgconfig
     printf "%s\n" "libdir=$L" "includedir=$I" "" "Name: mali-gles" \
         "Description: OpenGL ES 2.0 and EGL (X11) on the Mali-450; run programs with ozone-gl" \
         "Version: r5p0" "Cflags: -I\${includedir}" \
-        "Libs: -L\${libdir} -Wl,-rpath-link,\${libdir} -lEGL -lGLESv2" | sudo tee /usr/local/lib/pkgconfig/mali-gles.pc > /dev/null
+        "Libs: -L\${libdir} -Wl,-rpath-link,\${libdir} -lEGL -lGLESv2 -lMali" | sudo tee /usr/local/lib/pkgconfig/mali-gles.pc > /dev/null
     echo ">> Mali X driver, built on the box"
     make -s -C $d/ddx MALI_INC=$I MALI_LIB=$L
     sudo make -s -C $d/ddx install

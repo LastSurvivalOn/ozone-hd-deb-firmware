@@ -86,6 +86,11 @@ Several of these were found by bricking or hanging the box. Don't undo them.
     X pixmap (cached UMP) and fetch with XShmGetImage: ~3 ms.
   - RetroArch must use `audio_driver = "sdl2"` (`/etc/ozone/retroarch.cfg`), not alsa, for the
     same HDMI hang as mpv.
+  - WebKit on the GPU (`OZONE_WEB_GPU=1 ozone-web`) runs through the same shims: surfaceless
+    display and context, RGBA8 renderbuffers on X pixmaps, readback from UMP. In a process that
+    also loaded glvnd's `libGL.so.1` (WebKit), a plain call from the shim binds to glvnd's stubs:
+    call libMali through `MALI()`. Link the shim with `--no-as-needed -lMali`, or the dependency
+    is dropped and every GL program breaks.
 - The CPU governor is `interactive` with all cores online (`ozone-hw`); the stock `hotplug` was slower for interactive use.
 - Run `sync` after deploying files to the box. A crash has left a 0-byte init script before.
 - `/system` is nearly full and is mounted read-only. Remount it rw only briefly, as `autostart.sh` does.

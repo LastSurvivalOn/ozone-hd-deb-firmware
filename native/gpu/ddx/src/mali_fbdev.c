@@ -41,6 +41,7 @@
 #include "xf86xv.h"
 #include "xf86Crtc.h"
 #include "micmap.h"
+#include "shmint.h"
 
 #include "mali_def.h"
 #include "mali_fbdev.h"
@@ -1801,6 +1802,11 @@ static Bool MaliScreenInit(SCREEN_INIT_ARGS_DECL)
 		free(fPtr->exa);
 		fPtr->exa = NULL;
 	}
+
+	/* MIT-SHM shared pixmaps (fb wraps the client's segment; EXA leaves such pixmaps to fb): cairo
+	 * then hands X its images in place instead of having X copy each one, which for WebKit's frames
+	 * is a 3.5 MB copy a frame on the X server's core */
+	ShmRegisterFbFuncs(pScreen);
 
 	/* after fb and EXA, which would replace what damage wraps */
 	if (fPtr->use_shadow)

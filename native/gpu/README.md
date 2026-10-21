@@ -197,14 +197,54 @@ GLES 2.0 in "dumb mode" with a 565 config:
 Decoding alone is 26 fps at 720p. Texture uploads are the GPU side's cost: there is no
 `GL_EXT_unpack_subimage`, and the driver retiles on the CPU.
 
-WebKitGTK 2.50 does not use the GPU (`webkit://gpu`: "Policy: never"):
+WebKitGTK 2.50 on the GPU, through `egl-fix` (no change to WebKit). Out of the box it turns
+acceleration off (`webkit://gpu`: "Policy: never"):
 
-- Its render process needs an EGL 1.5 platform display: surfaceless or GBM.
-- It hands frames over as DMA-BUF or shared memory. Shared memory means
-  `glReadPixels`, which takes ~130 ms on this GPU.
-- With Mali, a CSS animation of three big layers runs at the same 2.1 fps as
-  CPU rendering, all in the WebProcess main thread (Skia on the CPU).
-- So the browser needs WebKit itself changed, not just a driver.
+- the UI process wants `EGL_MESA_platform_surfaceless` or `EGL_KHR_platform_gbm` among the client
+  extensions;
+- the web process wants that surfaceless display and `EGL_KHR_surfaceless_context`;
+- with no DMA-BUF it renders each frame into an RGBA8 renderbuffer and copies it out with
+  `glReadPixels(GL_BGRA)` into shared memory for the UI process. Mali doesn't read BGRA at all
+  (`GL_INVALID_ENUM`), and 720p takes it 160 ms in RGBA.
+
+`egl-fix` makes up all three. The surfaceless display is an X connection of its own, and a context
+without a surface gets a hidden 1x1 pbuffer. An RGBA8 renderbuffer gets a texture on an EGLImage of
+an X pixmap, in its place as the colour attachment. `glReadPixels` of it copies the pixmap's UMP
+memory, which DRI2 names: 16 ms for 1280x680, with no X request.
+
+Two traps on the way:
+
+- WebKit's process has glvnd's `libGL.so.1` loaded. Every libMali function the shim calls goes
+  through a pointer from `dlsym` on libMali's handle (`MALI()`), as a plain call binds to glvnd's
+  stubs. libMali's own extension table resolved to those stubs too (`glEGLImageTargetTexture2DOES`
+  did nothing): `eglGetProcAddress` now looks in libMali first.
+- `glEGLImageTargetRenderbufferStorageOES` left the renderbuffer 0x0 in WebKit, hence the texture.
+
+Results, with webkit://gpu showing the render process on "Mali-450 MP", screen updates a second:
+
+| Test | CPU (as ozone-web) | GPU |
+|---|---|---|
+| CSS animation, three big layers | 3 | 24 |
+| smooth scrolling Wikipedia | 6.5 | 9.7 |
+| ozone-web wheel scrolling Wikipedia (no smooth scrolling) | 5.2 | 4.5 |
+
+The limit is X:
+
+- every frame crosses whole through shared memory;
+- GTK clears its double buffer twice;
+- cairo uploads the frame into a new pixmap and composites it flipped (GL rows go bottom up).
+
+That is ~24 MB of memory traffic a frame, ~25 frames a second on this bus, and X at 100 %. The CPU
+path redraws only the strip a scroll exposes. So ozone-web takes the GPU only with
+`OZONE_WEB_GPU=1`. It costs ~45 MB of memory.
+
+The X driver now does less for every client:
+
+- pixmaps live in system memory until DRI2 gives them to the GPU;
+- freed pixmap memory is pooled;
+- MIT-SHM has shared pixmaps.
+
+Under WebKit this took X from 35000 page faults and ~1150 UMP cache ioctls a second down to none.
 
 ## fbdev-only findings (before UMP)
 
@@ -231,3 +271,5 @@ WebKitGTK 2.50 does not use the GPU (`webkit://gpu`: "Policy: never"):
 | `pixmapread.c` | render into an X pixmap, read it back with XShmGetImage vs glReadPixels |
 | `gpufilter.c` | GPU computing round trip (a blur), against the CPU |
 | `readpixels-spy.c` | LD_PRELOAD: glReadPixels and eglSwapBuffers calls and time |
+| `rbread.c` | WebKit's frame readback: surfaceless display, RGBA8 renderbuffer, glReadPixels(BGRA) |
+| `screenfps.py` | how often the screen really changes (samples fb0) |

@@ -105,11 +105,12 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
 - [ ] **Medium**: a TV-style home screen with tiles (Android's DTVLauncher); now rofi and the panel.
 - [x] **Hard**: GPU acceleration (Mali-450) for X: OpenGL ES 2.0 for games, mpv and code of
   one's own (`install-gpu.sh`, `install-games.sh`, [gpu/README.md](gpu/README.md)).
-- [ ] **Hard**: the browser on the GPU. WebKitGTK 2.50 turns acceleration off on this driver: it
-  needs an EGL 1.5 surfaceless or GBM display, and it hands frames over by `glReadPixels`
-  (160 ms for 720p here). Rendering into FBOs on X pixmaps is fast (a blur pass 11 ms, read back
-  in 3 ms), so a backend of that kind could work, inside WebKit or in a shim under it. Video in
-  web pages decodes in software either way (the hardware decoder isn't the GPU).
+- [x] **Hard**: the browser on the GPU (`OZONE_WEB_GPU=1`): WebKit composites on the Mali-450
+  through shims under it (native/gpu/egl-fix), CSS animations 8 times faster.
+- [ ] **Hard**: the browser's frames straight to the screen. Each still crosses to X whole through
+  shared memory, ~25 a second at most, so scrolling gains nothing yet. It needs a WebKit of our
+  own: frames kept as X pixmaps that X shows directly. Video in web pages: there are no
+  GStreamer H.264 decoders (gstreamer1.0-libav), and decoding would be in software anyway.
 - [ ] **Hard / not planned**: Android apps (Google Play, APKs) in Linux. Rebooting into Android
   is the way.
 

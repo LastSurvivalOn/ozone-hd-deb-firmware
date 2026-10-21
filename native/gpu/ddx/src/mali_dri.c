@@ -161,6 +161,15 @@ static DRI2Buffer2Ptr MaliDRI2CreateBuffer(DrawablePtr pDraw, unsigned int attac
 	privates->pPixmap = pPixmapToWrap;
 	privPixmapToWrap = (PrivPixmap *)exaGetPixmapDriverPrivate(pPixmapToWrap);
 
+	/* the GPU gets it: into UMP memory */
+	if (!maliPixmapUseUMP(pPixmapToWrap))
+	{
+		xf86DrvMsg(pScrn->scrnIndex, X_ERROR, "[%s:%d] no UMP memory for the pixmap\n", __FUNCTION__, __LINE__);
+		free(buffer);
+		free(privates);
+		return NULL;
+	}
+
 	buffer->cpp = pPixmapToWrap->drawable.bitsPerPixel / 8;
 	buffer->name = ump_secure_id_get(privPixmapToWrap->mem_info->handle);
 	buffer->flags = privPixmapToWrap->mem_info->offset;

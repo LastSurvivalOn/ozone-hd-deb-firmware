@@ -38,6 +38,87 @@
 #define MALI_EXA_FUNC(s) exa->s = mali ## s
 #define MALI_ALIGN( value, base ) (((value) + ((base) - 1)) & ~((base) - 1))
 
+/*
+ * Freed pixmap memory kept for the next pixmap of the same size. GTK and cairo make and drop a
+ * window-sized pixmap or two every frame; from malloc each was a fresh mmap that faulted in and
+ * cleared every page (35000 page faults a second under WebKit, a fifth of the X server's time).
+ */
+#define POOL_SLOTS 8
+#define POOL_MIN (64 << 10)
+#define POOL_MAX (24 << 20)
+
+static struct
+{
+	void *mem;
+	size_t size;
+	unsigned long used;
+} pool[POOL_SLOTS];
+static size_t pooled;
+static unsigned long pool_clock;
+
+static void *sysmem_get(size_t size)
+{
+	void *mem;
+	int i;
+
+	for (i = 0; i < POOL_SLOTS; i++)
+	{
+		if (pool[i].mem && pool[i].size == size)
+		{
+			mem = pool[i].mem;
+			pool[i].mem = NULL;
+			pooled -= size;
+			return mem;
+		}
+	}
+
+	return posix_memalign(&mem, 64, size) ? NULL : mem;
+}
+
+static void sysmem_put(void *mem, size_t size)
+{
+	int i, slot = -1;
+
+	if (size < POOL_MIN || size > POOL_MAX)
+	{
+		free(mem);
+		return;
+	}
+
+	/* the least recently pooled ones make room */
+	while (pooled + size > POOL_MAX || slot < 0)
+	{
+		int oldest = -1;
+
+		for (i = 0; i < POOL_SLOTS; i++)
+		{
+			if (!pool[i].mem)
+			{
+				slot = i;
+			}
+			else if (oldest < 0 || pool[i].used < pool[oldest].used)
+			{
+				oldest = i;
+			}
+		}
+
+		if (slot >= 0 && pooled + size <= POOL_MAX)
+		{
+			break;
+		}
+
+		free(pool[oldest].mem);
+		pooled -= pool[oldest].size;
+		pool[oldest].mem = NULL;
+		slot = -1;
+	}
+
+	pool[slot].mem = mem;
+	pool[slot].size = size;
+	pool[slot].used = ++pool_clock;
+	pooled += size;
+}
+
 static Bool maliPrepareSolid(PixmapPtr pPixmap, int alu, Pixel planemask, Pixel fg)
 {
 	IGNORE(pPixmap);
@@ -131,7 +212,14 @@ static void maliDestroyPixmap(ScreenPtr pScreen, void *driverPriv)
 		 * framebuffer pixmap so asserting here for now because it will break if it is called with a framebuffer
 		 * pixmap */
 		assert(privPixmap->other_buffer == NULL);
-		ump_reference_release(privPixmap->mem_info->handle);
+		if (privPixmap->mem_info->sysmem)
+		{
+			sysmem_put(privPixmap->mem_info->sysmem, privPixmap->mem_info->usize);
+		}
+		else
+		{
+			ump_reference_release(privPixmap->mem_info->handle);
+		}
 		free(privPixmap->mem_info);
 		free(privPixmap);
 	}
@@ -338,7 +426,15 @@ static Bool maliModifyPixmapHeader(PixmapPtr pPixmap, int width, int height, int
 
 	if (mem_info && mem_info->usize != 0)
 	{
-		ump_reference_release(mem_info->handle);
+		if (mem_info->sysmem)
+		{
+			sysmem_put(mem_info->sysmem, mem_info->usize);
+			mem_info->sysmem = NULL;
+		}
+		else
+		{
+			ump_reference_release(mem_info->handle);
+		}
 		mem_info->handle = NULL;
 		memset(privPixmap, 0, sizeof(*privPixmap));
 
@@ -361,18 +457,12 @@ static Bool maliModifyPixmapHeader(PixmapPtr pPixmap, int width, int height, int
 		}
 	}
 
-	if (fPtr->use_cached_ump)
-	{
-		mem_info->handle = ump_ref_drv_allocate(size, UMP_REF_DRV_CONSTRAINT_PHYSICALLY_LINEAR | UMP_REF_DRV_CONSTRAINT_USE_CACHE);
-	}
-	else
-	{
-		mem_info->handle = ump_ref_drv_allocate(size, UMP_REF_DRV_CONSTRAINT_PHYSICALLY_LINEAR);
-	}
+	/* in system memory until DRI2 gives it to the GPU (maliPixmapUseUMP) */
+	mem_info->handle = UMP_INVALID_MEMORY_HANDLE;
 
-	if (UMP_INVALID_MEMORY_HANDLE == mem_info->handle)
+	if (!(mem_info->sysmem = sysmem_get(size)))
 	{
-		ERROR_MSG("failed to allocate UMP memory (%i bytes)", size);
+		ERROR_MSG("failed to allocate pixmap memory (%i bytes)", size);
 		return FALSE;
 	}
 
@@ -429,6 +519,10 @@ static Bool maliPrepareAccess(PixmapPtr pPix, int index)
 			{
 				privPixmap->addr = (unsigned long)(fPtr->shadow ? fPtr->shadow : fPtr->fbmem);
 			}
+			else if (mem_info->sysmem)
+			{
+				privPixmap->addr = (unsigned long)mem_info->sysmem;
+			}
 			else
 			{
 				privPixmap->addr = (unsigned long)ump_mapped_pointer_get(mem_info->handle);
@@ -453,7 +547,7 @@ static Bool maliPrepareAccess(PixmapPtr pPix, int index)
 
 	privPixmap->refs++;
 
-	if (!privPixmap->isFrameBuffer)
+	if (!privPixmap->isFrameBuffer && !mem_info->sysmem)
 	{
 		int secure_id = 0;
 		_lock_item_s item;
@@ -521,7 +615,7 @@ static void maliFinishAccess(PixmapPtr pPix, int index)
 
 	mem_info = privPixmap->mem_info;
 
-	if (!privPixmap->isFrameBuffer)
+	if (!privPixmap->isFrameBuffer && mem_info && !mem_info->sysmem)
 	{
 		int secure_id = 0;
 		_lock_item_s item;
@@ -550,6 +644,59 @@ static void maliFinishAccess(PixmapPtr pPix, int index)
 
 	pPix->devPrivate.ptr = NULL;
 	privPixmap->refs--;
+}
+
+Bool maliPixmapUseUMP(PixmapPtr pPix)
+{
+	ScreenPtr pScreen = pPix->drawable.pScreen;
+	ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
+	MaliPtr fPtr = MALIPTR(pScrn);
+	PrivPixmap *privPixmap = (PrivPixmap *)exaGetPixmapDriverPrivate(pPix);
+	mali_mem_info *mem_info = privPixmap ? privPixmap->mem_info : NULL;
+	ump_handle handle;
+	void *ump;
+
+	if (!mem_info)
+	{
+		return FALSE;
+	}
+
+	if (!mem_info->sysmem)
+	{
+		return UMP_INVALID_MEMORY_HANDLE != mem_info->handle;
+	}
+
+	/* not while the CPU draws to it */
+	if (privPixmap->refs)
+	{
+		return FALSE;
+	}
+
+	handle = ump_ref_drv_allocate(mem_info->usize, UMP_REF_DRV_CONSTRAINT_PHYSICALLY_LINEAR |
+	                              (fPtr->use_cached_ump ? UMP_REF_DRV_CONSTRAINT_USE_CACHE : 0));
+
+	if (UMP_INVALID_MEMORY_HANDLE == handle)
+	{
+		ERROR_MSG("failed to allocate UMP memory (%lu bytes)", mem_info->usize);
+		return FALSE;
+	}
+
+	ump = ump_mapped_pointer_get(handle);
+	memcpy(ump, mem_info->sysmem, mem_info->usize);
+	ump_mapped_pointer_release(handle);
+
+	/* what the CPU wrote, out of its cache for the GPU */
+	if (fPtr->use_cached_ump)
+	{
+		ump_cache_operations_control(UMP_CACHE_OP_START);
+		ump_switch_hw_usage_secure_id(ump_secure_id_get(handle), UMP_USED_BY_MALI);
+		ump_cache_operations_control(UMP_CACHE_OP_FINISH);
+	}
+
+	sysmem_put(mem_info->sysmem, mem_info->usize);
+	mem_info->sysmem = NULL;
+	mem_info->handle = handle;
+	return TRUE;
 }
 
 Bool maliBeginCPUAccess(PixmapPtr pPix)

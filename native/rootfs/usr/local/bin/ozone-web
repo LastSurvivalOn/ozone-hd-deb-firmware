@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""ozone-web: a small browser on WebKitGTK, tuned for the S805 (Cortex-A5, no usable GPU under X).
+"""ozone-web: a small browser on WebKitGTK, tuned for the S805 (Cortex-A5, Mali-450 GPU).
 
 What was measured on the box, and what follows from it:
 
@@ -8,6 +8,13 @@ What was measured on the box, and what follows from it:
 - WebKit renders through EGL by default, which on fbdev means Mesa in software: 2.7 fps scrolling
   a plain page. WEBKIT_DISABLE_DMABUF_RENDERER + WEBKIT_DISABLE_COMPOSITING_MODE: 45 fps, 60 MB
   less. Composited mode with CPU or llvmpipe raster gained nothing on real pages.
+- OZONE_WEB_GPU=1, with the GPU on the desktop (native/gpu), runs it through ozone-gl in
+  composited mode on the Mali-450, its frames coming back through cached X pixmaps
+  (native/gpu/egl-fix). CSS animations: 24 frames a second instead of 3; smooth scrolling
+  Wikipedia 9.7 instead of 6.5. But every frame then crosses to X whole, through shared memory
+  (~25 a second at most on this memory bus), where the CPU path redraws only the strip a scroll
+  exposes: with this browser's settings wheel scrolling gains nothing (4.5 against 5.2), and it
+  takes ~45 MB more memory. So off by default.
 - Real wheel scrolling on heavy sites (Wikipedia, BBC) runs at 1-3 fps, and the cause is the
   sites' JavaScript reacting to every scroll, not painting: with JS off the same pages scroll at
   12-20 fps. Hence the per-site fast mode (JS off), on by default for sites that work without
@@ -70,8 +77,12 @@ if __name__ == '__main__' and sys.argv[1:2] not in (['--update-filters'], ['--ba
     if forward([to_uri(a) for a in sys.argv[1:]]):
         sys.exit(0)
 
-os.environ.setdefault('WEBKIT_DISABLE_DMABUF_RENDERER', '1')
-os.environ.setdefault('WEBKIT_DISABLE_COMPOSITING_MODE', '1')
+GPU = os.path.exists('/run/ozone-gpu-desktop') and os.environ.get('OZONE_WEB_GPU') == '1'
+if GPU and '/usr/local/lib/mali' not in os.environ.get('LD_LIBRARY_PATH', '').split(':'):
+    # the Mali libraries go in before the dynamic linker loads EGL, so: start again through ozone-gl
+    os.execvp('ozone-gl', ['ozone-gl', sys.executable] + sys.argv)
+os.environ.setdefault('WEBKIT_DISABLE_DMABUF_RENDERER', '0' if GPU else '1')
+os.environ.setdefault('WEBKIT_DISABLE_COMPOSITING_MODE', '0' if GPU else '1')
 
 import gi  # noqa: E402
 
@@ -277,7 +288,8 @@ class Browser(Gtk.ApplicationWindow):
         self.context.connect('download-started', self.on_download)
 
         self.settings = WebKit2.Settings(
-            hardware_acceleration_policy=WebKit2.HardwareAccelerationPolicy.NEVER,
+            hardware_acceleration_policy=WebKit2.HardwareAccelerationPolicy.ALWAYS if GPU
+            else WebKit2.HardwareAccelerationPolicy.NEVER,
             enable_smooth_scrolling=False,
             enable_webgl=False,
             enable_webaudio=False,

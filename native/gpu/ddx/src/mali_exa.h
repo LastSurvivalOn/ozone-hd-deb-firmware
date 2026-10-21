@@ -36,6 +36,10 @@ typedef struct
 	ump_handle handle;
 	unsigned long usize;
 	unsigned long offset;
+	/* A pixmap starts in system memory and moves to UMP when DRI2 hands it to the GPU: GTK makes and
+	 * drops a window-sized pixmap a frame, and UMP buffers cost a kernel allocation, page clearing and
+	 * cache maintenance on every CPU access */
+	unsigned char *sysmem;
 } mali_mem_info;
 
 typedef struct
@@ -51,6 +55,8 @@ typedef struct
 extern Bool maliSetupExa(ScreenPtr pScreen, ExaDriverPtr exa);
 /* CPU access to a pixmap outside EXA (devPrivate.ptr is valid in between) */
 extern Bool maliBeginCPUAccess(PixmapPtr pPix);
+/* moves a pixmap to UMP memory, for the GPU; TRUE if it is there */
+extern Bool maliPixmapUseUMP(PixmapPtr pPix);
 extern void maliEndCPUAccess(PixmapPtr pPix);
 
 #endif /* _MALI_EXA_H_ */

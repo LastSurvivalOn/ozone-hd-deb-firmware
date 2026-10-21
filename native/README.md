@@ -218,8 +218,10 @@ The Mali-450 MP4 draws OpenGL ES 2.0 under X: `./install-gpu.sh`, details in
 | glmark2-es2 | 81 |
 | a 3x3 blur, 720p RGBA, GPU round trip | 27 ms against 180 on the CPU |
 
-The browser does not gain from it. WebKitGTK 2.50 needs an EGL 1.5 surfaceless or GBM display,
-and it hands frames over by `glReadPixels`, which is 160 ms for 720p on this driver.
+The browser can render on it: `OZONE_WEB_GPU=1 ozone-web`, through the shims in
+[gpu/egl-fix](gpu/egl-fix). CSS animations run 8 times faster. But every frame then crosses to X
+whole, about 25 a second at most, so plain wheel scrolling gains nothing (and memory goes down by
+~45 MB). That is why it's off by default.
 
 ## Video
 
