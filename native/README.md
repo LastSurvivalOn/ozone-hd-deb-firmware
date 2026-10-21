@@ -32,7 +32,7 @@ the logo partition that u-boot shows at power-on and installs the same picture a
 Desktop packages:
 `xserver-xorg-core xserver-xorg-legacy xserver-xorg-video-fbdev xserver-xorg-input-evdev
 xserver-xorg-input-mouse xinit x11-xserver-utils x11-utils x11-xkb-utils xfonts-base bspwm sxhkd polybar rofi
-feh rxvt-unicode fonts-jetbrains-mono fonts-font-awesome fonts-noto-color-emoji mpv alsa-utils
+feh lxterminal fish bash-completion fonts-jetbrains-mono fonts-font-awesome fonts-noto-color-emoji mpv alsa-utils
 python3 nodejs dbus-x11 python3-gi gir1.2-webkit2-4.1 gir1.2-gtk-3.0 libglib2.0-bin xdotool wpasupplicant` (with `--no-install-recommends`), and to build amplay: `gcc libc6-dev make
 pkg-config libavformat-dev libavcodec-dev libswresample-dev libavutil-dev libasound2-dev libx11-dev
 libxft-dev`.

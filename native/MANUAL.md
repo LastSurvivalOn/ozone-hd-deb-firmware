@@ -104,7 +104,21 @@ again to hide it).
 **The app menu** opens with **Super+D** or the grid button. Start typing a name ("term", "files"…)
 and the list filters as you type. Use the arrows to choose and Enter to launch. Esc closes it.
 
-**The terminal** opens with **Super+Enter**.
+**The terminal** (the command line) opens with **Super+Enter**, or "Terminal" in the app menu.
+
+| Keys / mouse | Action |
+|---|---|
+| **Ctrl+Shift+C** / **Ctrl+Shift+V** | copy / paste (or the right mouse button: Copy, Paste) |
+| select with the mouse, then the middle button | paste the selection |
+| **Ctrl+Shift+T** / **Ctrl+Shift+W** | new tab / close the tab |
+| **Ctrl+PgUp** / **Ctrl+PgDn**, **Alt+1…9** | previous / next tab, tab number 1…9 |
+| **Ctrl + +** / **Ctrl + −** / **Ctrl+0** | bigger / smaller text / back to normal |
+| **Tab** | completes a command, a file name or an option; pressed again, a menu to choose from with the arrows (each option with what it does) |
+| **→** or **End** | takes the grey suggestion fish shows as you type (from the commands typed before); **Alt+→** takes one word of it |
+| **↑** / **↓** | earlier commands; with some text typed, only the ones that contain it |
+| **Ctrl+C** | stops the running command |
+
+With the remote, the on-screen keyboard has **Tab** and **Enter** too.
 
 All menus (apps, power, TV channels) work the same way: type to filter, arrows to choose, Enter
 or a click to confirm, Esc to close.

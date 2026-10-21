@@ -1,6 +1,6 @@
 # Apps
 super + Return
-    urxvt
+    ozone-terminal
 super + d
     rofi -show drun
 super + y

@@ -1,0 +1,11 @@
+#!/bin/sh
+# The terminal: LXTerminal (tabs, copy and paste, search; VTE renders without a GPU, which kitty or
+# Alacritty can't) running fish, whose suggestions and Tab menu need no setup. The login shell stays
+# bash, for ssh and scripts; LXTerminal opens $SHELL in every new tab.
+#   ozone-terminal [--working-directory=DIR] [-e COMMAND]
+export SHELL=/usr/bin/fish
+# the X session runs in the POSIX locale; fish must start in UTF-8 (Ukrainian names, its own marks)
+export LANG=C.UTF-8
+# dark menus and scrollbar, to go with the colours (the other GTK windows bring their own CSS)
+export GTK_THEME=Adwaita:dark
+exec lxterminal "$@"

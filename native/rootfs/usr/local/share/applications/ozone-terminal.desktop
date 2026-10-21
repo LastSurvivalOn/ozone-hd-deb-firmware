@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Terminal
+Comment=Command line: tabs, copy and paste, suggestions as you type
+Exec=ozone-terminal
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;

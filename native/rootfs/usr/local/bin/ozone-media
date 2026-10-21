@@ -592,7 +592,7 @@ def menu():
             if what is None:
                 return
             if 'terminal' in what:
-                subprocess.Popen(['urxvt', '-cd', point])
+                subprocess.Popen(['ozone-terminal', '--working-directory=' + point])
             elif 'Forget' in what:
                 subprocess.run(['sudo', '-n', sys.argv[0], 'forget', point])
             else:
