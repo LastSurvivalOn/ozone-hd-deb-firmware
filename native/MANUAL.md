@@ -237,8 +237,15 @@ without a key.
 Only one TV window can run at a time. If you open TV again during a scan, the panel says "TV is
 busy: a channel scan is running".
 
-A channel gets a 🔒 if it turns out to be encrypted when you try to watch it. "No signal" on the
-panel means that frequency isn't received, so check the antenna.
+A channel gets a 🔒 if it turns out to be encrypted when you try to watch it.
+
+**No signal.** If the tuner can't catch a channel's signal, the TV window stays and says "no
+signal, trying again…": it keeps trying, as the stock TV app does, and the picture starts as soon
+as the signal is caught. That can take from a few seconds to a minute or more: here the 1+1, ICTV,
+СТБ, Інтер multiplex (506 MHz) is often hard to catch at night. **Esc** stops trying, and a double
+click on another channel switches to it. If the signal drops while you watch, the picture stands
+still and goes on by itself once it is back. A channel that never comes, day or night, means that
+frequency isn't received: check the antenna.
 
 What isn't available: teletext and subtitles, recording, radio.
 

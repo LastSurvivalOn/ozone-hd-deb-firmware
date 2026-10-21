@@ -735,6 +735,32 @@ static int session_start(void)
     return 0;
 }
 
+static void on_wake(int sig)
+{
+    (void)sig;   /* nothing: it only cuts a waiting read() short (see join_demuxer) */
+}
+
+/* Live TV without a signal: the demuxer waits in read() on the pipe for data that may not come,
+   and FFmpeg looks at the interrupt callback only between reads, so quitting would wait for the
+   signal to come back. SIGUSR1 (no SA_RESTART) ends the read with EINTR, then the callback
+   (P.quit) ends the demuxer. */
+static void join_demuxer(pthread_t th)
+{
+    for (;;) {
+        if (P.quit)
+            pthread_kill(th, SIGUSR1);
+        struct timespec t;
+        clock_gettime(CLOCK_REALTIME, &t);
+        t.tv_nsec += 100000000;
+        if (t.tv_nsec >= 1000000000) {
+            t.tv_sec++;
+            t.tv_nsec -= 1000000000;
+        }
+        if (pthread_timedjoin_np(th, NULL, &t) == 0)
+            return;
+    }
+}
+
 static void session_stop(void)
 {
     pthread_mutex_lock(&P.clk_m);
@@ -744,7 +770,7 @@ static void session_stop(void)
     pq_set(&P.vq, &P.vq.abort, 1);
     pq_set(&P.aq, &P.aq.abort, 1);
     for (int i = 0; i < P.nin; i++)
-        pthread_join(P.in[i].th, NULL);
+        join_demuxer(P.in[i].th);
     pthread_join(P.vth, NULL);
     if (P.ast) {
         pthread_join(P.ath, NULL);
@@ -1182,6 +1208,7 @@ int main(int argc, char **argv)
     signal(SIGTERM, on_signal);
     signal(SIGHUP, on_signal);
     signal(SIGPIPE, SIG_IGN);
+    sigaction(SIGUSR1, &(struct sigaction){ .sa_handler = on_wake }, NULL);
 
     /* With frame-rate automation on, closing the decoder crashes the kernel (see ozone-hw) */
     if (!fr_auto_off()) {

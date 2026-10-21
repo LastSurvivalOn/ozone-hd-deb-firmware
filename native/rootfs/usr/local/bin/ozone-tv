@@ -51,6 +51,7 @@ DVR = '/dev/dvb/adapter0/dvr0'
 DEMUX_SOURCE = '/sys/class/stb/demux0_source'
 ASYNCFIFO_SOURCE = '/sys/class/stb/asyncfifo0_source'
 NO_DATA_TIMEOUT = 10   # s without a byte from dvr0 before giving up on a channel
+RELOCK_AFTER = 2       # signal checks (3 s apart) without lock while watching before tuning again
 DATA = os.path.join(os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share'), 'ozone-tv')
 CHANNELS = os.path.join(DATA, 'channels.json')
 LOCK = os.path.join(DATA, 'busy')   # the frontend can serve one run at a time
@@ -843,9 +844,33 @@ class Service:
 WATCHED = 0   # the channel the last watch() ended on, for the TV window
 
 
-def watch(index, test=None):
+def tune_until_locked(fe, ch, waiting=None, cancel=None):
+    """Tunes to ch's multiplex and, without a lock, tunes again and again, as the stock TV app does:
+    a weak or disturbed multiplex (506 MHz here at night) locks after a few tries, or later.
+    waiting(text) gets what's going on, cancel (an Event) stops it. True once locked"""
+    tries = 0
+    while True:
+        locked, strength, _q = fe.tune(ch['freq_khz'], ch['bandwidth'], ch['plp'])
+        tries += 1
+        if locked:
+            if tries > 1:
+                LOG.write('tv', '%d MHz locked after %d tries' % (ch['freq_khz'] // 1000, tries))
+            return True
+        text = '%s: no signal (level %d%%), trying again…' % (ch['name'], strength)
+        if waiting:
+            waiting(text)
+        elif tries == 1:
+            notify(text)
+        if tries == 1 or tries % 10 == 0:
+            LOG.write('tv', '%d MHz: no lock after %d tries' % (ch['freq_khz'] // 1000, tries))
+        if cancel and cancel.wait(0.5):
+            return False
+
+
+def watch(index, test=None, waiting=None, cancel=None):
     """Plays channel `index`; amplay's exit status 10/11 moves to the next/previous channel, 12 to
-    the one chosen in its list"""
+    the one chosen in its list. Without a signal it keeps trying (see tune_until_locked); waiting
+    and cancel are passed on to it, and waiting(None) means the player is about to start"""
     global WATCHED
     channels = [c for c in load_channels() if not c['radio']]
     if not channels:
@@ -861,10 +886,13 @@ def watch(index, test=None):
             ch = channels[index]
             LOG.write('tv', 'channel %d: %s' % (index + 1, json.dumps(ch, ensure_ascii=False)))
             busy('watching %s' % ch['name'])
-            if fe.khz != ch['freq_khz']:
-                locked, strength, _q = fe.tune(ch['freq_khz'], ch['bandwidth'], ch['plp'])
-                if not locked:
-                    notify('%s: no signal (%d%%)' % (ch['name'], strength))
+            # another multiplex, or this one lost
+            if fe.khz != ch['freq_khz'] or not fe.status()[0]:
+                if not tune_until_locked(fe, ch, waiting, cancel):
+                    LOG.write('tv', 'stopped waiting for a signal')
+                    return 0
+            if waiting:
+                waiting(None)
             if not reader:
                 reader = EitReader(guide)
             status, chosen = play(ch, index, fe, guide, channels)
@@ -883,15 +911,24 @@ def watch(index, test=None):
         fe.close()
 
 
-def monitor_signal(fe, stop):
-    """The signal every 3 s while watching, into the log"""
+def monitor_signal(fe, ch, stop):
+    """The signal every 3 s while watching, into the log. When the lock is gone for a while the
+    demodulator does not get it back by itself, so tune again until it does (the picture stands
+    still meanwhile and goes on when the data is back)"""
+    unlocked = 0
     while not stop.wait(3):
         try:
             locked, strength, quality = fe.status()
+            LOG.write('signal', '%s, level %d%%, quality %d%%' % ('locked' if locked else 'NO LOCK', strength, quality))
+            unlocked = 0 if locked else unlocked + 1
+            if unlocked >= RELOCK_AFTER:
+                locked, strength, _q = fe.tune(ch['freq_khz'], ch['bandwidth'], ch['plp'])
+                LOG.write('signal', 'tuned again: %s, level %d%%' % ('locked' if locked else 'no lock', strength))
+                if locked:
+                    unlocked = 0
         except (RuntimeError, OSError) as e:
             LOG.write('signal', str(e))
             return
-        LOG.write('signal', '%s, level %d%%, quality %d%%' % ('locked' if locked else 'NO LOCK', strength, quality))
 
 
 def channel_number(ch, index):
@@ -930,7 +967,7 @@ def play(ch, index, fe=None, guide=None, channels=None):
     pipe_to_log(player.stderr, 'amplay')
     stop = threading.Event()
     if fe:
-        threading.Thread(target=monitor_signal, args=(fe, stop), daemon=True).start()
+        threading.Thread(target=monitor_signal, args=(fe, ch, stop), daemon=True).start()
     out = player.stdin.fileno()
     # what came out of the demux, every 5 s: no data means no signal or wrong PIDs
     got, overflows, since = 0, 0, time.monotonic()
@@ -1062,6 +1099,7 @@ def window(test=None):
                                                      Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
             self.guide = Guide()
             self.busy = False
+            self.cancel, self.waiting, self.after = None, False, None   # see watch()
             self.win = Gtk.Window(title='TV')
             self.win.set_default_size(1280, 720)
             self.win.connect('destroy', Gtk.main_quit)
@@ -1226,6 +1264,12 @@ def window(test=None):
                 self.select(WATCHED if what == 'watch' else self.index)
                 self.win.show()
                 self.win.present()
+                if what == 'watch':
+                    self.status.set_text('')
+                    self.waiting = False
+                    if self.after is not None:   # chosen while waiting for a signal
+                        index, self.after = self.after, None
+                        self.watch(index)
             def thread():
                 try:
                     job()
@@ -1237,11 +1281,31 @@ def window(test=None):
             threading.Thread(target=thread, daemon=True).start()
 
         def watch(self, index):
-            if not self.list or self.busy:
+            """The window stays while the tuner looks for the signal (on_waiting says so) and goes
+            when the player starts; another channel chosen meanwhile replaces this one"""
+            if not self.list:
+                return
+            if self.busy:
+                if self.waiting:
+                    self.after = index
+                    self.cancel.set()
+                    self.status.set_text('Switching…')
                 return
             LOG.write('tv', 'window: watch channel %d' % (index + 1))
-            self.win.hide()
-            self.run('watch', lambda: watch(index, test))
+            self.cancel, self.waiting = threading.Event(), False
+            self.status.set_text('Tuning…')
+            waiting = lambda text: GLib.idle_add(self.on_waiting, text)
+            self.run('watch', lambda: watch(index, test, waiting, self.cancel))
+
+        def on_waiting(self, text):
+            """watch() has no signal yet (text), or the player starts (None)"""
+            self.waiting = text is not None
+            if text:
+                self.status.set_text(text + '   Esc: stop')
+                self.win.show()
+                self.win.present()
+            else:
+                self.win.hide()
 
         def scan(self):
             LOG.write('tv', 'window: scan')
@@ -1255,6 +1319,10 @@ def window(test=None):
 
         def on_key(self, w, ev):
             k = Gdk.keyval_name(ev.keyval)
+            if k == 'Escape' and self.busy and self.waiting:
+                self.cancel.set()
+                self.status.set_text('Stopping…')
+                return True
             if k == 'Escape' and not self.busy:
                 Gtk.main_quit()
                 return True
