@@ -13,6 +13,14 @@
 
 ARG_FILE=/run/ozone-reboot-arg
 
+# umountroot leaves the data partition under / (debian.img) writable, as the loop device keeps it
+# open: remount everything read-only, or it boots with a journal to recover (see halt)
+if [ "$1" = stop ] && /etc/ozone/is-native; then
+    sync
+    echo u > /proc/sysrq-trigger
+    sleep 2
+fi
+
 if [ "$1" = stop ] && [ -s $ARG_FILE ]; then
     arg=$(cat $ARG_FILE)
     echo "Rebooting with argument: $arg"

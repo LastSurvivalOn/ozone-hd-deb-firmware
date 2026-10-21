@@ -27,6 +27,10 @@ adb_root "mkdir -p $ROOT/lib/modules/$KVER/extra && \
           chmod 644 $ROOT/lib/modules/$KVER/extra/*.ko && rm /data/local/tmp/mali.ko"
 
 echo ">> config files"
+# rootfs/ has wrappers for these two stock scripts; the stock ones move aside first, once
+ssh_box 'sudo mkdir -p /usr/local/lib/ozone && for s in halt reboot; do
+    sudo dpkg-divert --local --rename --divert /usr/local/lib/ozone/$s.distrib --add /etc/init.d/$s >/dev/null
+done'
 tar -C "$HERE/rootfs" -czf - . | ssh_box 'sudo tar -C / --no-same-owner -xzf - && sudo chown -R root:root /etc/init.d/ozone-hw /etc/ozone /etc/network/interfaces /etc/fstab'
 scp -q -i $KEY "$HERE/../hybrid/box/rc" <USER>@$IP:/tmp/ozone-rc
 ssh_box 'sudo install -m 755 /tmp/ozone-rc /etc/ozone/rc && rm /tmp/ozone-rc && sudo chmod 755 /etc/init.d/ozone-hw /etc/ozone/is-native'

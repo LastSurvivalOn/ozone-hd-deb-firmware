@@ -36,7 +36,7 @@ item with the arrows and Enter, or click it. Esc closes the menu.
 | Restart desktop | Restarts the graphical session. Open windows close. Use it when something hangs (see section 9). |
 | Screen size | Fits the picture to a screen that cuts off its edges, see below. |
 | Reboot | Restarts the box into Linux. |
-| Power off | Stops the system and turns off the screen. The box itself can't cut its own power, so it stays powered until you unplug it. To turn it on again, unplug it and plug it back in. |
+| Power off | Stops the system and turns off the screen; the light on the box turns red. To turn it on again, press Power on the remote (or unplug the box and plug it back in): it starts from the beginning, with the logo, as after plugging in. |
 
 **Screen size.** Some TVs and monitors cut off the edges of the picture: the panel at the top or
 the bottom of the player is half hidden. Open ⏻ → **Screen size** (or "Screen size" in the app

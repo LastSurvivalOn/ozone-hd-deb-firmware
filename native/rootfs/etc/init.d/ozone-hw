@@ -86,8 +86,9 @@ start)
     echo "add default decoder ppmgr deinterlace amvideo" > /sys/class/vfm/map
     ;;
 stop)
-    # Halt: the box can't cut its own power (see /etc/default/halt), so at least switch HDMI off and
-    # let the TV show "no signal". Early suspend does that; the wakelock keeps it from going deeper.
+    # Halt: the box can't cut its own power (see /etc/default/halt), so switch HDMI off and let the
+    # TV show "no signal". Early suspend does that; the wakelock keeps it from going deeper until
+    # /etc/init.d/halt, with the filesystems read-only, lets go of it for deep suspend.
     if [ "$RUNLEVEL" = 0 ]; then
         echo ozone-halt > /sys/power/wake_lock
         echo mem > /sys/power/state

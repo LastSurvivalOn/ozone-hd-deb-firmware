@@ -1,0 +1,33 @@
+#! /bin/sh
+### BEGIN INIT INFO
+# Provides:          halt
+# Required-Start:
+# Required-Stop:
+# Default-Start:
+# Default-Stop:      0
+# Short-Description: Execute the halt command.
+# Description:       ozone wrapper around the stock script (dpkg-divert -> /usr/local/lib/ozone/halt.distrib):
+#                    in native Linux, ends in deep suspend, the box's own "off": the LED turns
+#                    red and Power on the IR remote turns it on again (u-boot boots it afresh).
+### END INIT INFO
+
+# This kernel can't power off (meson_power_off reboots), and a halted CPU leaves the LED on and
+# only unplugging brings the box back. Waking from deep suspend is a cold boot too, so the
+# filesystems must be read-only by now. umountroot has done that for / (debian.img), but not for
+# the data partition under it, which the loop device keeps open for writing: SysRq u remounts
+# everything read-only regardless. ozone-hw stop has already run early suspend (HDMI off) holding
+# the ozone-halt wakelock; without it the kernel goes on to suspend. If it doesn't (a driver
+# holds a wakelock), the stock script halts.
+if [ "$1" = stop ] && /etc/ozone/is-native; then
+    echo "Entering deep sleep: Power on the remote turns the box on"
+    sync
+    echo u > /proc/sysrq-trigger
+    # the remount runs in a kernel worker
+    sleep 2
+    echo mem > /sys/power/state
+    echo ozone-halt > /sys/power/wake_unlock 2> /dev/null
+    sleep 20
+    echo "Deep sleep did not happen"
+fi
+
+exec /usr/local/lib/ozone/halt.distrib "$@"

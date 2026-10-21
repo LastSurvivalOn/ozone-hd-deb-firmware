@@ -1,7 +1,8 @@
 # Default behaviour of shutdown -h / halt. Set to "halt" or "poweroff".
 # ozone: this kernel implements power off as a reboot (meson_power_off restarts with reason
-# "charging_reboot" and u-boot boots straight through), so the CPU is stopped instead. By then
-# ozone-hw has switched HDMI off. Plugging the box back in turns it on.
+# "charging_reboot" and u-boot boots straight through), so it must halt instead. /etc/init.d/halt
+# (ozone's wrapper) first tries deep suspend, the box's own "off": red LED, and Power on the remote
+# turns it on. Only if that fails is the CPU stopped, with HDMI off (ozone-hw).
 HALT=halt
 # `poweroff` and `shutdown -P` export INIT_HALT=POWEROFF, which /etc/init.d/halt prefers over HALT;
 # this file is sourced by that script, so override it too

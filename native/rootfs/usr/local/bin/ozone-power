@@ -7,7 +7,7 @@ choice=$(printf '%s\n' \
     "  Restart desktop" \
     "  Screen size (edges cut off)" \
     "  Reboot" \
-    "  Power off (unplug to turn back on)" |
+    "  Power off (Power on the remote turns it on)" |
     rofi -dmenu -i -p "  Power" -theme-str 'listview { lines: 6; }')
 
 case "$choice" in

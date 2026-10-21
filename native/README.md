@@ -186,8 +186,8 @@ Load log (times per page, crashes): `~/.cache/ozone-web/log`.
 | no volume control, no mmap (dmix) | softvol `Master`, one sound at a time |
 | no `getrandom()`/seccomp | Dropbear instead of OpenSSH, chrony with `-F 0` |
 | no fbcon | the boot logo stays on screen until X starts; ozone-hw redraws it on fb0 and pulses it |
-| power off reboots: `meson_power_off` restarts with reason `charging_reboot`, u-boot boots on | `HALT=halt` (and `INIT_HALT`) in `/etc/default/halt`, HDMI off first; plug in to turn on |
-| deep suspend powers USB down, wakes only on the IR remote | Sleep = Android early suspend with a wakelock held (`ozone-standby`): HDMI off, any key wakes |
+| power off reboots: `meson_power_off` restarts with reason `charging_reboot`, u-boot boots on | `HALT=halt` (and `INIT_HALT`) in `/etc/default/halt`; the diverted `/etc/init.d/halt` ends in deep suspend instead (below), halting only if that fails |
+| deep suspend powers USB down, wakes only on the IR remote's Power (red LED meanwhile), and waking is a cold boot | it is power off: after SysRq `u` (the data partition under `debian.img` stays writable past umountroot); Sleep = Android early suspend with a wakelock held (`ozone-standby`): HDMI off, any key wakes |
 
 ## Video
 
