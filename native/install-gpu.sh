@@ -46,6 +46,12 @@ tar -C "$D" -czf - . | ssh_box 'set -e; d=$(mktemp -d); tar -C $d -xzf -
     cd $L
     sudo ln -sf libEGL.so.1 libEGL.so
     for l in libGLESv2.so.2 libGLESv2.so libGLESv1_CM.so.1 libGLESv1_CM.so; do sudo ln -sf libMali.so $l; done
+    # for programs of your own: gcc prog.c $(pkg-config --cflags --libs mali-gles), run with ozone-gl
+    sudo mkdir -p /usr/local/lib/pkgconfig
+    printf "%s\n" "libdir=$L" "includedir=$I" "" "Name: mali-gles" \
+        "Description: OpenGL ES 2.0 and EGL (X11) on the Mali-450; run programs with ozone-gl" \
+        "Version: r5p0" "Cflags: -I\${includedir}" \
+        "Libs: -L\${libdir} -Wl,-rpath-link,\${libdir} -lEGL -lGLESv2" | sudo tee /usr/local/lib/pkgconfig/mali-gles.pc > /dev/null
     echo ">> Mali X driver, built on the box"
     make -s -C $d/ddx MALI_INC=$I MALI_LIB=$L
     sudo make -s -C $d/ddx install

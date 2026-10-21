@@ -1,6 +1,12 @@
 # GPU (Mali-450 MP) under X11
 
-Work in progress: nothing here is deployed by the install scripts yet.
+Installed by `../install-gpu.sh <ip>` (and games by `../install-games.sh <ip>`). What it gives:
+
+- the desktop's X runs the Mali driver (with the plain framebuffer as the fallback);
+- OpenGL ES 2.0 for programs started with `ozone-gl`; mpv and RetroArch use it by themselves;
+- computing in fragment shaders.
+
+The browser does not use it (see the end of Results).
 
 The way Amlogic and Hardkernel (ODROID-C1, the same S805) ran Mali under X11:
 the Mali X11 userspace driver (`libMali.so`, r5p0, EGL on DRI2) shares buffers
@@ -73,23 +79,100 @@ interval).
 
 ## `egl-fix/`
 
-`libmali-egl-fix.so`, preloaded (or linked ahead of `libMali.so`). It covers
-what the EGL 1.4 driver lacks and current programs expect:
+Built as `libEGL.so.1` in front of `libMali.so`, a dependency that provides everything else.
+Being the library itself, it also fixes programs that `dlopen` EGL and `dlsym` from the handle
+(SDL2, libepoxy). It covers what the EGL 1.4 driver lacks and current programs expect:
 
-- `eglInitialize` with NULL version pointers (it fails);
-- `EGL_EXT_platform_base` and `platform_x11`, on top of `eglGetDisplay`;
-- client extensions from `eglQueryString(EGL_NO_DISPLAY)`.
+| Fix | Who needs it |
+|---|---|
+| `eglInitialize` with NULL version pointers (Mali fails) | SDL2, mpv |
+| `EGL_EXT_platform_base`/`platform_x11` on top of `eglGetDisplay`; client extensions from `eglQueryString(EGL_NO_DISPLAY)` | mpv, glmark2 |
+| core GL functions from `eglGetProcAddress` (`EGL_KHR_client_get_all_proc_addresses`); Mali returns NULL, and programs then took glvnd's `libGL.so.1` stubs | mpv |
+| a TrueColor native visual for the RGB565 configs, which name a DirectColor one | glmark2 |
+| on the 16-bit screen, window configs of up to 8 bits a colour list RGB565 first | mpv |
+
+The last one matters because an 8888 config takes a 32-bit visual, and X then converts every frame
+on the CPU. With it, mpv dropped from 190 % to 111 % CPU.
+
+Building against it needs `-Wl,-rpath-link` (`libUMP.so`) and `-lGLESv2` as well:
+`pkg-config mali-gles` has both.
+
+## On the box
+
+| What | Where |
+|---|---|
+| modules | `/lib/modules/3.10.33/extra/gpu/`, loaded at boot by `/etc/init.d/ozone-gpu` (native only); it marks `/run/ozone-gpu` |
+| skip the GPU | `touch /etc/ozone/no-gpu` |
+| X screen config | `/usr/local/lib/ozone/gen-xorg-screen` writes `00-ozone-screen.conf` before X starts: `mali` when the GPU loaded, else `fbdev` |
+| X driver | `/usr/lib/xorg/modules/drivers/mali_drv.so` |
+| userspace driver | `/usr/local/lib/mali`: `libMali.so`, `libUMP.so`, and `libEGL.so.1`, which is `egl-fix` linked to `libMali.so` |
+| building your own GL code | `pkg-config --cflags --libs mali-gles` |
+
+- The desktop script marks `/run/ozone-gpu-desktop` when X has the Mali driver.
+- If that X dies with "Fatal server error", the script sets `/run/ozone-gpu-failed`, and the next X
+  runs on fbdev until a reboot. The log goes to `/var/log/ozone-desktop-gpu-failed.log`.
+- `ozone-gl PROGRAM` puts `/usr/local/lib/mali` first in the library path, with SDL2 on EGL/GLES.
+  Without the Mali desktop it changes nothing.
+- `/usr/local/bin/mpv` runs mpv with `--vo=gpu --gpu-context=x11egl` and drops the config's CPU
+  scaling filter.
+- `/usr/local/bin/retroarch` runs RetroArch with `/etc/ozone/retroarch.cfg` appended.
 
 ## Results
 
 These were measured on a test X server (`:1`, sharing fb0).
 
-GLES2 in an ordinary X11 window (`tests/x11win.c`), with the shadow:
+GLES2 in an ordinary X11 window (`tests/x11win.c`), with the shadow and the direct framebuffer
+copy (below):
 
 | Window | fps |
 |---|---|
 | 640x360 | 242 |
-| 1280x720 (full screen) | 92 |
+| 1280x720 (full screen) | 120 |
+
+The direct copy: ShadowFB went from back buffer to shadow to framebuffer, two copies of the frame,
+which this memory bus can't afford at 720p60. Now a DRI2 swap goes from the back buffer straight to
+the framebuffer where the window shows, and the shadow is skipped there.
+A 32-bit window is the other case: RetroArch accepts only 8888 configs, and Composite redirects such
+a window on the 16-bit screen. Its frame is converted to RGB565 with NEON on the way, instead of
+pixman compositing it from the window pixmap. For full-screen NES in RetroArch (Nestopia) this went
+57 → 61 → 82 fps.
+
+Games (`install-games.sh`):
+
+- RetroArch on `gl` with the RGUI menu; NES (Nestopia), Game Boy (Gambatte) and GBA (mGBA) run at
+  full speed.
+- glmark2-es2 at 720p full screen: ~110 fps in the simple scenes, score 81. It needs
+  `--visual-config r=5:g=6:b=5:a=0:d=24:s=8`, as every Mali config has a stencil buffer.
+
+Computing (`tests/gpufilter.c`), a 3x3 blur of a 1280x720 RGBA image:
+
+| Step | ms |
+|---|---|
+| in (`XShmPutImage`) | 6 |
+| shader | 14 |
+| out (`XShmGetImage`) | 7 |
+| GPU, all of it | 27 |
+| CPU, the same blur | 180 |
+
+Write the result to an FBO whose texture is an EGLImage of an X pixmap. A pixmap lives in cached UMP
+memory, so X reads it in ~3 ms. `glReadPixels` takes 160 ms for 720p, as the driver is the slow part,
+not the memory. For the same reason the input pixmap is a texture with no upload.
+Targets compared on that blur:
+
+| Target | ms |
+|---|---|
+| FBO on a pixmap | 10.8 |
+| pbuffer | 39 |
+| pixmap surface | 207 |
+
+Limits:
+
+- GLES 2.0 has no compute shaders and no float render targets: results are RGBA8.
+- Fragment shaders run at fp16 (`mediump`).
+- Texture coordinates computed in the fragment shader make dependent reads, 3x slower than ones
+  passed as varyings.
+
+Standby (Android early suspend) and waking leave the GPU working; Mali has no early suspend handler.
 
 Pure GPU fill is ~280 fps at 720p.
 
@@ -101,13 +184,18 @@ Pure GPU fill is ~280 fps at 720p.
 | CopyArea (scroll) | 3.0 | 47.5 | 2.7 |
 | FillRectangle | 1.0 | 0.6 | 0.9 |
 
-mpv, full screen, a yuv420p source without decoding (`--untimed`), in fps.
-`vo=gpu` runs on GLES 2.0 in "dumb mode", with `egl-fix`:
+mpv, full screen, H.264 decoded on the CPU. `vo=x11` uses the config's tuned scaler; `vo=gpu` uses
+GLES 2.0 in "dumb mode" with a 565 config:
 
-| Source | source alone | `vo=x11` | `vo=gpu` |
-|---|---|---|---|
-| 640x360 | 65 | 8.4 | 32 |
-| 1280x720 | 39 | 8.5 | 22.5 |
+| Video | `vo=x11` | `vo=gpu` |
+|---|---|---|
+| 360p, CPU (mpv + Xorg) | 190 % | 111 % |
+| 360p, untimed | 27.5 fps | 35 fps |
+| 720p, frames dropped in 20 s | 140 | 57 |
+| 720p, untimed | 22.6 fps | 21.4 fps |
+
+Decoding alone is 26 fps at 720p. Texture uploads are the GPU side's cost: there is no
+`GL_EXT_unpack_subimage`, and the driver retiles on the CPU.
 
 WebKitGTK 2.50 does not use the GPU (`webkit://gpu`: "Policy: never"):
 
@@ -138,3 +226,8 @@ WebKitGTK 2.50 does not use the GPU (`webkit://gpu`: "Policy: never"):
 | `fbwin.c` | fbdev window animation (`FRAMEBUFFER=/dev/fbN`) |
 | `iontest.c` | ION allocation as an fbdev pixmap |
 | `wktest.py` | a WebKit2 window (`url policy seconds`) |
+| `wkfps.py` | WebKit animation frame rate (`seconds policy canvas|css|URL`) |
+| `x2dbench.c` | X 2D speed: ShmPutImage, CopyArea, FillRectangle |
+| `pixmapread.c` | render into an X pixmap, read it back with XShmGetImage vs glReadPixels |
+| `gpufilter.c` | GPU computing round trip (a blur), against the CPU |
+| `readpixels-spy.c` | LD_PRELOAD: glReadPixels and eglSwapBuffers calls and time |

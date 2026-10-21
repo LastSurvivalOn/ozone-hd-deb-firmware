@@ -445,7 +445,6 @@ pointer MaliSetup(pointer module, pointer opts, int *errmaj, int *errmin)
 {
 	static Bool setupDone = FALSE;
 
-	ERROR_STR("MaliSetup");
 
 	IGNORE(opts);
 	IGNORE(errmin);
@@ -533,7 +532,6 @@ void MaliHWFreeRec(ScrnInfoPtr pScrn)
 
 static const OptionInfoRec *MaliAvailableOptions(int chipid, int busid)
 {
-	ERROR_STR("MaliAvailableOptions");
 
 	IGNORE(chipid);
 	IGNORE(busid);
@@ -543,7 +541,6 @@ static const OptionInfoRec *MaliAvailableOptions(int chipid, int busid)
 
 static void MaliIdentify(int flags)
 {
-	ERROR_STR("MaliIdentify");
 
 	IGNORE(flags);
 
@@ -902,7 +899,6 @@ Bool MaliHWProbe(char *device, char **namep)
 {
 	int fd;
 
-	ERROR_STR("MaliHWProbe");
 
 	if ((fd = mali_open(-1, device, namep)) == -1)
 	{
@@ -1099,7 +1095,6 @@ static Bool MaliProbe(DriverPtr drv, int flags)
 	ScrnInfoPtr pScrn;
 	GDevPtr *devSections;
 
-	ERROR_STR("MaliProbe");
 
 	if (flags & PROBE_DETECT)
 	{
@@ -1345,7 +1340,7 @@ static Bool mali_drm_open_master(ScrnInfoPtr pScrn)
 	}
 
 	fPtr->drm_fd = global_drm_fd;
-	ERROR_MSG("%s DRM OPEN (fd: 0x%x)\n", __func__, fPtr->drm_fd);
+	INFO_MSG("%s DRM OPEN (fd: 0x%x)\n", __func__, fPtr->drm_fd);
 
 	sv.drm_di_major = 1;
 	sv.drm_di_minor = 1;

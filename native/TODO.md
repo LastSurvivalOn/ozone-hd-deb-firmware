@@ -103,9 +103,13 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
   itself. Now only the laptop scripts.
 - [ ] **Medium**: updates from the box (apt and our scripts), in place of Android's OTA.
 - [ ] **Medium**: a TV-style home screen with tiles (Android's DTVLauncher); now rofi and the panel.
-- [ ] **Hard**: GPU acceleration (Mali-450). Android draws its interface and apps with GLES; X here
-  runs on fbdev with no GPU, as the Mali libraries are built for bionic (libhybris might load
-  them). It is the main reason the browser is slow, and video in web pages decodes in software.
+- [x] **Hard**: GPU acceleration (Mali-450) for X: OpenGL ES 2.0 for games, mpv and code of
+  one's own (`install-gpu.sh`, `install-games.sh`, [gpu/README.md](gpu/README.md)).
+- [ ] **Hard**: the browser on the GPU. WebKitGTK 2.50 turns acceleration off on this driver: it
+  needs an EGL 1.5 surfaceless or GBM display, and it hands frames over by `glReadPixels`
+  (160 ms for 720p here). Rendering into FBOs on X pixmaps is fast (a blur pass 11 ms, read back
+  in 3 ms), so a backend of that kind could work, inside WebKit or in a shim under it. Video in
+  web pages decodes in software either way (the hardware decoder isn't the GPU).
 - [ ] **Hard / not planned**: Android apps (Google Play, APKs) in Linux. Rebooting into Android
   is the way.
 

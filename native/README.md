@@ -19,7 +19,12 @@ recovery partition  → stock Android boot.img (T2, SmartTube)
 ./prepare-debian.sh <ip>            # sysvinit, network, time, modules, hardware, systemd ban
 # desktop packages — see below
 ./install-desktop.sh <ip>           # bspwm/polybar/rofi, yt, X autostart
+./install-gpu.sh <ip>               # Mali-450 GPU for X: modules, X driver, ozone-gl, mpv on the GPU
+./install-games.sh <ip>             # RetroArch (NES, GB, GBA) and glmark2, needs the GPU
 ```
+
+`install-gpu.sh` builds the kernel modules here first if they aren't in `out/gpu/` yet
+(`gpu/build-modules.sh`: it downloads a kernel tree and a toolchain into `cache/gpu/`).
 
 Flashing the image (from Android, as root): `dd if=linux-recovery.img of=/dev/block/boot`; before that, Android is
 copied to recovery: `dd if=/dev/block/boot of=/dev/block/recovery`. Backups of all partitions are in
@@ -190,7 +195,31 @@ Load log (times per page, crashes): `~/.cache/ozone-web/log`.
 | no `getrandom()`/seccomp | Dropbear instead of OpenSSH, chrony with `-F 0` |
 | no fbcon | the boot logo stays on screen until X starts; ozone-hw redraws it on fb0 and pulses it |
 | power off reboots: `meson_power_off` restarts with reason `charging_reboot`, u-boot boots on | `HALT=halt` (and `INIT_HALT`) in `/etc/default/halt`; the diverted `/etc/init.d/halt` ends in deep suspend instead (below), halting only if that fails |
+| no GPU in X: the Mali X11 driver needs UMP and DRM, the stock kernel has neither, and the Mali libraries for Linux are fbdev-only | our own modules (UMP, Mali r5p0 with UMP, DRM, `mali_drm`, `fbump`) built for the stock kernel from the box's own config, and the Mali X driver on Xorg 21 with a cached shadow ([gpu/README.md](gpu/README.md)) |
+| `rmmod mali` oopses (`aml_thermal` keeps calling the gone GPU cooling device) and `panic_on_oops` reboots | our `mali.ko` refuses to unload; never unload Android's either |
 | deep suspend powers USB down, wakes only on the IR remote's Power (red LED meanwhile), and waking is a cold boot | it is power off: after SysRq `u` (the data partition under `debian.img` stays writable past umountroot); Sleep = Android early suspend with a wakelock held (`ozone-standby`): HDMI off, any key wakes |
+
+## GPU
+
+The Mali-450 MP4 draws OpenGL ES 2.0 under X: `./install-gpu.sh`, details in
+[gpu/README.md](gpu/README.md).
+
+- At boot `ozone-gpu` loads the modules, and the desktop gets the Mali X driver. If the modules
+  aren't there, or that X crashes, the desktop gets the plain framebuffer.
+- `touch /etc/ozone/no-gpu` turns it off.
+- Programs use the GPU through `ozone-gl PROGRAM`; mpv and RetroArch do it by themselves.
+- `ozone-gl` only changes the library path. Without it, a program gets Mesa in software, as before.
+- Your own code builds with `pkg-config --cflags --libs mali-gles`.
+
+| | |
+|---|---|
+| GLES window, 1280x720 full screen | 120 fps (pure GPU fill: 280) |
+| RetroArch, full-screen NES | 82 fps |
+| glmark2-es2 | 81 |
+| a 3x3 blur, 720p RGBA, GPU round trip | 27 ms against 180 on the CPU |
+
+The browser does not gain from it. WebKitGTK 2.50 needs an EGL 1.5 surfaceless or GBM display,
+and it hands frames over by `glReadPixels`, which is 160 ms for 720p on this driver.
 
 ## Video
 
@@ -211,8 +240,9 @@ amplay --reset                              # brings the desktop back if amplay 
 
 Keys: Space pause, ←/→ ±10 s, PgDn/PgUp ±60 s, ↑/↓ volume, M mute, Q/Esc quit; mouse: move to show
 the controls, click the picture to pause, the progress bar to seek, wheel for volume. `yt` (Super+Y) picks
-H.264 up to 1080p and falls back to mpv, which decodes in software (360p at best: converting frames
-to RGB565 caps it at ~20 fps).
+H.264 up to 1080p and falls back to mpv, which decodes in software (360p at best). Without the GPU,
+converting frames to RGB565 caps it at ~20 fps. With the GPU, mpv scales and converts on the Mali
+(`/usr/local/bin/mpv`), at 111 % CPU for 360p instead of 190.
 
 How the driver is driven, and what breaks it:
 

@@ -19,7 +19,8 @@ mouse work too.
 9. [When something goes wrong](#9-when-something-goes-wrong)
 10. [The remote control](#10-the-remote-control)
 11. [USB drives, SD cards and network folders](#11-usb-drives-sd-cards-and-network-folders)
-12. [All key combinations](#12-all-key-combinations)
+12. [Games](#12-games)
+13. [All key combinations](#13-all-key-combinations)
 
 ---
 
@@ -344,6 +345,7 @@ Sound comes out of the TV over HDMI.
 | A black screen after turning on | Wait a minute. Failing that, unplug the box and plug it back in. |
 | The screen went dark by itself | It's asleep. Press a key or click the mouse. |
 | Everything is slow | Close unneeded browser tabs. If the temperature on the panel is high, give the box ventilation. |
+| Games or videos show a black window, or the desktop looks wrong | The graphics chip may be at fault. ⏻ → **Reboot**: if the desktop fails with it, the box falls back to drawing without it by itself. |
 | No internet (no IP address or WiFi name on the panel) | Click **WiFi** on the panel and choose your network. If it doesn't connect, check the router, then ⏻ → **Reboot**. |
 | "Could not connect …: wrong password?" | Choose the network again and retype the password (letter case matters). |
 
@@ -431,7 +433,30 @@ and whenever the network or that computer comes back. If it doesn't connect, a m
 a wrong user name or password, no such folder, the computer doesn't answer, or there's no computer
 by that name.
 
-## 12. All key combinations
+## 12. Games
+
+**RetroArch** in the app menu (**Super+D**) plays games of these consoles:
+
+- NES / Famicom (`.nes`);
+- Game Boy and Game Boy Color (`.gb`, `.gbc`);
+- Game Boy Advance (`.gba`).
+
+Put the game files in the **Games** folder of your home folder, or on a USB drive, then choose
+**Load Content** in RetroArch's menu. The box's graphics chip draws the games, so they run smoothly.
+
+| Remote | Game | RetroArch's menu |
+|---|---|---|
+| arrows | the cross (d-pad) | move |
+| **OK** | button A | choose |
+| **delete** | button B | back |
+| **1** / **2** | Start / Select | |
+| **page+** / **page−** | L / R shoulders | |
+| **0** | opens the menu (save, load, quit the game) | |
+| **exit** | closes RetroArch | |
+
+A USB gamepad works too: plug it in before starting RetroArch.
+
+## 13. All key combinations
 
 ### Anywhere
 | Keys | Action |

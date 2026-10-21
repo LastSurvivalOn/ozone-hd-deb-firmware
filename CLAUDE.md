@@ -32,6 +32,11 @@ Both phases share **the same** Debian rootfs: an ext4 file at `/data/linux/debia
 - `install-desktop.sh <ip>`: deploys a subset of `rootfs/` plus `dotfiles/` (bspwm, sxhkd, polybar, rofi; Catppuccin Mocha), builds `amplay/` on the box, fetches yt-dlp, and adds an X respawn line to `/etc/inittab`. Desktop packages are installed manually first; the list is in `native/README.md`.
 - `rootfs/usr/local/bin/ozone-web`: the browser (Python, GTK3, WebKit2 4.1), see `native/README.md`.
 - `amplay/amplay.c`: video player for the hardware decoder (amstream ioctls, FFmpeg demux, ALSA audio, evdev keys). Built natively on the box with gcc; there is no cross toolchain. `yt` uses it and falls back to mpv.
+- `install-gpu.sh <ip>`: the Mali-450 for X (see `native/gpu/README.md`).
+  - Kernel modules come from `gpu/build-modules.sh`, on the laptop with AOSP's `arm-eabi-4.8` and
+    the box's own kernel config.
+  - The Mali X driver (`gpu/ddx`) and `libEGL.so.1` (`gpu/egl-fix`) are built on the box.
+  - `install-games.sh <ip>` adds RetroArch and glmark2 on top.
 - `install-logo.sh <ip>`: repacks the `logo` partition (`tools/logoimg.py`, AML_RES v2) with `logo/bootup.png` (1920x1080) and installs the same picture as `/usr/share/ozone/splash.rgb565`, which `ozone-hw` draws on fb0 and `lib/ozone/splash` pulses via the OSD global alpha ioctl until X starts.
 - `rootfs/` mirrors absolute paths on the box. `/etc/ozone/is-native` tells the modes apart: it exits 0 when PID 1 is sysvinit and 1 under Android (`/init`). Hardware and input init scripts guard on it so they do nothing in chroot mode.
 - Flashing is done from Android as root, manually: `dd if=linux-recovery.img of=/dev/block/boot`, after first copying boot → recovery.
@@ -59,6 +64,28 @@ Several of these were found by bricking or hanging the box. Don't undo them.
 - **Browser:** Chromium can't run (SIGKILL in `execve` on 3.10). WebKitGTK needs `WEBKIT_DISABLE_DMABUF_RENDERER=1` (otherwise it renders via software EGL at ~3 fps). On heavy sites page JavaScript, not painting, limits scrolling, which is why `ozone-web` has per-site JS off ("fast mode") and a reader view. Measure scrolling with real wheel events (`xdotool click 5`) and on-screen frame changes; a JS `scrollBy` loop measures something else.
 - **GTK CSS from Python:** the first number in the first stylesheet fails to parse ("not a number: Function not implemented"): GTK reads a stale errno, which Python leaves at ENOSYS (no `getrandom()`). `yt` loads a throwaway stylesheet first.
 - **Drives and network folders:** `ozone-media` (native only) mounts USB/SD drives in `/media` from netlink uevents (no udev) and keeps the network folders in `/etc/ozone/shares.json` (root, 600: passwords) mounted. The kernel's CIFS speaks **SMB1 only**, and `mount.cifs` needs the `aid_inet` supplementary group (it drops its capabilities, then the paranoid network check fails with error 13). SMB2/3 goes through rclone from rclone.org (Debian's 1.60 creates a stray "．" folder on the share); `rclone mount --daemon` keeps the caller's pipes open, so never capture its output. FUSE mounts (NTFS, exFAT, rclone) are unmounted by `ozone-media stop` before sendsigs.
+- **GPU (Mali-450).** The stock kernel has no UMP and no DRM, which the Mali X11 driver needs, so
+  `ozone-gpu` loads our own modules from `extra/gpu/`: ump, umplock, mali r5p0 with UMP, hdmi, drm,
+  mali_drm, fbump.
+  - **Never `rmmod mali`, ours or Android's.** `aml_thermal` keeps polling the GPU cooling device
+    of the unloaded module, which oopses, and `panic_on_oops` reboots. Our `mali.ko` refuses to
+    unload. To reload the GPU modules, reboot.
+  - The module ABI is checked only by vermagic (no MODVERSIONS). Build with
+    `gpu/kernel-3.10.33.config`, the box's own config taken from its boot.img.
+  - `gen-xorg-screen` picks `Driver "mali"` when `/run/ozone-gpu` exists. After an X crash with it
+    (`/run/ozone-gpu-failed`) it picks fbdev until a reboot.
+  - The Mali X driver keeps the screen in a cached UMP shadow: reading the framebuffer is uncached,
+    and a window scroll took 47 ms. DRI2 swaps go from the back buffer straight to the framebuffer
+    (one copy; 32-bit windows converted with NEON).
+  - Programs get the GPU through `ozone-gl` (`/usr/local/lib/mali` first in the library path), never
+    system-wide: WebKit/GTK keep Mesa. `/usr/local/bin/mpv` and `retroarch` wrap the real ones.
+  - Mali's own EGL is 1.4 with bugs that our `libEGL.so.1` covers (NULL version pointers, no
+    platform displays, no core functions from GetProcAddress, DirectColor visuals). The screen is
+    16-bit: 8888 configs take 32-bit visuals, which X converts on the CPU, so 565 comes first.
+  - `glReadPixels` is 160 ms for 720p. To read GPU results, render into an FBO on an EGLImage of an
+    X pixmap (cached UMP) and fetch with XShmGetImage: ~3 ms.
+  - RetroArch must use `audio_driver = "sdl2"` (`/etc/ozone/retroarch.cfg`), not alsa, for the
+    same HDMI hang as mpv.
 - The CPU governor is `interactive` with all cores online (`ozone-hw`); the stock `hotplug` was slower for interactive use.
 - Run `sync` after deploying files to the box. A crash has left a 0-byte init script before.
 - `/system` is nearly full and is mounted read-only. Remount it rw only briefly, as `autostart.sh` does.
