@@ -45,6 +45,9 @@ start)
     echo 0 > $FB/fb0/blank
     [ -f $SPLASH ] && start-stop-daemon --start --quiet --background --make-pidfile \
         --pidfile /run/ozone-splash.pid --exec /usr/bin/python3 -- /usr/local/lib/ozone/splash
+    # a TV that only turns up after power-on gets HDMI then (u-boot chose analog output without it)
+    start-stop-daemon --start --quiet --background --make-pidfile --pidfile /run/ozone-hdmi-watch.pid \
+        --startas /bin/sh -- -c 'exec /usr/local/lib/ozone/hdmi-watch >> /var/log/hdmi-watch.log 2>&1'
 
     # Without udev the kernel creates device nodes for root only; set permissions as in regular Debian
     chgrp -R audio /dev/snd && chmod -R g+rw /dev/snd
