@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=System info
+Comment=The box: firmware, startup, hardware, storage, memory, how it works
+Exec=ozone-sysinfo
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;

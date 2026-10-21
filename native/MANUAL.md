@@ -104,6 +104,14 @@ again to hide it).
 **The app menu** opens with **Super+D** or the grid button. Start typing a name ("term", "files"…)
 and the list filters as you type. Use the arrows to choose and Enter to launch. Esc closes it.
 
+**System info** (in the app menu, or a click on the CPU, memory or temperature on the panel)
+tells everything about the box: the firmware and the programs with their versions, what starts
+at boot and with the desktop (and whether it runs now), how the system works, the hardware (the
+processor's speed and temperature, the TV it is connected to, the WiFi signal), the free space
+and the memory. **↑ / ↓** choose a section, **→** goes into it (then **↑ / ↓ / PgUp / PgDn**
+scroll, **←** goes back), **Esc** closes. **Copy all** puts the whole report on the clipboard,
+to paste into a message.
+
 **The terminal** (the command line) opens with **Super+Enter**, or "Terminal" in the app menu.
 
 | Keys / mouse | Action |

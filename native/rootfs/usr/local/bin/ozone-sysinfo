@@ -1,0 +1,675 @@
+#!/usr/bin/python3
+"""ozone-sysinfo: everything about the box in one window.
+
+Sections on the left: an overview, the software (firmware, kernel, Debian, programs), what starts
+at boot and with the desktop (and whether it runs now), how it all works, the hardware, storage
+and memory. The live ones refresh every 3 s. "Copy all" puts the whole report on the clipboard.
+
+Keys: ↑ / ↓ choose a section, → (or Tab) goes into it, where ↑ / ↓ / PgUp / PgDn scroll and ←
+goes back; Esc closes. The panel's CPU, memory and temperature open it too.
+"""
+import os
+import re
+import subprocess
+import threading
+import time
+
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('Gdk', '3.0')
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+
+REFRESH = 3000   # ms
+SYSTEM_PROP = '/system/build.prop'
+
+CSS = b"""
+* { font-family: "DejaVu Sans"; font-size: 13px; color: #cdd6f4; }
+window, scrolledwindow, list, viewport { background: #11111b; }
+.header { padding: 10px 16px; }
+.logo { font-family: "FontAwesome"; font-size: 24px; color: #cba6f7; }
+.heading { font-size: 18px; font-weight: bold; }
+.status { color: #7f849c; }
+button { background: #1e1e2e; border: 1px solid #313244; border-radius: 16px; padding: 4px 14px;
+         box-shadow: none; }
+button:hover, button:focus { border-color: #cba6f7; }
+button.close { font-family: "FontAwesome"; font-size: 16px; background: transparent; border: none;
+               padding: 4px 10px; color: #a6adc8; }
+button.close:hover { background: #f38ba8; color: #11111b; }
+.sections { border-right: 1px solid #313244; }
+.sections row { padding: 10px 16px; outline: none; }
+.sections row:selected { background: #313244; }
+.icon { font-family: "FontAwesome"; font-size: 15px; color: #cba6f7; min-width: 22px; }
+.section { font-size: 15px; font-weight: bold; }
+.content { padding: 8px 24px 24px 24px; }
+.block { font-weight: bold; font-size: 14px; color: #f9e2af; padding: 18px 0 6px 0; }
+.key { color: #a6adc8; }
+.value { font-family: "JetBrains Mono"; font-size: 13px; }
+.on { color: #a6e3a1; }
+.off { color: #7f849c; }
+.text { font-size: 14px; }
+.content:focus { outline: none; }
+progressbar trough { min-height: 8px; background: #313244; border: none; border-radius: 4px; }
+progressbar progress { min-height: 8px; background: #89b4fa; border: none; border-radius: 4px; }
+progressbar.warn progress { background: #fab387; }
+progressbar.full progress { background: #f38ba8; }
+"""
+
+
+# ---- reading the system ---------------------------------------------------------------------------
+
+def read(path, default=''):
+    try:
+        with open(path, errors='replace') as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def run(*cmd, timeout=10):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ''
+
+
+def size(n):
+    n = float(n)
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if n < 1024 or unit == 'TB':
+            return ('%.0f %s' if unit in ('B', 'KB') or n >= 100 else '%.1f %s') % (n, unit)
+        n /= 1024
+
+
+def props(path=SYSTEM_PROP):
+    out = {}
+    for line in read(path).splitlines():
+        if '=' in line and not line.startswith('#'):
+            k, v = line.split('=', 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def meminfo():
+    out = {}
+    for line in read('/proc/meminfo').splitlines():
+        k, v = line.split(':', 1)
+        out[k] = int(v.split()[0]) * 1024
+    # 3.10 has no MemAvailable (3.14 does): what programs could get without swapping
+    out.setdefault('MemAvailable', out['MemFree'] + out.get('Buffers', 0) + out.get('Cached', 0)
+                   + out.get('SReclaimable', 0) - out.get('Shmem', 0))
+    return out
+
+
+def processes():
+    """{pid: [argv]}"""
+    out = {}
+    for pid in os.listdir('/proc'):
+        if pid.isdigit():
+            argv = read('/proc/%s/cmdline' % pid).split('\0')
+            if argv and argv[0]:
+                out[int(pid)] = argv
+    return out
+
+
+def running_names(procs):
+    """Program names that run: argv[0] and, for interpreters, the script"""
+    names = set()
+    for argv in procs.values():
+        names.add(os.path.basename(argv[0]))
+        if os.path.basename(argv[0]).startswith(('python', 'sh', 'bash', 'perl')) and len(argv) > 1:
+            names.add(os.path.basename(argv[1]))
+            if len(argv) > 2:
+                names.add('%s %s' % (os.path.basename(argv[1]), argv[2]))
+    return names
+
+
+def native():
+    return subprocess.call(['/etc/ozone/is-native']) == 0 if os.path.exists('/etc/ozone/is-native') else False
+
+
+def uptime():
+    s = int(float(read('/proc/uptime', '0').split()[0]))
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m = s // 60
+    return ' '.join(p for p in ('%d d' % d if d else '', '%d h' % h if h or d else '', '%d min' % m) if p)
+
+
+def temperature():
+    t = read('/sys/class/thermal/thermal_zone0/temp')
+    if not t:
+        return ''
+    t = int(t)
+    return '%d °C' % (t // 1000 if t > 1000 else t)
+
+
+def addresses():
+    """{interface: ipv4}"""
+    out = {}
+    for line in run('ip', '-4', '-o', 'addr', 'show').splitlines():
+        f = line.split()
+        if len(f) > 3 and f[1] != 'lo':
+            out[f[1]] = f[3].split('/')[0]
+    return out
+
+
+def wifi():
+    """wpa_supplicant's view (root's socket: through sudo, as ozone-wifi does)"""
+    out = {}
+    for args in (('status',), ('signal_poll',)):
+        for line in run('sudo', '-n', 'wpa_cli', '-i', 'wlan0', *args, timeout=3).splitlines():
+            if '=' in line:
+                k, v = line.split('=', 1)
+                out[k] = v
+    return out
+
+
+def edid():
+    text = read('/sys/class/amhdmitx/amhdmitx0/edid')
+    brand = re.search(r'Brand Name:\s*(.*)', text)
+    product = re.search(r'Product Name:\s*(.*)', text)
+    return ' '.join(m.group(1).strip() for m in (brand, product) if m)
+
+
+def df(path):
+    try:
+        st = os.statvfs(path)
+    except OSError:
+        return None
+    total = st.f_blocks * st.f_frsize
+    free = st.f_bavail * st.f_frsize
+    return total, total - st.f_bfree * st.f_frsize, free
+
+
+def init_description(name):
+    m = re.search(r'^# Short-Description:\s*(.*)$', read('/etc/init.d/' + name), re.M)
+    return m.group(1).strip() if m else ''
+
+
+# ---- sections: each returns blocks, a block is (title, [rows]); a row is (key, value), ('bar',
+# label, fraction, text), ('text', paragraph), or (key, value, on) with on True / False -----------
+
+def overview():
+    p = props()
+    mem = meminfo()
+    ips = addresses()
+    w = wifi()
+    hw = re.search(r'^Hardware\s*:\s*(.*)$', read('/proc/cpuinfo'), re.M)
+    cores = len(re.findall(r'^processor', read('/proc/cpuinfo'), re.M))
+    maxf = int(read('/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq', '0')) // 1000
+    tv = edid()
+    net = []
+    if 'wlan0' in ips:
+        net.append('WiFi %s: %s' % (w.get('ssid', '?'), ips['wlan0']))
+    if 'eth0' in ips:
+        net.append('cable: %s' % ips['eth0'])
+    root = df('/')
+    rows = [
+        ('Box', '%s (board %s, by %s)' % (p.get('ro.product.model', 'OzoneHD T2'), p.get('ro.product.board', '?'),
+                                          p.get('ro.product.manufacturer', '?'))),
+        ('System', 'Debian %s %s, %s' % (read('/etc/debian_version'), run('dpkg', '--print-architecture'),
+                                         'native Linux' if native() else 'in a chroot under Android')),
+        ('Processor', 'Amlogic S805 (%s), %d × ARM Cortex-A5 up to %d MHz' % (
+            hw.group(1).replace('Amlogic', '').strip() if hw else '?', cores, maxf)),
+        ('Memory', '%s, %s in use' % (size(mem['MemTotal']), size(mem['MemTotal'] - mem['MemAvailable']))),
+        ('System disk', '%s free of %s' % (size(root[2]), size(root[0])) if root else '?'),
+        ('Screen', '%s output%s' % (read('/sys/class/display/mode', '?'), ' to %s' % tv if tv else '')),
+        ('Network', ', '.join(net) or 'not connected'),
+        ('Temperature', temperature()),
+        ('Up for', uptime()),
+        ('Load', ' '.join(read('/proc/loadavg').split()[:3]) + ' (1, 5, 15 min; 4 means all cores busy)'),
+        ('Name on the network', run('hostname')),
+    ]
+    return [('This box', rows)]
+
+
+VERSIONS = {}   # filled by a thread: some take seconds on this CPU (yt-dlp is a big Python program)
+
+
+def collect_versions():
+    pkgs = ('xserver-xorg-core', 'bspwm', 'sxhkd', 'polybar', 'rofi', 'mpv', 'libavformat59',
+            'libwebkit2gtk-4.1-0', 'python3', 'fish', 'lxterminal', 'sysvinit-core', 'dropbear-bin')
+    for line in run('dpkg-query', '-W', '-f', '${Package} ${Version}\\n', *pkgs).splitlines():
+        name, _, ver = line.partition(' ')
+        VERSIONS[name] = re.sub(r'^\d+:', '', ver)
+    VERSIONS['rclone'] = run('rclone', 'version').split('\n')[0].replace('rclone ', '')
+    VERSIONS['yt-dlp'] = run('yt-dlp', '--version', timeout=30)
+
+
+def software():
+    p = props()
+    ver = read('/proc/version')
+    m = re.match(r'Linux version (\S+) \((\S+)\) \(gcc version ([\d.]+).*\) #\d+ (.*?) (\w{3} \w{3} +\d+ .*)$', ver)
+    built = time.strftime('%d.%m.%Y', time.gmtime(int(p['ro.build.date.utc']))) if 'ro.build.date.utc' in p else '?'
+    cmdline = read('/proc/cmdline')
+    modes = ', '.join('%s=%s' % kv for kv in re.findall(r'\b(hdmimode|cvbsmode)=(\S+)', cmdline))
+    firmware = [
+        ('Android', '%s, build %s (%s)' % (p.get('ro.build.version.release', '?'),
+                                           p.get('ro.build.display.id', '?').split()[0], built)),
+        ('Kernel', '%s %s' % (m.group(1), m.group(4)) if m else ver),
+        ('Kernel built', '%s by the vendor (%s, gcc %s)' % (m.group(5), m.group(2), m.group(3)) if m else '?'),
+        ('Boot loader', 'the stock u-boot, untouched; it boots the "boot" partition, which holds Linux'),
+        ('Display from u-boot', modes or '?'),
+    ]
+    linux = [
+        ('Debian', '%s (bookworm), %s' % (read('/etc/debian_version'), run('dpkg', '--print-architecture'))),
+        ('Init', 'sysvinit %s (no systemd: the kernel lacks what it needs)' % VERSIONS.get('sysvinit-core', '')),
+        ('Ozone scripts', read('/etc/ozone/version') or 'version unknown (installed before it was recorded)'),
+        ('Packages', '%d installed' % run('dpkg-query', '-W', '-f', '${db:Status-Abbrev}\\n').split().count('ii')),
+    ]
+    names = [('Xorg', 'xserver-xorg-core'), ('bspwm (windows)', 'bspwm'), ('sxhkd (keys)', 'sxhkd'),
+             ('polybar (panel)', 'polybar'), ('rofi (menus)', 'rofi'), ('mpv', 'mpv'),
+             ('FFmpeg', 'libavformat59'), ('WebKitGTK (browser)', 'libwebkit2gtk-4.1-0'),
+             ('Python', 'python3'), ('fish', 'fish'), ('LXTerminal', 'lxterminal'),
+             ('Dropbear (ssh)', 'dropbear-bin'), ('yt-dlp', 'yt-dlp'), ('rclone', 'rclone')]
+    programs = [(label, VERSIONS.get(pkg) or ('…' if not VERSIONS else '-')) for label, pkg in names]
+    amplay = '/usr/local/bin/amplay'
+    if os.path.exists(amplay):
+        programs.append(('amplay (video)', 'built on the box %s' % time.strftime(
+            '%d.%m.%Y', time.localtime(os.path.getmtime(amplay)))))
+    return [('Firmware (stays from the factory)', firmware), ('Linux', linux), ('Programs', programs)]
+
+
+def startup():
+    procs = processes()
+    names = running_names(procs)
+    # services that leave a process behind, and its name
+    daemons = {'dropbear': 'dropbear', 'chrony': 'chronyd', 'ozone-input': 'kbd-merge', 'ozone-wifi': 'wpa_supplicant',
+               'ozone-media': 'ozone-media daemon', 'dbus': 'dbus-daemon', 'cron': 'cron', 'rsyslog': 'rsyslogd'}
+    blocks = []
+    for title, d in (('Early boot (/etc/rcS.d)', '/etc/rcS.d'), ('Services (/etc/rc2.d)', '/etc/rc2.d')):
+        rows = []
+        for link in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+            if not link.startswith('S'):
+                continue
+            name = link[3:]
+            desc = init_description(name) or name
+            if name in daemons:
+                on = daemons[name] in names
+                rows.append((name, desc, on))
+            else:
+                rows.append((name, desc))
+        blocks.append((title, rows))
+    desktop = [
+        ('X', 'the graphics server; init starts it and starts it again if it stops (/etc/inittab)', 'Xorg'),
+        ('bspwm', 'the window manager: tiles the windows, the workspaces', 'bspwm'),
+        ('sxhkd', 'keyboard shortcuts and the remote\'s app buttons', 'sxhkd'),
+        ('polybar', 'the panel at the top', 'polybar'),
+        ('ozone-remote', 'the IR remote: mouse mode, on-screen keyboard, exit, Power', 'ozone-remote'),
+        ('ozone-panel', 'shows the panel over full-screen windows', 'ozone-panel'),
+        ('ozone-web', 'the browser, waiting hidden so that it opens at once', 'ozone-web'),
+    ]
+    blocks.append(('With the desktop (~/.config/bspwm/bspwmrc)', [(n, d, p in names) for n, d, p in desktop]))
+    mods = {'8189es': 'WiFi (Realtek RTL8189ES), taken from Android', 'aml_nftl_dev': 'the NAND flash, from Android',
+            'aml_thermal': 'temperature and cooling', 'mali': 'the GPU (not used by X)'}
+    rows = []
+    for line in read('/proc/modules').splitlines():
+        f = line.split()
+        rows.append((f[0], '%s, %s' % (mods.get(f[0], 'kernel module'), size(int(f[1])))))
+    blocks.append(('Kernel modules', rows or [('', 'none')]))
+    return blocks
+
+
+HOW = [
+    ('Two systems on one box', [
+        'Android stays as it came from the factory; Linux lives next to it. The stock boot loader (u-boot) '
+        'starts whatever is in the "boot" partition: that is Linux now, with the box\'s own kernel. '
+        'Android\'s boot image moved to the "recovery" partition, and "Android" in the power menu starts it.']),
+    ('How Linux starts', [
+        'The kernel is the one Android uses (3.10, with Amlogic\'s drivers). A small start-up program of '
+        'ours (the initramfs) loads Android\'s NAND driver, mounts the data partition and the file '
+        '/data/linux/debian.img on it (a whole Debian system in one 2 GB file), and hands over to it. '
+        'There sysvinit starts the services, then the graphics with the panel.']),
+    ('Hardware, the Android way', [
+        'Android\'s own pieces drive the hardware where Linux has no driver: its WiFi module, its tool that '
+        'teaches the kernel the remote\'s buttons, and its TV libraries, which tune the DVB-T2 receiver '
+        'through a small bridge program (dtvfe). Video plays on the chip\'s hardware decoder (amplay), '
+        'so 1080p costs little CPU.']),
+    ('What is unusual', [
+        'There is no systemd and no udev: small scripts of ours set up devices, input, drives and power. '
+        'There is no GPU graphics either: the desktop is drawn by the CPU into a 16-bit framebuffer, '
+        '1280×720, which the display hardware scales to the TV. Sound reaches the TV over HDMI.']),
+    ('Power', [
+        'Sleep turns the screen off and wakes on any key. Power off puts the chip into deep sleep (the '
+        'light turns red); waking from it is a fresh start, so the filesystems are closed first. The box '
+        'can never cut its own power.']),
+    ('The same Debian under Android', [
+        'debian.img can also run inside Android (a chroot), without its graphics: useful for ssh and '
+        'tools while Android plays TV.']),
+]
+
+
+def how():
+    return [(title, [('text', t) for t in texts]) for title, texts in HOW]
+
+
+def hardware():
+    cpu = '/sys/devices/system/cpu/'
+    cores = sorted(int(c[3:]) for c in os.listdir(cpu) if re.match(r'cpu\d+$', c))
+    online = [c for c in cores if read(cpu + 'cpu%d/online' % c, '1') == '1']
+    cur = int(read(cpu + 'cpu0/cpufreq/scaling_cur_freq', '0')) // 1000
+    # cpuinfo_min_freq says 24 MHz, a step the driver never uses
+    lo = int(read(cpu + 'cpu0/cpufreq/scaling_min_freq', '0')) // 1000
+    hi = int(read(cpu + 'cpu0/cpufreq/cpuinfo_max_freq', '0')) // 1000
+    processor = [
+        ('Chip', 'Amlogic S805 (Meson8B), 28 nm'),
+        ('Cores', '%d × ARM Cortex-A5 (ARMv7, NEON), %d online' % (len(cores), len(online))),
+        ('Speed now', '%d MHz (%d to %d, governor %s)' % (cur, lo, hi, read(cpu + 'cpu0/cpufreq/scaling_governor'))),
+        ('Temperature', temperature()),
+        ('Graphics chip', 'ARM Mali-450, not used: X draws with the CPU'),
+        ('Video decoder', 'H.264, HEVC, MPEG-2/4 up to 1080p, in hardware'),
+    ]
+    mem = meminfo()
+    memory = [('RAM', '1 GB on the board; %s for Linux, the rest is reserved for video and the display'
+               % size(mem['MemTotal']))]
+    tv = edid()
+    hpd = read('/sys/class/amhdmitx/amhdmitx0/hpd_state')
+    fb = read('/sys/class/graphics/fb0/virtual_size').replace(',', '×')
+    display = [
+        ('HDMI', ('connected' + (' to %s' % tv if tv else '')) if hpd == '1' else 'nothing connected'),
+        ('Output', read('/sys/class/display/mode', '?')),
+        ('Desktop', '%s, %s-bit colour, scaled to the output' % (fb, read('/sys/class/graphics/fb0/bits_per_pixel'))),
+        ('Modes the TV takes', ', '.join(read('/sys/class/amhdmitx/amhdmitx0/disp_cap').split()) or '?'),
+    ]
+    card = re.search(r'\]:\s*(.*)', read('/proc/asound/cards'))
+    sound = [('Card', '%s; to the TV over HDMI (through the S/PDIF encoder)' % (card.group(1).strip() if card else '?'))]
+    ips = addresses()
+    w = wifi()
+    eth_up = read('/sys/class/net/eth0/carrier') == '1'
+    net = [
+        ('Ethernet', '%s, MAC %s' % (('cable in, %s Mbit/s' % read('/sys/class/net/eth0/speed') +
+                                      (', %s' % ips['eth0'] if 'eth0' in ips else '')) if eth_up else 'no cable',
+                                     read('/sys/class/net/eth0/address'))),
+        ('WiFi', 'Realtek RTL8189ES (2.4 GHz), MAC %s' % read('/sys/class/net/wlan0/address')),
+    ]
+    if w.get('ssid'):
+        freq = int(w.get('freq', w.get('FREQUENCY', '0')) or 0)
+        chan = (freq - 2407) // 5 if 2412 <= freq <= 2472 else '?'
+        net.append(('WiFi network', '%s, channel %s, signal %s dBm, %s Mbit/s, %s' % (
+            w['ssid'], chan, w.get('RSSI', '?'), w.get('LINKSPEED', '?'), w.get('ip_address', ips.get('wlan0', '')))))
+    else:
+        net.append(('WiFi network', 'not connected'))
+    other = [
+        ('TV receiver', 'DVB-T2: Availink AVL6762 demodulator + MaxLinear MxL608 tuner' +
+         ('' if os.path.isdir('/dev/dvb/adapter0') else ' (not set up)')),
+        ('Remote', 'IR receiver, NEC remote (code 0xfe01)'),
+        ('Storage', 'NAND flash, %s in partitions' % size(sum(int(l.split()[2]) * 1024 for l in read('/proc/partitions').splitlines()[2:]
+                                              if l.split() and not l.split()[3].startswith(('loop', 'zram', 'sd', 'mmcblk'))))),
+    ]
+    usb = []
+    base = '/sys/bus/usb/devices/'
+    for d in sorted(os.listdir(base)) if os.path.isdir(base) else []:
+        product = read(base + d + '/product')
+        if product and not d.startswith('usb'):
+            speed = read(base + d + '/speed')
+            name = ('%s %s' % (read(base + d + '/manufacturer'), product)).strip()
+            usb.append(('port ' + d, '%s (%s Mbit/s)' % (name, speed)))
+    known = {'aml_keypad': 'the IR receiver (the remote)', 'gpio_keypad': 'the button on the box',
+             'cec_input': 'HDMI-CEC (not used)', 'ozone-kbd': 'all keyboards together, for X (kbd-merge)',
+             'ozone-remote': 'the remote\'s keys, through ozone-remote',
+             'ozone-remote-mouse': 'the remote\'s mouse mode'}
+    inputs = []
+    for n in re.findall(r'^N: Name="(.*)"', read('/proc/bus/input/devices'), re.M):
+        n = n.strip()
+        if n not in [i[0] for i in inputs]:
+            inputs.append((n, known.get(n, 'USB keyboard, mouse or other input')))
+    return [('Processor', processor), ('Memory', memory), ('Display', display), ('Sound', sound),
+            ('Network', net), ('Other', other), ('USB devices', usb or [('', 'none')]),
+            ('Input devices', inputs)]
+
+
+def bar(label, used, total, extra='', left='free'):
+    frac = used / total if total else 0
+    return ('bar', label, frac, '%s of %s used, %s %s%s' % (size(used), size(total), size(total - used), left, extra))
+
+
+def storage():
+    rows = []
+    for path, label, what in (('/', 'Linux (debian.img)', ''), ('/mnt/nand', 'Data partition', ''),
+                              ('/system', 'Android system', ' (read-only)')):
+        d = df(path)
+        if d:
+            rows.append(bar(label, d[1], d[0], what))
+    media = []
+    for line in read('/proc/mounts').splitlines():
+        f = line.split()
+        mnt = re.sub(r'\\([0-7]{3})', lambda m: chr(int(m.group(1), 8)), f[1])
+        if mnt.startswith('/media/'):
+            d = df(mnt)
+            if d:
+                kind = 'network folder' if f[2] in ('cifs', 'fuse.rclone') else 'drive'
+                media.append(bar('%s (%s)' % (os.path.basename(mnt), kind), d[1], d[0]))
+    parts = []
+    names = {'boot': 'Linux (our image; the box boots it)', 'recovery': 'Android\'s boot image',
+             'system': 'Android', 'data': 'Android\'s apps and data, and debian.img', 'cache': 'Android\'s cache',
+             'logo': 'the boot logo', 'misc': 'boot flags'}
+    for line in read('/proc/partitions').splitlines()[2:]:
+        f = line.split()
+        if f and f[3] in names:
+            parts.append((f[3], '%s, %s' % (size(int(f[2]) * 1024), names[f[3]])))
+    explain = [('text', 'Linux is one file, debian.img, on Android\'s data partition: the space it can '
+                        'grow into is the free space of that partition.')]
+    return [('Space', rows), ('Drives and network folders', media or [('', 'none connected')]),
+            ('NAND partitions', parts), ('', explain)]
+
+
+def memory():
+    m = meminfo()
+    used = m['MemTotal'] - m['MemAvailable']
+    cache = m.get('Cached', 0) + m.get('Buffers', 0)
+    rows = [bar('Memory', used, m['MemTotal'], left='available'),
+            ('In use by programs', size(used)),
+            ('Disk cache', '%s (given back when programs need it)' % size(cache)),
+            ('Not used at all', size(m['MemFree']))]
+    if m.get('SwapTotal'):
+        sw = m['SwapTotal'] - m['SwapFree']
+        rows.append(bar('Swap (zram: compressed, in RAM)', sw, m['SwapTotal']))
+    procs = []
+    for pid, argv in processes().items():
+        rss = re.search(r'^VmRSS:\s+(\d+)', read('/proc/%d/status' % pid), re.M)
+        if rss:
+            name = os.path.basename(argv[0])
+            if name.startswith('python') and len(argv) > 1 and not argv[1].startswith('-'):
+                name = os.path.basename(argv[1])
+            procs.append((int(rss.group(1)) * 1024, name, pid))
+    procs.sort(reverse=True)
+    top = [(name, '%s  (pid %d)' % (size(rss), pid)) for rss, name, pid in procs[:12]]
+    return [('Memory', rows), ('Biggest programs', top)]
+
+
+SECTIONS = [  # (name, icon, function, live)
+    ('Overview', '', overview, True),
+    ('Software', '', software, False),
+    ('Startup', '', startup, True),
+    ('How it works', '', how, False),
+    ('Hardware', '', hardware, True),
+    ('Storage', '', storage, True),
+    ('Memory', '', memory, True),
+]
+
+
+def as_text(name, blocks):
+    out = ['== %s ==' % name]
+    for title, rows in blocks:
+        if title:
+            out.append('\n%s' % title)
+        for row in rows:
+            if row[0] == 'text':
+                out.append('  ' + row[1])
+            elif row[0] == 'bar':
+                out.append('  %s: %s' % (row[1], row[3]))
+            else:
+                state = '' if len(row) < 3 else (' [running]' if row[2] else ' [not running]')
+                out.append('  %s: %s%s' % (row[0], row[1], state) if row[0] else '  %s' % row[1])
+    return '\n'.join(out)
+
+
+# ---- the window -----------------------------------------------------------------------------------
+
+def label(text='', cls=None, **kw):
+    kw.setdefault('xalign', 0)
+    w = Gtk.Label(label=text, **kw)
+    for c in (cls or '').split():
+        w.get_style_context().add_class(c)
+    return w
+
+
+class Window:
+    def __init__(self):
+        # GTK's CSS parser loses the first number of the first stylesheet to a stale errno (see yt)
+        try:
+            Gtk.CssProvider().load_from_data(b'* { padding: 0px; }')
+        except GLib.Error:
+            pass
+        style = Gtk.CssProvider()
+        style.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), style,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.win = Gtk.Window(title='System info')
+        self.win.set_default_size(1280, 720)
+        self.win.connect('destroy', Gtk.main_quit)
+        self.win.connect('key-press-event', self.on_key)
+
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        header = Gtk.Box(spacing=12)
+        header.get_style_context().add_class('header')
+        header.pack_start(label('', 'logo'), False, False, 0)
+        header.pack_start(label('System info', 'heading'), False, False, 0)
+        self.status = label('', 'status')
+        header.pack_start(self.status, True, True, 0)
+        copy = Gtk.Button(label='Copy all')
+        copy.connect('clicked', lambda w: self.copy_all())
+        header.pack_start(copy, False, False, 0)
+        # bspwm draws no title bars, so the window closes here (or with Esc, the panel's ✕)
+        close = Gtk.Button(label='', tooltip_text='Close')
+        close.get_style_context().add_class('close')
+        close.connect('clicked', lambda w: self.win.destroy())
+        header.pack_start(close, False, False, 0)
+        top.pack_start(header, False, False, 0)
+
+        body = Gtk.Box()
+        self.list = Gtk.ListBox()
+        self.list.get_style_context().add_class('sections')
+        self.list.set_size_request(240, -1)
+        for name, icon, _f, _live in SECTIONS:
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(spacing=12)
+            box.pack_start(label(icon, 'icon', xalign=0.5), False, False, 0)
+            box.pack_start(label(name, 'section'), False, False, 0)
+            row.add(box)
+            self.list.add(row)
+        self.list.connect('row-selected', lambda lb, row: row and self.show(row.get_index()))
+        body.pack_start(self.list, False, False, 0)
+        self.scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, can_focus=True)
+        self.scroll.get_style_context().add_class('content')
+        body.pack_start(self.scroll, True, True, 0)
+        top.pack_start(body, True, True, 0)
+        self.win.add(top)
+
+        self.index = 0
+        self.win.show_all()
+        self.list.select_row(self.list.get_row_at_index(0))
+        self.list.get_row_at_index(0).grab_focus()
+        GLib.timeout_add(REFRESH, self.tick)
+        threading.Thread(target=self.versions, daemon=True).start()
+
+    def versions(self):
+        collect_versions()
+        GLib.idle_add(lambda: self.index == 1 and self.show(1))
+
+    def tick(self):
+        if SECTIONS[self.index][3]:
+            self.show(self.index)
+        return True
+
+    def show(self, index):
+        self.index = index
+        name, _icon, func, live = SECTIONS[index]
+        try:
+            blocks = func()
+        except Exception as e:   # one section failing must not take the window down
+            blocks = [('Could not read this', [('text', repr(e))])]
+        adj = self.scroll.get_vadjustment()
+        keep = adj.get_value()
+        old = self.scroll.get_child()
+        if old:
+            self.scroll.remove(old)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        keys = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)   # one key column for all blocks
+        for title, rows in blocks:
+            box.pack_start(label(title, 'block') if title else Gtk.Box(height_request=14), False, False, 0)
+            grid = Gtk.Grid(column_spacing=24, row_spacing=6)
+            for r, row in enumerate(rows):
+                if row[0] == 'text':
+                    grid.attach(label(row[1], 'text', wrap=True, max_width_chars=90, hexpand=True), 0, r, 2, 1)
+                elif row[0] == 'bar':
+                    _b, text, frac, detail = row
+                    key = label(text, 'key')
+                    keys.add_widget(key)
+                    grid.attach(key, 0, r, 1, 1)
+                    cell = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True)
+                    pb = Gtk.ProgressBar(fraction=min(1.0, frac), valign=Gtk.Align.CENTER)
+                    if frac > 0.9:
+                        pb.get_style_context().add_class('full')
+                    elif frac > 0.75:
+                        pb.get_style_context().add_class('warn')
+                    cell.pack_start(pb, False, False, 0)
+                    cell.pack_start(label(detail, 'value'), False, False, 0)
+                    grid.attach(cell, 1, r, 1, 1)
+                else:
+                    key = label(row[0], 'key', yalign=0)
+                    keys.add_widget(key)
+                    grid.attach(key, 0, r, 1, 1)
+                    value = row[1]
+                    cls = 'value'
+                    if len(row) > 2:
+                        value = ('● running   ' if row[2] else '○ not running   ') + value
+                        cls += ' on' if row[2] else ' off'
+                    grid.attach(label(value, cls, wrap=True, hexpand=True, xalign=0), 1, r, 1, 1)
+            box.pack_start(grid, False, False, 0)
+        self.scroll.add(box)
+        box.show_all()
+        self.status.set_text(time.strftime('updated %H:%M:%S') if live else '')
+        # a refresh keeps the place; a new section starts at the top
+        GLib.idle_add(adj.set_value, keep if old and getattr(self, 'shown', None) == index else 0)
+        self.shown = index
+        return False
+
+    def copy_all(self):
+        if not VERSIONS:
+            collect_versions()
+        text = '\n\n'.join(as_text(name, func()) for name, _i, func, _l in SECTIONS if func is not how)
+        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
+        self.status.set_text('copied: paste it anywhere with Ctrl+V')
+
+    def on_key(self, w, ev):
+        k = Gdk.keyval_name(ev.keyval)
+        if k == 'Escape':
+            self.win.destroy()
+            return True
+        in_content = self.win.get_focus() is self.scroll
+        adj = self.scroll.get_vadjustment()
+        if not in_content and k in ('Right', 'Tab'):
+            self.scroll.grab_focus()
+            return True
+        if in_content:
+            step = {'Up': -60, 'Down': 60, 'Page_Up': -adj.get_page_size() * 0.9,
+                    'Page_Down': adj.get_page_size() * 0.9}.get(k)
+            if step:
+                adj.set_value(max(0, min(adj.get_upper() - adj.get_page_size(), adj.get_value() + step)))
+                return True
+            if k in ('Left', 'ISO_Left_Tab'):
+                self.list.get_row_at_index(self.index).grab_focus()
+                return True
+        return False
+
+
+def main():
+    GLib.set_prgname('ozone-sysinfo')
+    Window()
+    Gtk.main()
+
+
+if __name__ == '__main__':
+    main()
