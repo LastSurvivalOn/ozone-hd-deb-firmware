@@ -1,6 +1,6 @@
 #!/bin/sh
-# Shows the resident browser (ozone-web --background) straight over D-Bus: ~70 ms, where starting
-# ozone-web's Python just to forward the request takes 0.6 s. Starts it if it isn't running.
+# Shows the running browser straight over D-Bus: ~70 ms, where starting ozone-web's Python just to
+# forward the request takes 0.6 s. Starts it if it isn't running.
 # (Kept out of sxhkdrc: braces in a command there are sxhkd's sequence syntax.)
 gdbus call --session --dest org.ozone.Web --object-path /org/ozone/Web \
     --method org.gtk.Application.Activate '{}' > /dev/null 2>&1 || exec ozone-web

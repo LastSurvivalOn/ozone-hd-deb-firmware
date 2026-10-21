@@ -286,9 +286,8 @@ What isn't available: teletext and subtitles, recording, radio.
 
 ## 7. The browser
 
-Open it with **Super+W** or the globe on the panel. It opens instantly, because it stays ready in
-the background. Closing it with **Super+Q** hides it, and next time it reopens with the same
-tabs.
+Open it with **Super+W** or the globe on the panel. It takes about 4 seconds to start. Closing it
+with **Super+Q** quits it and frees its memory, and next time it reopens with the same tabs.
 
 Type an address (`example.com`) or just words into the address bar. Words are searched with
 DuckDuckGo.

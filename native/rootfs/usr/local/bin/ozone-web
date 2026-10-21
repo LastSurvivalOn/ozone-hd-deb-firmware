@@ -27,10 +27,11 @@ What was measured on the box, and what follows from it:
   library CDNs: CNN loaded in 22 s instead of 45, The Verge in 12 instead of 48. The shield button
   lets them through for a site that needs them.
 - One instance: opening it again adds a tab to the running window instead of starting another
-  4-second, 200 MB browser. `--background` (started with the desktop) keeps it ready, hidden,
-  with a web process already spawned (~60 MB): it opens at once, and closing the window frees
-  the tabs and hides it again. A running instance gets requests through gdbus before this script
-  even imports GTK (66 ms instead of 1.5 s).
+  4-second, 200 MB browser. Closing the window quits it. `--background` keeps it ready, hidden,
+  with a web process already spawned (~60 MB, and more after use): it opens at once, and closing
+  the window frees the tabs and hides it again. The desktop no longer starts it that way, for the
+  memory. A running instance gets requests through gdbus before this script even imports GTK
+  (66 ms instead of 1.5 s).
 
   ozone-web [URL...]
   ozone-web --background         start hidden, ready to open

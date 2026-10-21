@@ -149,9 +149,9 @@ results (default `en`/`UA`).
 
 `ozone-web` (Super+W, the globe on the panel): Python + GTK3 on WebKitGTK 2.50, with tabs, an
 address/search bar (DuckDuckGo HTML), find (Ctrl+F), zoom, downloads to `~/Downloads`, session
-restore. One instance: opening it again adds a tab, and it starts hidden with the desktop
-(`--background`, ~60 MB) with a web process already running, so the panel button shows it in
-~0.1 s and a page like HN is up in ~2 s; closing the window frees the tabs and hides it again.
+restore. One instance: opening it again adds a tab, and closing the window quits it. It used to
+start hidden with the desktop (`--background`, ~60 MB at first and more after use), which showed
+it in ~0.1 s; that is off now, for the memory, and it takes ~4 s to start.
 Measured on the box before picking WebKit:
 
 | | Chromium 150 | Firefox ESR 153 | WebKitGTK 2.50 |

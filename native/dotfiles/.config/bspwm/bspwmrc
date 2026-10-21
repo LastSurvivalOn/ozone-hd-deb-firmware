@@ -31,5 +31,3 @@ feh --no-fehbg --bg-fill ~/.local/share/wallpapers/ozone.png
 ~/.config/polybar/launch.sh
 # the panel over fullscreen windows: pointer at the top edge, or info on the remote
 pgrep -x ozone-panel > /dev/null || ozone-panel &
-# the browser waits hidden, so the panel button opens it at once (~60 MB)
-ozone-web --background &
