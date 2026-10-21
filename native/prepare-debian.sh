@@ -24,7 +24,8 @@ adb -s $IP:5555 push "$W/boot/mali.ko" /data/local/tmp/mali.ko >/dev/null
 rm -r "$W"
 adb_root "mkdir -p $ROOT/lib/modules/$KVER/extra && \
           cp /system/lib/8189es.ko /system/lib/aml_thermal.ko /data/local/tmp/mali.ko $ROOT/lib/modules/$KVER/extra/ && \
-          chmod 644 $ROOT/lib/modules/$KVER/extra/*.ko && rm /data/local/tmp/mali.ko"
+          chmod 755 $ROOT/lib/modules/$KVER/extra && chmod 644 $ROOT/lib/modules/$KVER/extra/*.ko && \
+          rm /data/local/tmp/mali.ko"
 
 echo ">> config files"
 # rootfs/ has wrappers for these two stock scripts; the stock ones move aside first, once

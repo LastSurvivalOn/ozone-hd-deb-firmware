@@ -1228,7 +1228,7 @@ int MaliHWGetFD(ScrnInfoPtr pScrn)
 
 void MaliHWSetVideoModes(ScrnInfoPtr pScrn)
 {
-	char **modename;
+	const char **modename;
 	DisplayModePtr mode, this, last = pScrn->modes;
 
 	TRACE_ENTER();

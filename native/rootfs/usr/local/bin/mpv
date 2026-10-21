@@ -1,0 +1,9 @@
+#!/bin/sh
+# mpv, with the video output on the GPU when the desktop has one (see ozone-gl). Software
+# playback is decoding plus scaling and converting to RGB565 for the screen; on the GPU the second
+# part leaves the CPU: 360p takes 111 % CPU instead of 190, and 720p drops 57 frames in 20 s
+# instead of 140. The config's vf does that scaling on the CPU for vo=x11: off here.
+# Without the GPU the config stays as it is.
+[ -e /run/ozone-gpu-desktop ] &&
+    exec ozone-gl /usr/bin/mpv --vo=gpu --gpu-context=x11egl --gpu-api=opengl --vf= "$@"
+exec /usr/bin/mpv "$@"

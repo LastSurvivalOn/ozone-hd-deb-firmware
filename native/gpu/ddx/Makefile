@@ -7,7 +7,7 @@ MODULEDIR := $(shell pkg-config --variable=moduledir xorg-server)
 CFLAGS ?= -O2 -g
 CFLAGS += -fPIC -Wall -Wno-unused -include src/config.h \
 	$(shell pkg-config --cflags xorg-server libdrm) -I$(MALI_INC)
-LDLIBS = -L$(MALI_LIB) -lUMP -ldrm
+LDLIBS = -L$(MALI_LIB) -Wl,-rpath,$(MALI_LIB) -lUMP -ldrm
 
 SRC = src/mali_dri.c src/mali_exa.c src/mali_fbdev.c src/mali_lcd.c
 

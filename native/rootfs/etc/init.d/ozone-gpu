@@ -1,0 +1,47 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          ozone-gpu
+# Required-Start:    ozone-hw
+# Required-Stop:
+# Default-Start:     S
+# Default-Stop:
+# Short-Description: Mali-450 GPU for X: UMP, Mali, DRM
+# Description:       Loads the GPU modules from native/gpu (the stock kernel has no UMP and no
+#                    DRM, which the Mali X11 driver needs) and marks /run/ozone-gpu for the
+#                    desktop (gen-xorg-screen).
+### END INIT INFO
+
+# Under Android, Android loads its own mali.ko
+/etc/ozone/is-native || exit 0
+
+D=/lib/modules/3.10.33/extra/gpu
+# never mali.ko from extra/ as well: neither one can be unloaded (see native/gpu/README.md)
+MODULES="ump umplock mali hdmi drm mali_drm fbump"
+
+case "$1" in
+start)
+    [ -f $D/mali.ko ] || exit 0
+    # touch /etc/ozone/no-gpu for the plain framebuffer
+    [ -e /etc/ozone/no-gpu ] && exit 0
+    for m in $MODULES; do
+        grep -q "^$m " /proc/modules && continue
+        if ! insmod $D/$m.ko; then
+            echo "ozone-gpu: $m.ko failed to load, X uses the framebuffer" >&2
+            exit 1
+        fi
+    done
+    # Without udev the nodes are root's only
+    chgrp video /dev/mali /dev/ump /dev/umplock /dev/dri/card* &&
+        chmod 660 /dev/mali /dev/ump /dev/umplock /dev/dri/card*
+    touch /run/ozone-gpu
+    ;;
+stop|restart|force-reload)
+    ;;
+status)
+    [ -e /run/ozone-gpu ]
+    ;;
+*)
+    echo "usage: $0 start" >&2
+    exit 3
+    ;;
+esac
