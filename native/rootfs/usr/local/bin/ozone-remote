@@ -12,8 +12,9 @@ which kbd-merge merges into X's keyboard like any other. On the way it adds:
            erases, exit hides it; it can be clicked with the mouse too.
   exit     back: closes menus, the on-screen keyboard, the channel list, stops the player and
            closes the TV window (Esc); any other window it closes.
-  Power    sleep (ozone-standby); any button wakes the box (ozone-standby can't see the remote,
-           which is held here, so this wakes it).
+  Power    sleep (ozone-standby) when let go; any button wakes the box (ozone-standby can't see
+           the remote, which is held here, so this wakes it). Held for 2 s: power off (the box's
+           deep sleep, red LED; Power turns it on again).
 
 The panel shows both modes and switches them with a click (ozone-remote status | mouse | osk).
 If this isn't running, kbd-merge still passes the remote on as plain keys.
@@ -88,6 +89,7 @@ E = ecodes
 MOUSE_KEY = E.KEY_F19      # the "mouse" button, see remote.conf
 OSK_KEY = E.KEY_F14        # "text"
 RIGHT_CLICK_KEY = E.KEY_F13   # "info", in mouse mode
+POWER_OFF_HOLD = 2000      # ms of Power held down that power off instead of sleep
 
 
 def log(text):
@@ -344,6 +346,7 @@ class Remote:
         self.mouse_mode = False
         self.osk = Keyboard(self.changed)
         self.woke_at = self.wake_sent = 0
+        self.power_timer = None   # Power is down: the timeout that powers off if it stays down
         self.down = set()   # keys passed on and not released yet
         self.vol_since = self.vol_last = 0
         self.debug = os.path.exists(DEBUG)
@@ -441,7 +444,13 @@ class Remote:
             return
         press = value == 1
         if code == E.KEY_POWER:
+            # Power repeats while held (remote.conf), so the decoder lets it go only when the
+            # button is; a press that woke the box set no timer, and its release does nothing
             if press:
+                self.power_timer = GLib.timeout_add(POWER_OFF_HOLD, self.power_off)
+            elif value == 0 and self.power_timer:
+                GLib.source_remove(self.power_timer)
+                self.power_timer = None
                 subprocess.Popen(['sudo', '-n', 'ozone-standby'])
             return
         if code == MOUSE_KEY:
@@ -465,6 +474,12 @@ class Remote:
             return
         self.kbd.key(code, value)
         (self.down.add if value else self.down.discard)(code)
+
+    def power_off(self):
+        self.power_timer = None
+        log('Power held: power off')
+        subprocess.Popen(['sudo', '-n', 'poweroff'])
+        return False
 
     def volume(self, code, value):
         """A step per press and, held, one every 0.2 s or so after 0.4 s (X's autorepeat, 25 a

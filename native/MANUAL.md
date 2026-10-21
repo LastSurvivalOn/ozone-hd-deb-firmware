@@ -323,7 +323,7 @@ The box's own remote can run everything by itself: point it at the box.
 
 | Button | What it does |
 |---|---|
-| **Power** | sleep; any button wakes the box again |
+| **Power** | sleep; any button wakes the box again. Held for 2 seconds: power off (the light turns red; Power turns the box on again) |
 | **↑ ↓ ← →**, **OK** | move and choose, like the arrows and Enter |
 | **exit** | back: closes a menu, the on-screen keyboard or the channel list, stops the player, closes the TV window; any other window (YouTube, the browser) it closes |
 | **home** | the open windows and all the apps (YouTube, TV, the browser, Power, Screen size, WiFi…) |
