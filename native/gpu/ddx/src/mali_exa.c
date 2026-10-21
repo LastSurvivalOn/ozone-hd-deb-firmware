@@ -175,6 +175,38 @@ static Bool maliModifyPixmapHeader(PixmapPtr pPixmap, int width, int height, int
 
 	miModifyPixmapHeader(pPixmap, width, height, depth, bitsPerPixel, devKind, pPixData);
 
+	if (fPtr->shadow && pPixData == fPtr->shadow)
+	{
+		/* The screen pixmap of ShadowFB: a UMP buffer of its own, so no second half to flip to */
+		privPixmap->isFrameBuffer = TRUE;
+
+		if (privPixmap->mem_info)
+		{
+			return TRUE;
+		}
+
+		mem_info = calloc(1, sizeof(*mem_info));
+
+		if (!mem_info)
+		{
+			return FALSE;
+		}
+
+		ump_reference_add(fPtr->shadow_handle);
+		mem_info->handle = fPtr->shadow_handle;
+		mem_info->usize = exaGetPixmapPitch(pPixmap) * pPixmap->drawable.height;
+		mem_info->offset = 0;
+		privPixmap->mem_info = mem_info;
+
+		if (bitsPerPixel != 0)
+		{
+			privPixmap->bits_per_pixel = bitsPerPixel;
+		}
+
+		INFO_MSG("Creating shadow FRAMEBUFFER pixmap %p\n", pPixmap);
+		return TRUE;
+	}
+
 	if ((pPixData == fPtr->fbmem) || offset)
 	{
 		/* Wrap one of the fbdev virtual buffers */
@@ -395,7 +427,7 @@ static Bool maliPrepareAccess(PixmapPtr pPix, int index)
 		{
 			if (privPixmap->isFrameBuffer)
 			{
-				privPixmap->addr = (unsigned long)fPtr->fbmem;
+				privPixmap->addr = (unsigned long)(fPtr->shadow ? fPtr->shadow : fPtr->fbmem);
 			}
 			else
 			{

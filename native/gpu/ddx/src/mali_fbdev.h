@@ -28,6 +28,8 @@
 
 #include "xf86.h"
 #include "exa.h"
+#include "damage.h"
+#include <ump/ump.h>
 
 /*for amlogic hwc support*/
 #include "xf86Cursor.h"
@@ -72,6 +74,13 @@ typedef struct
 	Bool use_cached_ump;
 	Bool use_umplock;
 	int fd_umplock;
+	/* ShadowFB: the screen pixmap in cached UMP memory, copied to the
+	 * framebuffer (uncached, slow to read) where damaged */
+	Bool use_shadow;
+	unsigned char *shadow;
+	ump_handle shadow_handle;
+	DamagePtr shadow_damage;
+	ScreenBlockHandlerProcPtr BlockHandler;
 	void			*aml_disp_private;
 	void			*aml_hwcursor_private;
 } MaliRec, *MaliPtr;

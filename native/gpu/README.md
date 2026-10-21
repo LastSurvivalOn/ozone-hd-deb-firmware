@@ -52,8 +52,16 @@ and puts the secure id in `/sys/module/fbump/parameters/secure_id`.
 
 `ddx/` is Hardkernel's `c1_mali_ddx` (ARM's xf86-video-mali, MIT).
 It builds against Xorg 21 unchanged, apart from a Makefile and `config.h`
-instead of autotools. One change: it falls back to the `fbump` secure id when
-the fb ioctls fail.
+instead of autotools. Changes:
+
+- `ShadowFB` (on by default): the screen pixmap lives in cached UMP memory, and
+  the damaged parts go to the framebuffer before X waits for clients. Drawing
+  straight to the framebuffer reads uncached memory: a window scroll
+  (CopyArea) took 47.5 ms instead of 3. With the shadow there is no page
+  flipping.
+- Without the shadow, it falls back to the `fbump` secure id when the fb
+  ioctls fail.
+- `fbdev_crtc_config_resize` set the screen pixmap's width to its height.
 
 ```
 make -C ddx MALI_INC=<mali_headers> MALI_LIB=<dir with libUMP.so>
@@ -63,19 +71,52 @@ It needs `xserver-xorg-dev` and `libdrm-dev`. The userspace driver comes from
 github.com/mdrjr/c1_mali_libs at 31d5c21 (`x11/`: r5p0, with vsync and swap
 interval).
 
+## `egl-fix/`
+
+`libmali-egl-fix.so`, preloaded (or linked ahead of `libMali.so`). It covers
+what the EGL 1.4 driver lacks and current programs expect:
+
+- `eglInitialize` with NULL version pointers (it fails);
+- `EGL_EXT_platform_base` and `platform_x11`, on top of `eglGetDisplay`;
+- client extensions from `eglQueryString(EGL_NO_DISPLAY)`.
+
 ## Results
 
-On a test X server (`:1`, sharing fb0) with an ordinary X11 window
-(`tests/x11win.c`):
+These were measured on a test X server (`:1`, sharing fb0).
+
+GLES2 in an ordinary X11 window (`tests/x11win.c`), with the shadow:
 
 | Window | fps |
 |---|---|
-| 640x360 | 307 |
-| 1000x600 | 162 |
-| 1280x720 (full screen) | 95 |
+| 640x360 | 242 |
+| 1280x720 (full screen) | 92 |
 
-The swap copies the window from cached UMP memory, ~7 ms for 720p.
 Pure GPU fill is ~280 fps at 720p.
+
+2D, 1280x680 (`tests/x2dbench.c`), in ms:
+
+| Operation | fbdev (shadow) | mali, direct | mali, ShadowFB |
+|---|---|---|---|
+| ShmPutImage | 3.0 | 1.9 | 3.2 |
+| CopyArea (scroll) | 3.0 | 47.5 | 2.7 |
+| FillRectangle | 1.0 | 0.6 | 0.9 |
+
+mpv, full screen, a yuv420p source without decoding (`--untimed`), in fps.
+`vo=gpu` runs on GLES 2.0 in "dumb mode", with `egl-fix`:
+
+| Source | source alone | `vo=x11` | `vo=gpu` |
+|---|---|---|---|
+| 640x360 | 65 | 8.4 | 32 |
+| 1280x720 | 39 | 8.5 | 22.5 |
+
+WebKitGTK 2.50 does not use the GPU (`webkit://gpu`: "Policy: never"):
+
+- Its render process needs an EGL 1.5 platform display: surfaceless or GBM.
+- It hands frames over as DMA-BUF or shared memory. Shared memory means
+  `glReadPixels`, which takes ~130 ms on this GPU.
+- With Mali, a CSS animation of three big layers runs at the same 2.1 fps as
+  CPU rendering, all in the WebProcess main thread (Skia on the CPU).
+- So the browser needs WebKit itself changed, not just a driver.
 
 ## fbdev-only findings (before UMP)
 

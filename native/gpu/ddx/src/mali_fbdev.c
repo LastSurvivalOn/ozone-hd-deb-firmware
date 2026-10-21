@@ -25,6 +25,7 @@
 #endif
 
 #include <errno.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
@@ -115,6 +116,7 @@ typedef enum
 	OPTION_DRI2_WAIT_VSYNC,
 	OPTION_UMP_CACHED,
 	OPTION_UMP_LOCK,
+	OPTION_SHADOW_FB,
 } FBDevOpts;
 
 static const OptionInfoRec MaliOptions[] =
@@ -126,6 +128,7 @@ static const OptionInfoRec MaliOptions[] =
 	{ OPTION_DRI2_WAIT_VSYNC,  "DRI2_WAIT_VSYNC", OPTV_BOOLEAN, {0}, FALSE },
 	{ OPTION_UMP_CACHED,       "UMP_CACHED",      OPTV_BOOLEAN, {0}, FALSE },
 	{ OPTION_UMP_LOCK,         "UMP_LOCK",        OPTV_BOOLEAN, {0}, FALSE },
+	{ OPTION_SHADOW_FB,        "ShadowFB",        OPTV_BOOLEAN, {0}, TRUE  },
 	{ -1,                      NULL,              OPTV_NONE,    {0}, FALSE }
 };
 
@@ -561,6 +564,12 @@ static Bool fbdev_crtc_config_resize(ScrnInfoPtr pScrn, int width, int height)
 		return TRUE;
 	}
 
+	/* the shadow is allocated for the size X started with */
+	if (fPtr->use_shadow)
+	{
+		return width == pScrn->virtualX && height == pScrn->virtualY;
+	}
+
 	/* calculate new pitch, align to any HW requirements if needed */
 	pitch = width * (pScrn->bitsPerPixel / 8);
 
@@ -568,14 +577,19 @@ static Bool fbdev_crtc_config_resize(ScrnInfoPtr pScrn, int width, int height)
 	pScrn->virtualY = height;
 
 	/* update pitch setting in EXA */
-#if 1
 	PixmapPtr frontPixmap = (*pScrn->pScreen->GetScreenPixmap)(pScrn->pScreen);
 	PixmapPtr backPixmap  = ((PrivPixmap *)exaGetPixmapDriverPrivate(frontPixmap))->other_buffer;
 
-	backPixmap->devKind = frontPixmap->devKind = pitch;
-	backPixmap->drawable.width = frontPixmap->drawable.width = width;
-	backPixmap->drawable.height = frontPixmap->drawable.width = height;
-#endif
+	frontPixmap->devKind = pitch;
+	frontPixmap->drawable.width = width;
+	frontPixmap->drawable.height = height;
+
+	if (backPixmap)
+	{
+		backPixmap->devKind = pitch;
+		backPixmap->drawable.width = width;
+		backPixmap->drawable.height = height;
+	}
 	pScrn->displayWidth = pitch / (pScrn->bitsPerPixel / 8);
 
 	/* reinitialize the crtc to get the new setting */
@@ -632,6 +646,14 @@ static void mali_check_dri_options(ScrnInfoPtr pScrn)
 	else
 	{
 		CONFIG_MSG("Use uncached UMP memory");
+	}
+
+	if (xf86ReturnOptValBool(fPtr->Options, OPTION_SHADOW_FB, TRUE))
+	{
+		CONFIG_MSG("Shadow framebuffer in cached UMP memory");
+		fPtr->use_shadow = TRUE;
+		/* flipping shows the framebuffer halves, which the shadow bypasses */
+		fPtr->use_pageflipping = FALSE;
 	}
 
 	if (xf86ReturnOptValBool(fPtr->Options, OPTION_UMP_LOCK, FALSE))
@@ -1530,6 +1552,117 @@ static Bool MaliPreInit(ScrnInfoPtr pScrn, int flags)
 	return TRUE;
 }
 
+static Bool MaliShadowAlloc(ScrnInfoPtr pScrn)
+{
+	MaliPtr fPtr = MALIPTR(pScrn);
+	unsigned long size = (unsigned long)fPtr->fb_lcd_fix.line_length * pScrn->virtualY;
+
+	if (UMP_OK != ump_open())
+	{
+		return FALSE;
+	}
+
+	fPtr->shadow_handle = ump_ref_drv_allocate(size, UMP_REF_DRV_CONSTRAINT_PHYSICALLY_LINEAR | UMP_REF_DRV_CONSTRAINT_USE_CACHE);
+
+	if (UMP_INVALID_MEMORY_HANDLE == fPtr->shadow_handle)
+	{
+		return FALSE;
+	}
+
+	fPtr->shadow = ump_mapped_pointer_get(fPtr->shadow_handle);
+
+	if (NULL == fPtr->shadow)
+	{
+		ump_reference_release(fPtr->shadow_handle);
+		fPtr->shadow_handle = UMP_INVALID_MEMORY_HANDLE;
+		return FALSE;
+	}
+
+	memcpy(fPtr->shadow, fPtr->fbmem + fPtr->fboff, size);
+	INFO_MSG("Shadow framebuffer: %lu bytes of cached UMP memory, secure id 0x%x\n", size, ump_secure_id_get(fPtr->shadow_handle));
+	return TRUE;
+}
+
+/* Copies the damaged parts of the shadow to the framebuffer */
+static void MaliShadowBlockHandler(ScreenPtr pScreen, void *timeout)
+{
+	ScrnInfoPtr pScrn = xf86ScreenToScrn(pScreen);
+	MaliPtr fPtr = MALIPTR(pScrn);
+	RegionPtr damage = DamageRegion(fPtr->shadow_damage);
+
+	pScreen->BlockHandler = fPtr->BlockHandler;
+	(*pScreen->BlockHandler)(pScreen, timeout);
+	pScreen->BlockHandler = MaliShadowBlockHandler;
+
+	if (RegionNotEmpty(damage) && pScrn->vtSema)
+	{
+		int stride = fPtr->fb_lcd_fix.line_length, bpp = pScrn->bitsPerPixel / 8;
+		int n = RegionNumRects(damage);
+		BoxPtr box = RegionRects(damage);
+
+		for (; n--; box++)
+		{
+			unsigned long offset = box->y1 * stride + box->x1 * bpp;
+			int width = (box->x2 - box->x1) * bpp, y;
+
+			for (y = box->y1; y < box->y2; y++, offset += stride)
+			{
+				memcpy(fPtr->fbmem + fPtr->fboff + offset, fPtr->shadow + offset, width);
+			}
+		}
+
+		DamageEmpty(fPtr->shadow_damage);
+	}
+}
+
+static Bool MaliShadowCreateScreenResources(ScreenPtr pScreen)
+{
+	ScrnInfoPtr pScrn = xf86ScreenToScrn(pScreen);
+	MaliPtr fPtr = MALIPTR(pScrn);
+	Bool ret;
+
+	pScreen->CreateScreenResources = fPtr->CreateScreenResources;
+	ret = (*pScreen->CreateScreenResources)(pScreen);
+	pScreen->CreateScreenResources = MaliShadowCreateScreenResources;
+
+	if (!ret)
+	{
+		return FALSE;
+	}
+
+	fPtr->shadow_damage = DamageCreate(NULL, NULL, DamageReportNone, TRUE, pScreen, pScreen);
+
+	if (!fPtr->shadow_damage)
+	{
+		return FALSE;
+	}
+
+	DamageRegister(&pScreen->GetScreenPixmap(pScreen)->drawable, fPtr->shadow_damage);
+	fPtr->BlockHandler = pScreen->BlockHandler;
+	pScreen->BlockHandler = MaliShadowBlockHandler;
+	return TRUE;
+}
+
+static void MaliShadowFree(ScreenPtr pScreen)
+{
+	ScrnInfoPtr pScrn = xf86ScreenToScrn(pScreen);
+	MaliPtr fPtr = MALIPTR(pScrn);
+
+	if (fPtr->shadow_damage)
+	{
+		DamageDestroy(fPtr->shadow_damage);
+		fPtr->shadow_damage = NULL;
+		pScreen->BlockHandler = fPtr->BlockHandler;
+	}
+
+	if (fPtr->shadow)
+	{
+		ump_mapped_pointer_release(fPtr->shadow_handle);
+		ump_reference_release(fPtr->shadow_handle);
+		fPtr->shadow = NULL;
+	}
+}
+
 static Bool MaliScreenInit(SCREEN_INIT_ARGS_DECL)
 {
 	ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
@@ -1615,6 +1748,17 @@ static Bool MaliScreenInit(SCREEN_INIT_ARGS_DECL)
 
 	fPtr->fbstart = fPtr->fbmem + fPtr->fboff;
 
+	if (fPtr->use_shadow && !MaliShadowAlloc(pScrn))
+	{
+		WARNING_MSG("no shadow framebuffer, drawing straight to the framebuffer");
+		fPtr->use_shadow = FALSE;
+	}
+
+	if (fPtr->use_shadow)
+	{
+		fPtr->fbstart = fPtr->shadow;
+	}
+
 	ret = fbScreenInit(pScreen, fPtr->fbstart, pScrn->virtualX,
 	                   pScrn->virtualY, pScrn->xDpi,
 	                   pScrn->yDpi, pScrn->displayWidth,
@@ -1661,6 +1805,19 @@ static Bool MaliScreenInit(SCREEN_INIT_ARGS_DECL)
 		WARNING_MSG("Failed allocating EXA Driver!");
 		free(fPtr->exa);
 		fPtr->exa = NULL;
+	}
+
+	/* after fb and EXA, which would replace what damage wraps */
+	if (fPtr->use_shadow)
+	{
+		if (!DamageSetup(pScreen))
+		{
+			ERROR_MSG("damage setup failed");
+			return FALSE;
+		}
+
+		fPtr->CreateScreenResources = pScreen->CreateScreenResources;
+		pScreen->CreateScreenResources = MaliShadowCreateScreenResources;
 	}
 
 	xf86SetBackingStore(pScreen);
@@ -1755,6 +1912,7 @@ static Bool MaliCloseScreen(CLOSE_SCREEN_ARGS_DECL)
 	TRACE_ENTER();
 
 	MaliHWRestore(pScrn);
+	MaliShadowFree(pScreen);
 	MaliHWUnmapVidmem(pScrn);
 	pScrn->vtSema = FALSE;
 
