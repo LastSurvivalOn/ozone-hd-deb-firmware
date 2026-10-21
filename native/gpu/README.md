@@ -246,6 +246,55 @@ The X driver now does less for every client:
 
 Under WebKit this took X from 35000 page faults and ~1150 UMP cache ioctls a second down to none.
 
+## Next: a WebKit of our own (not started)
+
+Scrolling on the GPU needs WebKit to hand its frames to X as pixmaps, not through shared memory.
+The shims can't do that, because the copy into shared memory and the cairo upload happen inside
+WebKit's two processes. Plan, written 2026-10-21, against the box's `libwebkit2gtk-4.1-0`
+2.50.6-1~deb12u2:
+
+1. **Build it unchanged first.**
+   - Cross-build on the laptop. The box can't: a link alone needs several GB of RAM.
+   - Source: `apt source webkit2gtk` at exactly the box's Debian version, so the library can
+     replace the packaged one with the same ABI.
+   - Toolchain: a bookworm chroot with `dpkg --add-architecture armhf`, `crossbuild-essential-armhf`
+     and the armhf build-deps (`DEB_BUILD_PROFILES="cross nocheck nodoc"`). Not qemu-user: that
+     would take days.
+   - Build only the 4.1 (GTK 3) library and its processes, Release, no debug info (`-g0`), with
+     lld or gold. Expect hours and 30–50 GB of disk.
+   - Milestone: `ozone-web` runs on the box with the new `libwebkit2gtk-4.1.so.0`,
+     `libjavascriptcoregtk-4.1.so.0` and `WebKitWebProcess`, all taken from
+     `/usr/local/lib/ozone-webkit` through `LD_LIBRARY_PATH`. The Debian package stays installed
+     and untouched, and its typelibs keep working because the ABI is the same.
+2. **Web process: render into X pixmaps.**
+   - Add a render target next to the shared-memory one: an X pixmap, with a texture on its
+     EGLImage as the FBO's colour attachment. This is what `gles-fix.c` already does under
+     WebKit.
+   - Keep WebKit's swapchain of buffers (one pixmap per buffer). Flip the rows when drawing so
+     that X gets them top down.
+   - `glFinish` before the frame is announced, and send the pixmap's XID over IPC in place of the
+     shared-memory handle.
+   - The X connection can be the one the shims' surfaceless display already opens.
+3. **UI process: show the pixmap.**
+   - In the backing store's paint, wrap the XID in `cairo_xlib_surface_create`. GTK then
+     composites it inside X (XRender), with no copy in the client.
+   - If that is still slow, use a child X window under the view and `XCopyArea` into it.
+   - Pass WebKit's damage rectangles on, so that X copies only what changed.
+4. **Measure** with `screenfps.py` and `wkfps.py` against the table above.
+   - Goal: wheel scrolling in ozone-web beats the CPU path (5.2 updates a second).
+   - Expected traffic per frame: the GPU writes 3.5 MB, X reads it and writes 1.7 MB of 565 into
+     the shadow, and the flush copies 1.7 MB. That is about 9 MB against ~24 MB now.
+   - The display side is known to keep up: a 720p GLES window already reaches 120 fps over DRI2.
+5. **Ship** the libraries in `/usr/local/lib/ozone-webkit` and point `ozone-web` at them only
+   with `OZONE_WEB_GPU=1`. Every Debian security update of webkit2gtk needs a rebuild (or a hold),
+   because the private library ABI follows the package version.
+
+Risks:
+- WebKit's X11 support in the GTK 3 port is shrinking release by release.
+- The IPC and backing-store classes change between minor versions, so the patch is tied to
+  2.50.
+- Page JavaScript still limits heavy sites, which no GPU fixes.
+
 ## fbdev-only findings (before UMP)
 
 - Android's `mali.ko` works with the fbdev blobs from Amlogic's buildroot

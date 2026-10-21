@@ -109,7 +109,8 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
   through shims under it (native/gpu/egl-fix), CSS animations 8 times faster.
 - [ ] **Hard**: the browser's frames straight to the screen. Each still crosses to X whole through
   shared memory, ~25 a second at most, so scrolling gains nothing yet. It needs a WebKit of our
-  own: frames kept as X pixmaps that X shows directly. Video in web pages: there are no
+  own: frames kept as X pixmaps that X shows directly (the plan is in
+  [gpu/README.md](gpu/README.md#next-a-webkit-of-our-own-not-started)). Video in web pages: there are no
   GStreamer H.264 decoders (gstreamer1.0-libav), and decoding would be in software anyway.
 - [ ] **Hard / not planned**: Android apps (Google Play, APKs) in Linux. Rebooting into Android
   is the way.
