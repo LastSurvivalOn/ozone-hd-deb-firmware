@@ -1,0 +1,147 @@
+#!/usr/bin/python3
+"""ozone-panel: shows the panel over a fullscreen window (the player, the TV, a fullscreen page).
+
+polybar keeps itself just above bspwm's monitor window (wm-restack = bspwm), so fullscreen windows
+cover it. This raises it to the top while the pointer is at the top edge of the screen or on the
+panel, or for a few seconds after "ozone-panel peek" (info on the remote, see ozone-remote), and then
+puts it back where polybar keeps it.
+
+  ozone-panel          the daemon (started by bspwmrc); it asks X where the pointer is 10 times a
+                       second, which costs next to nothing
+  ozone-panel peek     show the panel for a few seconds, or hide it if it is showing
+"""
+import ctypes
+import os
+import signal
+import subprocess
+import sys
+import time
+
+NAME = 'ozone-panel'
+TICK = 0.1
+PEEK = 4.0     # s a peek shows the panel
+LINGER = 1.0   # s it stays after the pointer leaves it
+
+CW_SIBLING, CW_STACK_MODE, ABOVE = 1 << 5, 1 << 6, 0
+
+
+class WindowChanges(ctypes.Structure):
+    _fields_ = [('x', ctypes.c_int), ('y', ctypes.c_int), ('width', ctypes.c_int),
+                ('height', ctypes.c_int), ('border_width', ctypes.c_int),
+                ('sibling', ctypes.c_ulong), ('stack_mode', ctypes.c_int)]
+
+
+def daemon_pid():
+    r = subprocess.run(['pgrep', '-o', '-x', NAME], capture_output=True, text=True)
+    pids = [int(p) for p in r.stdout.split() if int(p) != os.getpid()]
+    return pids[0] if pids else None
+
+
+def query(*args):
+    r = subprocess.run(args, capture_output=True, text=True)
+    words = r.stdout.split()
+    return int(words[0], 0) if words else None
+
+
+class Panel:
+    def __init__(self):
+        self.x = ctypes.CDLL('libX11.so.6')
+        self.x.XOpenDisplay.restype = ctypes.c_void_p
+        self.dpy = ctypes.c_void_p(self.x.XOpenDisplay(None))
+        if not self.dpy:
+            sys.exit('%s: no X display' % NAME)
+        self.x.XDefaultRootWindow.restype = ctypes.c_ulong
+        self.root = self.x.XDefaultRootWindow(self.dpy)
+        # Xlib's default handler exits on any error, and polybar's window goes away when it restarts
+        self.on_error = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)(lambda d, e: 0)
+        self.x.XSetErrorHandler(self.on_error)
+        self.shown = False
+        self.until = 0
+        self.peek = False
+        signal.signal(signal.SIGUSR1, self.on_peek)
+
+    def on_peek(self, *_):
+        self.peek = True
+
+    def pointer_y(self):
+        w = ctypes.c_ulong()
+        i = ctypes.c_int()
+        y = ctypes.c_int()
+        m = ctypes.c_uint()
+        self.x.XQueryPointer(self.dpy, ctypes.c_ulong(self.root), ctypes.byref(w), ctypes.byref(w),
+                             ctypes.byref(i), ctypes.byref(y), ctypes.byref(i), ctypes.byref(i),
+                             ctypes.byref(m))
+        return y.value
+
+    def bar(self):
+        """polybar's window and its height (it may have restarted since the last look)"""
+        wid = query('xdotool', 'search', '--class', 'Polybar')
+        if wid is None:
+            return None, 0
+        r = ctypes.c_ulong()
+        i = ctypes.c_int()
+        h = ctypes.c_uint()
+        u = ctypes.c_uint()
+        if not self.x.XGetGeometry(self.dpy, ctypes.c_ulong(wid), ctypes.byref(r), ctypes.byref(i),
+                                   ctypes.byref(i), ctypes.byref(u), ctypes.byref(h),
+                                   ctypes.byref(u), ctypes.byref(u)):
+            return None, 0
+        return wid, h.value
+
+    def show(self, seconds):
+        self.wid, self.height = self.bar()
+        if self.wid is None:
+            return
+        self.x.XRaiseWindow(self.dpy, ctypes.c_ulong(self.wid))
+        self.x.XFlush(self.dpy)
+        self.shown = True
+        self.until = time.monotonic() + seconds
+
+    def hide(self):
+        self.shown = False
+        # back just above bspwm's window for the monitor (instance "root"), where polybar puts it
+        below = query('xdotool', 'search', '--classname', '^root$')
+        if below is None:
+            return
+        ch = WindowChanges(sibling=below, stack_mode=ABOVE)
+        self.x.XConfigureWindow(self.dpy, ctypes.c_ulong(self.wid), CW_SIBLING | CW_STACK_MODE,
+                                ctypes.byref(ch))
+        self.x.XFlush(self.dpy)
+
+    def run(self):
+        while True:
+            time.sleep(TICK)
+            now = time.monotonic()
+            if self.peek:
+                self.peek = False
+                if self.shown:
+                    self.hide()
+                else:
+                    self.show(PEEK)
+                continue
+            y = self.pointer_y()
+            if not self.shown:
+                if y == 0:
+                    self.show(LINGER)
+                continue
+            if y < self.height:
+                self.until = max(self.until, now + LINGER)
+            elif now > self.until:
+                self.hide()
+
+
+def main():
+    if sys.argv[1:] == ['peek']:
+        pid = daemon_pid()
+        if pid:
+            os.kill(pid, signal.SIGUSR1)
+        return
+    if sys.argv[1:]:
+        sys.exit('usage: ozone-panel [peek]')
+    if daemon_pid():
+        sys.exit('%s is already running' % NAME)
+    Panel().run()
+
+
+if __name__ == '__main__':
+    main()

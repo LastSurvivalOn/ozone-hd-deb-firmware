@@ -12,6 +12,7 @@ which kbd-merge merges into X's keyboard like any other. On the way it adds:
            erases, exit hides it; it can be clicked with the mouse too.
   exit     back: closes menus, the on-screen keyboard, the channel list, stops the player and
            closes the TV window (Esc); any other window it closes.
+  info     the panel, over a fullscreen window too (ozone-panel); in mouse mode the right button.
   Power    sleep (ozone-standby) when let go; any button wakes the box (ozone-standby can't see
            the remote, which is held here, so this wakes it). Held for 2 s: power off (the box's
            deep sleep, red LED; Power turns it on again).
@@ -88,7 +89,8 @@ from evdev import InputDevice, ecodes, list_devices  # noqa: E402
 E = ecodes
 MOUSE_KEY = E.KEY_F19      # the "mouse" button, see remote.conf
 OSK_KEY = E.KEY_F14        # "text"
-RIGHT_CLICK_KEY = E.KEY_F13   # "info", in mouse mode
+INFO_KEY = E.KEY_F13       # "info": the panel over a fullscreen window (ozone-panel peek)
+RIGHT_CLICK_KEY = INFO_KEY   # in mouse mode
 POWER_OFF_HOLD = 2000      # ms of Power held down that power off instead of sleep
 
 
@@ -471,6 +473,11 @@ class Remote:
         if code == E.KEY_ESC:
             if press:
                 self.back()
+            return
+        # here, not in sxhkd: the player grabs X's keyboard
+        if code == INFO_KEY:
+            if press:
+                subprocess.Popen(['ozone-panel', 'peek'])
             return
         self.kbd.key(code, value)
         (self.down.add if value else self.down.discard)(code)

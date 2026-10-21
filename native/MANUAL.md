@@ -93,6 +93,11 @@ The panel is the bar along the top of the screen. From left to right:
 | ✕ | closes the active window |
 | ⏻ | power menu |
 
+A window in full screen (the video player, TV, a full-screen page) covers the panel. To see it
+anyway, move the mouse pointer to the very top of the screen: the panel appears over the window
+and stays while the pointer is on it. **info** on the remote shows it for a few seconds (press it
+again to hide it).
+
 **The app menu** opens with **Super+D** or the grid button. Start typing a name ("term", "files"…)
 and the list filters as you type. Use the arrows to choose and Enter to launch. Esc closes it.
 
@@ -323,11 +328,12 @@ The box's own remote can run everything by itself: point it at the box.
 
 | Button | What it does |
 |---|---|
-| **Power** | sleep; any button wakes the box again. Held for 2 seconds: power off (the light turns red; Power turns the box on again) |
+| **Power** | sleep; any button wakes the box again |
 | **↑ ↓ ← →**, **OK** | move and choose, like the arrows and Enter |
 | **exit** | back: closes a menu, the on-screen keyboard or the channel list, stops the player, closes the TV window; any other window (YouTube, the browser) it closes |
 | **home** | the open windows and all the apps (YouTube, TV, the browser, Power, Screen size, WiFi…) |
 | **browse** | the browser |
+| **info** | the panel, over a full-screen window too (in mouse mode: the right mouse button) |
 | red | YouTube |
 | **epg**, **dvb**, **TV/radio** | the TV window |
 | **vol+ / vol−**, **mute** | volume |
