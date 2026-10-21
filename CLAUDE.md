@@ -72,6 +72,9 @@ Several of these were found by bricking or hanging the box. Don't undo them.
     unload. To reload the GPU modules, reboot.
   - The module ABI is checked only by vermagic (no MODVERSIONS). Build with
     `gpu/kernel-3.10.33.config`, the box's own config taken from its boot.img.
+  - The Mali X driver opens fb1 (OSD2) for its hardware cursor. We use a software cursor, so
+    fb1 must stay blanked: unblanked, it shows the 1080p boot logo still in its memory over the
+    whole desktop. The stock driver unblanked it at every DPMS On.
   - `gen-xorg-screen` picks `Driver "mali"` when `/run/ozone-gpu` exists. After an X crash with it
     (`/run/ozone-gpu-failed`) it picks fbdev until a reboot.
   - The Mali X driver keeps the screen in a cached UMP shadow: reading the framebuffer is uncached,

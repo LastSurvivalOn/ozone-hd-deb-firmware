@@ -1082,10 +1082,13 @@ void MaliHWDPMSSet(ScrnInfoPtr pScrn, int mode, int flags)
 	{
 		ERROR_MSG("FBIOBLANK: %s\n", strerror(errno));
 	}
-    if (fbmode == 0)
-        aml_hw_cursor_show(disp);
-    else 
-        aml_hw_cursor_hide(disp);
+    if (MALI_DISP_HWC(pScrn))
+    {
+        if (fbmode == 0)
+            aml_hw_cursor_show(disp);
+        else
+            aml_hw_cursor_hide(disp);
+    }
 
 }
 
@@ -1882,6 +1885,10 @@ static Bool MaliScreenInit(SCREEN_INIT_ARGS_DECL)
 				ERROR_STR("failed to enable hardware cursor\n");
 		    }
 		}
+		/* fb1 (OSD2) is only the cursor's layer: left on without one, it shows what its
+		 * memory holds over the whole screen (the boot logo) */
+		if (!fPtr->aml_hwcursor_private)
+		    aml_hw_cursor_hide(fPtr->aml_disp_private);
 	}
 
 	if (fPtr->use_umplock)
