@@ -10,5 +10,9 @@ CONNECTED)
     ;;
 DISCONNECTED)
     dhclient -x -pf $PF $1 2> /dev/null
+    # dhclient -x can leave the address. With the cable on the same subnet, its route would then
+    # take the replies to what comes in over the cable (netwatch turns WiFi off for the cable).
+    ip route flush dev $1
+    ip -4 addr flush dev $1
     ;;
 esac

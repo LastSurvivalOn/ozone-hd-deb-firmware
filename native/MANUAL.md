@@ -72,8 +72,10 @@ networks appears, strongest first:
 Choose a network and type its password (once: it's remembered), then Enter. The panel shows
 "Connecting to …", then the network name and the box's address. Saved networks connect again by
 themselves after a reboot. The list also has **Rescan**, **Disconnect** and **Forget a network**.
-With both the cable and WiFi connected, the cable is used. When you pull the cable out, the box
-switches to WiFi within a few seconds.
+When the network cable is plugged in and working, WiFi turns itself off after a few seconds. When
+you pull the cable out, WiFi connects again within a few seconds. If you turned WiFi off with
+**Disconnect**, it stays off. To use WiFi with the cable plugged in, choose the network again in
+the list.
 
 
 The panel is the bar along the top of the screen. From left to right:

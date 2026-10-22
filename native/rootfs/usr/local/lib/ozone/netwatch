@@ -1,23 +1,68 @@
 #!/bin/sh
-# Follows the network cable (started by ozone-wifi). Kernel 3.10 keeps using a route whose link is
-# down, so with the cable pulled out, eth0's default route would swallow what should go over WiFi:
-# its address and routes go when the cable does, and DHCP runs again when it comes back. eth0 stays
-# up throughout, since the carrier can't be read on an interface that is down.
+# Follows the network cable (started by ozone-wifi).
+# - Kernel 3.10 keeps using a route whose link is down, so with the cable pulled out, eth0's default
+#   route would swallow what should go over WiFi: its address and routes go when the cable does,
+#   and DHCP runs again when it comes back. eth0 stays up throughout, since the carrier can't be
+#   read on an interface that is down (and so no ifdown: taking the link down reads as the cable
+#   going out, which brought it back up, in a loop).
+# - WiFi steps aside while the cable works: once it has had an address for two checks in a row,
+#   wpa_cli disconnect; when it goes, reconnect. Only a disconnect of netwatch's own is undone, not
+#   one from the WiFi window.
+LOG=/var/log/netwatch.log
+PAUSED=/run/ozone-wifi-paused
+PF=/run/dhclient.eth0.pid
+
 carrier() {
     cat /sys/class/net/eth0/carrier 2> /dev/null || echo 0
 }
 
-last=$(carrier)
-while sleep 3; do
+# the cable is in use: plugged in, with an address from DHCP
+wired() {
+    [ "$(carrier)" = 1 ] && ip -4 addr show dev eth0 | grep -q ' inet ' && echo 1 || echo 0
+}
+
+log() {
+    echo "$(date '+%F %T') $1" >> $LOG
+}
+
+rm -f $PAUSED
+last=$(carrier) wifi_off=0 seen=0
+while true; do
     now=$(carrier)
-    [ "$now" = "$last" ] && continue
-    if [ "$now" = 1 ]; then
-        echo "$(date '+%F %T') cable in" >> /var/log/netwatch.log
-        { ifdown --force eth0; ifup eth0; } > /dev/null 2>&1 &
-    else
-        echo "$(date '+%F %T') cable out" >> /var/log/netwatch.log
-        ip route flush dev eth0
-        ip -4 addr flush dev eth0
+    if [ "$now" != "$last" ]; then
+        if [ "$now" = 1 ]; then
+            log "cable in"
+            # ifupdown's dhclient, started again
+            { dhclient -x -pf $PF eth0; dhclient -4 -nw -pf $PF -lf /var/lib/dhcp/dhclient.eth0.leases eth0; } > /dev/null 2>&1
+        else
+            log "cable out"
+            ip route flush dev eth0
+            ip -4 addr flush dev eth0
+        fi
+        last=$now
     fi
-    last=$now
+    if [ "$(wired)" = 1 ]; then
+        seen=$((seen + 1))
+        if [ $wifi_off = 0 ] && [ $seen -ge 2 ]; then
+            state=$(wpa_cli -i wlan0 status 2> /dev/null | sed -n 's/^wpa_state=//p')
+            if [ "$state" = DISCONNECTED ]; then
+                wifi_off=1   # already off, from the WiFi window: not ours to turn back on
+            elif [ -n "$state" ] && wpa_cli -i wlan0 disconnect > /dev/null; then
+                touch $PAUSED
+                wifi_off=1
+                log "cable works: WiFi off"
+            fi
+        fi
+    else
+        seen=0
+        if [ $wifi_off = 1 ]; then
+            if [ -e $PAUSED ]; then
+                rm -f $PAUSED
+                wpa_cli -i wlan0 reconnect > /dev/null
+                log "no cable: WiFi on"
+            fi
+            wifi_off=0
+        fi
+    fi
+    sleep 3
 done

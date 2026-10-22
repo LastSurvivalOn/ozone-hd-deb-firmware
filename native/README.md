@@ -74,7 +74,11 @@ password the first time, and saved networks connect again by themselves. The chi
 
 `lib/ozone/netwatch` follows the cable. Kernel 3.10 keeps using a route whose link is down, so when
 the cable is pulled out it removes eth0's address and routes, and runs DHCP again when it comes
-back. Logs: `/var/log/wpa_supplicant.log`, `/var/log/netwatch.log`.
+back (dhclient itself: `ifdown` takes the link down, which looks like the cable going out). Once the
+cable has had an address for two checks (6 s), it disconnects WiFi (`wpa_cli disconnect`), and
+reconnects it when the cable goes, unless WiFi was off from the WiFi window already. `wifi-event`
+removes wlan0's address on any disconnect: on the same subnet as the cable, its route took the
+replies to what came in over the cable. Logs: `/var/log/wpa_supplicant.log`, `/var/log/netwatch.log`.
 
 ## Television (DVB-T/T2)
 
