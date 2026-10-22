@@ -1,0 +1,9 @@
+#!/bin/sh
+# ozone-launch COMMAND...: what the remote's program buttons run (sxhkdrc). Only from the empty
+# desktop: with a window open on it the button belongs to that window (sxhkd passes it on too), so
+# YouTube, the browser or TV doesn't open over the program in use. The panel, the home menu and
+# the keyboard's Super shortcuts still open anything.
+if [ -n "$(bspc query -N -n '.window.local.!hidden' 2> /dev/null)" ]; then
+    exit 0
+fi
+exec "$@"

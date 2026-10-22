@@ -2483,8 +2483,8 @@ class TvWindow:
         self.right.add(self.sched)
         body.pack_start(self.right, True, True, 0)
         top.pack_start(body, True, True, 0)
-        hint = self.label('Enter: watch   →: the guide   Menu or F2: the channel\'s menu   Tab: next list   '
-                          'Esc: close', 'hint')
+        hint = self.label('OK: watch   →: the guide   blue (Menu, F2): the channel\'s menu   green (Tab): the next '
+                          'list   exit (Esc): back, close', 'hint')
         hint.set_margin_start(16)
         hint.set_margin_bottom(6)
         top.pack_start(hint, False, False, 0)
@@ -2521,8 +2521,6 @@ class TvWindow:
         if self.filling or not combo.get_active_id():
             return
         self.group = combo.get_active_id()
-        if self.group in groups(self.app.settings, self.app.channels):
-            self.app.set_setting('group', self.group)
         self.reload()
 
     def next_group(self):
@@ -2730,6 +2728,8 @@ class TvWindow:
 
     def activate(self, row):
         if hasattr(row, 'ch'):
+            # the list watched from is the one the window opens with, and exit goes back to
+            self.app.set_setting('group', self.group)
             self.app.watch(self.group, row.index)
         elif hasattr(row, 'rec'):
             self.play_recording(row.rec)
@@ -3410,8 +3410,15 @@ class TvWindow:
             if 1 <= int(self.typed) <= len(self.rows):
                 self.select(int(self.typed) - 1)
             return True
-        if k == 'Escape':
-            self.win.destroy()
+        if k == 'Escape':   # the remote's exit: back, a step at a time
+            if focus and focus.get_parent() is self.sched:
+                row = self.list.get_selected_row()
+                if row:
+                    row.grab_focus()
+            elif self.group in (RECORDED, TIMERS_VIEW):
+                self.groups.set_active_id(self.app.settings.get('group', ALL))
+            else:
+                self.win.destroy()
             return True
         if k in ('Menu', 'F2', 'Launch4'):   # the remote's blue key
             row = self.list.get_selected_row()

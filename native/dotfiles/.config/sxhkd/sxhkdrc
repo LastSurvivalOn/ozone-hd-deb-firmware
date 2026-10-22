@@ -47,18 +47,20 @@ XF86AudioMute
 # keyboards, and X would never see the key go up
 @XF86PowerOff
     sudo -n ozone-standby
-# home: the open windows, then the apps
+# home: the open windows, then the apps (their names alone, not "Apps" before each)
 XF86HomePage
-    rofi -show combi -modi combi -combi-modi window,drun -display-combi "  Home"
-# browse
-XF86WWW
-    ozone-web-show
+    rofi -show combi -modi combi -combi-modi window,drun -display-combi "  Home" -combi-display-format "{text}"
 # usb: the drives and network folders
 XF86Launch7
     ozone-media menu
+# The buttons of programs open them only from the empty desktop: with a window open they are that
+# program's (~ passes them on to it: the TV window's, YouTube's), and open nothing over it.
+# browse
+~XF86WWW
+    ozone-launch ozone-web-show
 # red
-XF86Launch1
-    yt
+~XF86Launch1
+    ozone-launch yt
 # epg, dvb, TV/radio
-XF86Launch{6,8,9}
-    ozone-tv
+~XF86Launch{6,8,9}
+    ozone-launch ozone-tv

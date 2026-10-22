@@ -280,7 +280,7 @@ all, to fill in the rest. Some channels broadcast no guide at all ("no programme
 | **←** | back to the channels |
 | **Menu** or **F2** (remote: **blue**), a right click | the channel's menu, see below |
 | **Tab** (remote: **green**) | the next list |
-| **Esc** | close the window |
+| **Esc** (remote: **exit**) | back: from the guide to the channels, from Recordings or Timers to the channels; then close the window |
 
 **The channel's menu**: **Channel info and PIDs** (the frequency, the service, the streams, and the
 PIDs, which you can change by hand for a channel that plays wrongly), **Lists** (add it to a list
@@ -476,6 +476,10 @@ The box's own remote can run everything by itself: point it at the box.
 | **<<** | back 10 s in the player (TV too, see section 6) |
 | **delete** | deletes a character when typing |
 | **mouse** | mouse mode, see below |
+
+**browse**, **red**, **epg**, **dvb** and **TV/radio** open their programs only from the empty desktop:
+with a program open they are that program's buttons, and nothing opens over it. Close it with
+**exit** first, or use **home**, which always works.
 | **text** | the on-screen keyboard, see below; while watching TV, teletext |
 | **record** | while watching TV, record what's on |
 
