@@ -9,10 +9,11 @@ which kbd-merge merges into X's keyboard like any other. On the way it adds:
            info is the right button, page+/page- scroll. mouse again ends it. (The decoder's own
            mouse mode, which moves a few pixels per press, is switched off in remote.conf.)
   text     the on-screen keyboard, for typing: the arrows move over it, OK types the key, delete
-           erases, exit hides it; it can be clicked with the mouse too.
+           erases, exit hides it; it can be clicked with the mouse too. In the TV player: teletext.
   exit     back: closes menus, the on-screen keyboard, the channel list, stops the player and
            closes the TV window (Esc); any other window it closes.
   info     the panel, over a fullscreen window too (ozone-panel); in mouse mode the right button.
+           In the TV player: the channel's info and the signal.
   Power    sleep (ozone-standby) when let go; any button wakes the box (ozone-standby can't see
            the remote, which is held here, so this wakes it). Held for 2 s: power off (the box's
            deep sleep, red LED; Power turns it on again).
@@ -459,7 +460,7 @@ class Remote:
             if press:
                 self.set_mouse(not self.mouse_mode)
             return
-        if code == OSK_KEY:
+        if code == OSK_KEY and not self.tv_player():
             if press:
                 self.osk.toggle()
             return
@@ -475,7 +476,7 @@ class Remote:
                 self.back()
             return
         # here, not in sxhkd: the player grabs X's keyboard
-        if code == INFO_KEY:
+        if code == INFO_KEY and not self.tv_player():
             if press:
                 subprocess.Popen(['ozone-panel', 'peek'])
             return
@@ -562,6 +563,11 @@ class Remote:
     @staticmethod
     def running(name):
         return subprocess.call(['pgrep', '-x', name], stdout=subprocess.DEVNULL) == 0
+
+    @staticmethod
+    def tv_player():
+        """amplay --tv is up: info and text are its keys (channel info, teletext)"""
+        return subprocess.call(['pgrep', '-f', '^amplay .*--t[v]'], stdout=subprocess.DEVNULL) == 0
 
 
 def main():
