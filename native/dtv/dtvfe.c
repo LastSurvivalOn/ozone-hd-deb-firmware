@@ -11,12 +11,15 @@
  * Protocol, one command per line on stdin, one reply line on stdout:
  *   tune <kHz> [<bandwidth MHz> [<plp>]]   -> "tune <locked 0/1> <strength %> <quality %>"
  *   status                                 -> "status <locked> <strength> <quality>"
+ *   antenna <0|1>                          -> "antenna <0|1>": the 5 V for an active antenna
  *   quit
  * On start it prints "ready <frontend type>" or "error <reason>" and exits.
  *
  * Interface of libth_dtv_external_c.so, from its disassembly and the TV app's middleware:
  *   External_Init(); PI_System_Start(); PI_Tuner_Init(&type, &cfg[36]);
- *   PI_Tuner_DVB_T_StartLock(tuner, &params) and PI_Tuner_DVB_T_CheckSignalStatus(tuner, &status).
+ *   PI_Tuner_DVB_T_StartLock(tuner, &params) and PI_Tuner_DVB_T_CheckSignalStatus(tuner, &status);
+ *   PI_Tuner_DVB_T_SetAntennaPower(tuner, mode): mode 5 ("5V") sets the power GPIO, anything else
+ *   clears it.
  */
 #include <dlfcn.h>
 #include <stdint.h>
@@ -48,6 +51,7 @@ static int (*PI_System_Start)(void);
 static int (*PI_Tuner_Init)(uint32_t *type, uint8_t *cfg);
 static int (*PI_Tuner_DVB_T_StartLock)(int tuner, struct tune_params *p);
 static int (*PI_Tuner_DVB_T_CheckSignalStatus)(int tuner, struct signal_status *s);
+static int (*PI_Tuner_DVB_T_SetAntennaPower)(int tuner, int mode);
 
 static void *sym(void *lib, const char *name)
 {
@@ -87,6 +91,7 @@ int main(void)
     PI_Tuner_Init = sym(ext, "PI_Tuner_Init");
     PI_Tuner_DVB_T_StartLock = sym(ext, "PI_Tuner_DVB_T_StartLock");
     PI_Tuner_DVB_T_CheckSignalStatus = sym(ext, "PI_Tuner_DVB_T_CheckSignalStatus");
+    PI_Tuner_DVB_T_SetAntennaPower = sym(ext, "PI_Tuner_DVB_T_SetAntennaPower");
 
     External_Init();
     PI_System_Start();
@@ -97,11 +102,14 @@ int main(void)
     printf("ready %u\n", type);
 
     while (fgets(line, sizeof line, stdin)) {
-        unsigned khz = 0, bw = 8, plp = 0;
+        unsigned khz = 0, bw = 8, plp = 0, on = 0;
         if (sscanf(line, "tune %u %u %u", &khz, &bw, &plp) >= 1) {
             struct tune_params p = { khz, (uint8_t)bw, 0, 0, (uint8_t)plp, plp_info };
             PI_Tuner_DVB_T_StartLock(0, &p);
             status("tune");
+        } else if (sscanf(line, "antenna %u", &on) == 1) {
+            PI_Tuner_DVB_T_SetAntennaPower(0, on ? 5 : 0);
+            printf("antenna %u\n", on ? 1 : 0);
         } else if (!strncmp(line, "status", 6)) {
             status("status");
         } else if (!strncmp(line, "quit", 4)) {
