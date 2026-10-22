@@ -107,10 +107,9 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
   one's own (`install-gpu.sh`, `install-games.sh`, [gpu/README.md](gpu/README.md)).
 - [x] **Hard**: the browser on the GPU (`OZONE_WEB_GPU=1`): WebKit composites on the Mali-450
   through shims under it (native/gpu/egl-fix), CSS animations 8 times faster.
-- [ ] **Hard**: the browser's frames straight to the screen. Each still crosses to X whole through
-  shared memory, ~25 a second at most, so scrolling gains nothing yet. It needs a WebKit of our
-  own: frames kept as X pixmaps that X shows directly (the plan is in
-  [gpu/README.md](gpu/README.md#next-a-webkit-of-our-own-not-started)). Video in web pages: there are no
+- [ ] **Hard**: the browser's frames straight to the screen. In progress: a WebKit of our own
+  hands frames to X as pixmaps (`install-webkit.sh`): CSS animations 34.6 frames a second instead
+  of 29; X still composites every whole frame ([gpu/README.md](gpu/README.md#a-webkit-of-our-own-in-progress)). Video in web pages: there are no
   GStreamer H.264 decoders (gstreamer1.0-libav), and decoding would be in software anyway.
 - [ ] **Hard / not planned**: Android apps (Google Play, APKs) in Linux. Rebooting into Android
   is the way.

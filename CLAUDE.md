@@ -90,6 +90,11 @@ Several of these were found by bricking or hanging the box. Don't undo them.
     X pixmap (cached UMP) and fetch with XShmGetImage: ~3 ms.
   - RetroArch must use `audio_driver = "sdl2"` (`/etc/ozone/retroarch.cfg`), not alsa, for the
     same HDMI hang as mpv.
+  - Our own WebKit (`native/webkit`, `install-webkit.sh`): Debian's source cross-built in docker
+    on the laptop, installed in `/usr/local/lib/ozone-webkit` (its helper processes are found by
+    the built-in prefix), used only by `OZONE_WEB_GPU=1 ozone-web`, with frames as X pixmaps
+    (`WEBKIT_X11_PIXMAP_RENDERER`). Rebuild it after each webkit2gtk security update. The build
+    container is capped at all but 4 GB of the laptop's RAM: 8 jobs on WebCore once froze it.
   - WebKit on the GPU (`OZONE_WEB_GPU=1 ozone-web`) runs through the same shims: surfaceless
     display and context, RGBA8 renderbuffers on X pixmaps, readback from UMP. In a process that
     also loaded glvnd's `libGL.so.1` (WebKit), a plain call from the shim binds to glvnd's stubs:

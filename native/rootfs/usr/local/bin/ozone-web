@@ -14,7 +14,8 @@ What was measured on the box, and what follows from it:
   Wikipedia 9.7 instead of 6.5. But every frame then crosses to X whole, through shared memory
   (~25 a second at most on this memory bus), where the CPU path redraws only the strip a scroll
   exposes: with this browser's settings wheel scrolling gains nothing (4.5 against 5.2), and it
-  takes ~45 MB more memory. So off by default.
+  takes ~45 MB more memory. So off by default. With our own WebKit installed
+  (install-webkit.sh) the frames go to X as pixmaps instead: CSS animations 34.6 against 29.
 - Real wheel scrolling on heavy sites (Wikipedia, BBC) runs at 1-3 fps, and the cause is the
   sites' JavaScript reacting to every scroll, not painting: with JS off the same pages scroll at
   12-20 fps. Hence the per-site fast mode (JS off), on by default for sites that work without
@@ -79,9 +80,20 @@ if __name__ == '__main__' and sys.argv[1:2] not in (['--update-filters'], ['--ba
         sys.exit(0)
 
 GPU = os.path.exists('/run/ozone-gpu-desktop') and os.environ.get('OZONE_WEB_GPU') == '1'
-if GPU and '/usr/local/lib/mali' not in os.environ.get('LD_LIBRARY_PATH', '').split(':'):
-    # the Mali libraries go in before the dynamic linker loads EGL, so: start again through ozone-gl
-    os.execvp('ozone-gl', ['ozone-gl', sys.executable] + sys.argv)
+# our WebKit (install-webkit.sh), which hands frames to X as pixmaps; OZONE_WEB_OWN_WEBKIT=0: Debian's
+OWN_WEBKIT = '/usr/local/lib/ozone-webkit/lib'
+OWN = (GPU and os.environ.get('OZONE_WEB_OWN_WEBKIT', '1') == '1'
+       and os.path.exists(OWN_WEBKIT + '/libwebkit2gtk-4.1.so.0'))
+if GPU:
+    paths = [p for p in os.environ.get('LD_LIBRARY_PATH', '').split(':') if p]
+    if '/usr/local/lib/mali' not in paths or (OWN and OWN_WEBKIT not in paths):
+        # the libraries go in before the dynamic linker loads EGL and WebKit, so: start again
+        # through ozone-gl (which puts the Mali ones first)
+        if OWN and OWN_WEBKIT not in paths:
+            os.environ['LD_LIBRARY_PATH'] = ':'.join([OWN_WEBKIT] + paths)
+        os.execvp('ozone-gl', ['ozone-gl', sys.executable] + sys.argv)
+if OWN:
+    os.environ.setdefault('WEBKIT_X11_PIXMAP_RENDERER', '1')
 os.environ.setdefault('WEBKIT_DISABLE_DMABUF_RENDERER', '0' if GPU else '1')
 os.environ.setdefault('WEBKIT_DISABLE_COMPOSITING_MODE', '0' if GPU else '1')
 

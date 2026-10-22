@@ -246,7 +246,28 @@ The X driver now does less for every client:
 
 Under WebKit this took X from 35000 page faults and ~1150 UMP cache ioctls a second down to none.
 
-## Next: a WebKit of our own (not started)
+## A WebKit of our own (in progress)
+
+Built and running (2026-10-22): `webkit/build.sh` cross-builds Debian's 2.50.6-1~deb12u2 with
+`webkit/patches/0001-x11-pixmap-renderer.patch`, `install-webkit.sh` puts it in
+`/usr/local/lib/ozone-webkit`, and `OZONE_WEB_GPU=1 ozone-web` uses it with frames as X pixmaps.
+The build runs in docker (Debian 12, clang-16 for armhf), capped at all but 4 GB of the laptop's
+memory: 8 compile jobs on WebCore once took all 15 GB and froze the desktop.
+
+`wkfps.py 14 ALWAYS css` (the compositor alone), screen updates a second:
+
+| WebKit | screen | X | UI process | web process |
+|---|---|---|---|---|
+| Debian's, shared memory | 28.8 | 99 % | 24 % | 61 % |
+| ours, shared memory | 29.2 | 100 % | 22 % | 60 % |
+| ours, X pixmaps | 34.6 | 81 % | 9 % | 49 % |
+
+The page itself runs at 61.7 frames a second. Wheel scrolling Wikipedia in ozone-web stays at ~5
+(4.7 with pixmaps, 5.0 without): there the web process's main thread (the page's scroll handling)
+is the limit, not the frames. X is still the busiest: it composites the whole 32-bit frame onto
+GTK's 16-bit double buffer (OVER, so it reads that too) and copies that to the window.
+
+The plan it followed, written before the build:
 
 Scrolling on the GPU needs WebKit to hand its frames to X as pixmaps, not through shared memory.
 The shims can't do that, because the copy into shared memory and the cairo upload happen inside

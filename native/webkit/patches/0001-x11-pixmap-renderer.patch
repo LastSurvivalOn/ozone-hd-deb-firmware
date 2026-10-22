@@ -1,0 +1,386 @@
+X pixmaps as the web process's render target (GTK 3 on X11, opt-in)
+
+Without DMA-BUF, the web process renders each frame into a renderbuffer, reads it back with
+glReadPixels into shared memory, and the UI process uploads that to X through cairo: ~24 MB of
+memory traffic a frame on the OzoneHD box (Mali-450, 32-bit DDR3), ~25 frames a second at most.
+
+With WEBKIT_X11_PIXMAP_RENDERER=1 the swap chain's buffers are X pixmaps instead: the GPU renders
+into a texture on each one's EGLImage (top down, so no mirroring), the UI process gets the XID
+and composites the pixmap with XRender, inside X. No CPU copy of the frame in either process.
+diff -ruN a/Source/WebKit/UIProcess/glib/AcceleratedBackingStore.messages.in b/Source/WebKit/UIProcess/glib/AcceleratedBackingStore.messages.in
+--- a/Source/WebKit/UIProcess/glib/AcceleratedBackingStore.messages.in	2026-10-22 15:48:08.538020527 +0300
++++ b/Source/WebKit/UIProcess/glib/AcceleratedBackingStore.messages.in	2026-10-22 15:51:09.722459933 +0300
+@@ -24,6 +24,9 @@
+ messages -> AcceleratedBackingStore {
+     DidCreateDMABufBuffer(uint64_t id, WebCore::IntSize size, uint32_t format, Vector<UnixFileDescriptor> fds, Vector<uint32_t> offsets, Vector<uint32_t> strides, uint64_t modifier, WebKit::RendererBufferFormat::Usage usage)
+     DidCreateSHMBuffer(uint64_t id, WebCore::ShareableBitmapHandle handle)
++#if PLATFORM(GTK) && PLATFORM(X11) && !USE(GTK4)
++    DidCreateX11PixmapBuffer(uint64_t id, WebCore::IntSize size, uint64_t pixmap)
++#endif
+     DidDestroyBuffer(uint64_t id)
+     Frame(uint64_t id, Vector<WebCore::IntRect, 1> damage, UnixFileDescriptor syncFD)
+ }
+diff -ruN a/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.cpp b/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.cpp
+--- a/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.cpp	2026-10-22 15:48:08.557440068 +0300
++++ b/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.cpp	2026-10-22 15:51:09.722838373 +0300
+@@ -68,6 +68,11 @@
+ #include <gdk/x11/gdkx.h>
+ #endif
+ 
++#if PLATFORM(X11) && !USE(GTK4)
++#include <cairo-xlib.h>
++#include <gdk/gdkx.h>
++#endif
++
+ #if USE(SKIA)
+ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
+ IGNORE_CLANG_WARNINGS_BEGIN("cast-align")
+@@ -326,9 +331,11 @@
+ 
+     if (auto* surface = this->surface()) {
+         cairo_save(cr);
+-        cairo_matrix_t transform;
+-        cairo_matrix_init(&transform, 1, 0, 0, -1, 0, static_cast<float>(m_size.height() / m_webPage->deviceScaleFactor()));
+-        cairo_transform(cr, &transform);
++        if (!surfaceIsTopDown()) {
++            cairo_matrix_t transform;
++            cairo_matrix_init(&transform, 1, 0, 0, -1, 0, static_cast<float>(m_size.height() / m_webPage->deviceScaleFactor()));
++            cairo_transform(cr, &transform);
++        }
+         cairo_rectangle(cr, clipRect.x(), clipRect.y(), clipRect.width(), clipRect.height());
+         cairo_set_source_surface(cr, surface, 0, 0);
+         cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+@@ -708,6 +715,69 @@
+     didRelease();
+ }
+ 
++#if PLATFORM(X11) && !USE(GTK4)
++RefPtr<AcceleratedBackingStore::Buffer> AcceleratedBackingStore::BufferX11Pixmap::create(WebPageProxy& webPage, uint64_t id, uint64_t surfaceID, const IntSize& size, uint64_t pixmap)
++{
++    auto* display = gdk_display_get_default();
++    if (!GDK_IS_X11_DISPLAY(display))
++        return nullptr;
++    auto* visual = gdk_screen_get_rgba_visual(gdk_display_get_default_screen(display));
++    if (!visual)
++        return nullptr;
++
++    RefPtr<cairo_surface_t> surface = adoptRef(cairo_xlib_surface_create(GDK_DISPLAY_XDISPLAY(display), pixmap, GDK_VISUAL_XVISUAL(visual), size.width(), size.height()));
++    if (cairo_surface_status(surface.get()) != CAIRO_STATUS_SUCCESS)
++        return nullptr;
++    cairo_surface_set_device_scale(surface.get(), webPage.deviceScaleFactor(), webPage.deviceScaleFactor());
++
++    // Using the pixmap once makes cairo create its Picture, which keeps the pixmap alive in X
++    // after the web process frees its XID (when it drops the buffer)
++    gdk_x11_display_error_trap_push(display);
++    RefPtr<cairo_surface_t> probe = adoptRef(cairo_surface_create_similar(surface.get(), CAIRO_CONTENT_COLOR_ALPHA, 1, 1));
++    RefPtr<cairo_t> cr = adoptRef(cairo_create(probe.get()));
++    cairo_set_source_surface(cr.get(), surface.get(), 0, 0);
++    cairo_paint(cr.get());
++    cairo_surface_flush(probe.get());
++    bool failed = gdk_x11_display_error_trap_pop(display);
++    if (failed)
++        return nullptr;
++
++    return adoptRef(*new BufferX11Pixmap(webPage, id, surfaceID, size, WTFMove(surface)));
++}
++
++AcceleratedBackingStore::BufferX11Pixmap::BufferX11Pixmap(WebPageProxy& webPage, uint64_t id, uint64_t surfaceID, const IntSize& size, RefPtr<cairo_surface_t>&& surface)
++    : Buffer(webPage, id, surfaceID, size, RendererBufferFormat::Usage::Rendering)
++    , m_surface(WTFMove(surface))
++{
++}
++
++RendererBufferDescription AcceleratedBackingStore::BufferX11Pixmap::description() const
++{
++#if USE(LIBDRM)
++    return { RendererBufferDescription::Type::SharedMemory, m_usage, DRM_FORMAT_ARGB8888, 0 };
++#else
++    return { };
++#endif
++}
++
++void AcceleratedBackingStore::BufferX11Pixmap::release()
++{
++    // the web process renders the next frame into it: X must be done reading it
++    XSync(cairo_xlib_surface_get_display(m_surface.get()), False);
++    didRelease();
++}
++
++void AcceleratedBackingStore::didCreateX11PixmapBuffer(uint64_t id, const IntSize& size, uint64_t pixmap)
++{
++    RefPtr webPage = m_webPage.get();
++    if (!webPage)
++        return;
++
++    if (auto buffer = BufferX11Pixmap::create(*webPage, id, m_surfaceID, size, pixmap))
++        m_buffers.add(id, WTFMove(buffer));
++}
++#endif
++
+ void AcceleratedBackingStore::didCreateDMABufBuffer(uint64_t id, const IntSize& size, uint32_t format, Vector<WTF::UnixFileDescriptor>&& fds, Vector<uint32_t>&& offsets, Vector<uint32_t>&& strides, uint64_t modifier, RendererBufferFormat::Usage usage)
+ {
+     RefPtr webPage = m_webPage.get();
+diff -ruN a/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.h b/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.h
+--- a/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.h	2026-10-22 15:48:08.546097191 +0300
++++ b/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.h	2026-10-22 15:51:09.722623158 +0300
+@@ -93,6 +93,9 @@
+ 
+     void didCreateDMABufBuffer(uint64_t id, const WebCore::IntSize&, uint32_t format, Vector<WTF::UnixFileDescriptor>&&, Vector<uint32_t>&& offsets, Vector<uint32_t>&& strides, uint64_t modifier, RendererBufferFormat::Usage);
+     void didCreateSHMBuffer(uint64_t id, WebCore::ShareableBitmapHandle&&);
++#if PLATFORM(X11) && !USE(GTK4)
++    void didCreateX11PixmapBuffer(uint64_t id, const WebCore::IntSize&, uint64_t pixmap);
++#endif
+     void didDestroyBuffer(uint64_t id);
+     void frame(uint64_t id, Rects&&, WTF::UnixFileDescriptor&&);
+     void frameDone();
+@@ -112,7 +115,10 @@
+ #if USE(GBM)
+             Gbm,
+ #endif
+-            SharedMemory
++            SharedMemory,
++#if PLATFORM(X11) && !USE(GTK4)
++            X11Pixmap
++#endif
+         };
+ 
+         virtual Type type() const = 0;
+@@ -123,6 +129,8 @@
+         virtual unsigned textureID() const { return 0; }
+ #endif
+         virtual cairo_surface_t* surface() const { return nullptr; }
++        // GL rows come bottom up, so surfaces are shown mirrored, unless they are top down already
++        virtual bool surfaceIsTopDown() const { return false; }
+ 
+         virtual RendererBufferDescription description() const = 0;
+         virtual RefPtr<WebCore::NativeImage> asNativeImageForTesting() const = 0;
+@@ -197,6 +205,27 @@
+         RefPtr<cairo_surface_t> m_surface;
+     };
+ 
++#if PLATFORM(X11) && !USE(GTK4)
++    // The web process's frames in X pixmaps (rendered top down), composited by X itself
++    class BufferX11Pixmap final : public Buffer {
++    public:
++        static RefPtr<Buffer> create(WebPageProxy&, uint64_t id, uint64_t surfaceID, const WebCore::IntSize&, uint64_t pixmap);
++
++    private:
++        BufferX11Pixmap(WebPageProxy&, uint64_t id, uint64_t surfaceID, const WebCore::IntSize&, RefPtr<cairo_surface_t>&&);
++
++        Buffer::Type type() const override { return Buffer::Type::X11Pixmap; }
++        void didUpdateContents(Buffer*, const Rects&) override { }
++        cairo_surface_t* surface() const override { return m_surface.get(); }
++        bool surfaceIsTopDown() const override { return true; }
++        RendererBufferDescription description() const override;
++        RefPtr<WebCore::NativeImage> asNativeImageForTesting() const override { return nullptr; }
++        void release() override;
++
++        RefPtr<cairo_surface_t> m_surface;
++    };
++#endif
++
+ #if GTK_CHECK_VERSION(4, 13, 4)
+     class BufferDMABuf final : public Buffer {
+     public:
+diff -ruN a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp	2026-10-22 15:48:08.581363260 +0300
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp	2026-10-22 15:49:40.829957573 +0300
+@@ -52,6 +52,20 @@
+ #include <GLES2/gl2.h>
+ #endif
+ 
++#if PLATFORM(GTK) && PLATFORM(X11) && !USE(GTK4)
++// The few Xlib calls the X pixmap renderer makes. Not <X11/Xlib.h>: in a unified source its macros
++// (None, Status, Bool, Always...) would break the files that follow.
++extern "C" {
++struct _XDisplay;
++_XDisplay* XOpenDisplay(const char*);
++unsigned long XDefaultRootWindow(_XDisplay*);
++unsigned long XCreatePixmap(_XDisplay*, unsigned long drawable, unsigned width, unsigned height, unsigned depth);
++int XFreePixmap(_XDisplay*, unsigned long);
++int XSync(_XDisplay*, int discard);
++int XFlush(_XDisplay*);
++}
++#endif
++
+ #if USE(GBM)
+ #include <WebCore/DRMDeviceManager.h>
+ #include <WebCore/GBMVersioning.h>
+@@ -368,6 +382,76 @@
+     RenderTargetShareableBuffer::didRenderFrame(WTFMove(damageRects));
+ }
+ 
++#if PLATFORM(GTK) && PLATFORM(X11) && !USE(GTK4)
++// The pixmaps are made on a connection of our own: the EGL display is surfaceless, and the
++// driver finds a pixmap by its XID on its own connection
++static _XDisplay* x11PixmapDisplay()
++{
++    static _XDisplay* display = XOpenDisplay(nullptr);
++    return display;
++}
++
++static bool x11PixmapRendererEnabled()
++{
++    static bool enabled = [] {
++        const char* value = getenv("WEBKIT_X11_PIXMAP_RENDERER");
++        return value && strcmp(value, "0") && x11PixmapDisplay();
++    }();
++    return enabled;
++}
++
++std::unique_ptr<AcceleratedSurface::RenderTarget> AcceleratedSurface::RenderTargetX11Pixmap::create(uint64_t surfaceID, const IntSize& size)
++{
++    auto* display = x11PixmapDisplay();
++    // depth 32: RGBA, which X composites with alpha
++    unsigned long pixmap = XCreatePixmap(display, XDefaultRootWindow(display), size.width(), size.height(), 32);
++    XSync(display, 0);
++    Vector<EGLAttrib> attributes = { EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE };
++    auto image = PlatformDisplay::sharedDisplay().createEGLImage(EGL_NO_CONTEXT, EGL_NATIVE_PIXMAP_KHR, reinterpret_cast<EGLClientBuffer>(pixmap), attributes);
++    if (!image) {
++        WTFLogAlways("Failed to create an EGL image for an X pixmap of size %dx%d", size.width(), size.height());
++        XFreePixmap(display, pixmap);
++        XFlush(display);
++        return nullptr;
++    }
++    return makeUnique<RenderTargetX11Pixmap>(surfaceID, size, pixmap, image);
++}
++
++AcceleratedSurface::RenderTargetX11Pixmap::RenderTargetX11Pixmap(uint64_t surfaceID, const IntSize& size, unsigned long pixmap, EGLImage image)
++    : RenderTargetShareableBuffer(surfaceID, size)
++    , m_pixmap(pixmap)
++    , m_image(image)
++{
++    // a texture, not a renderbuffer: the Mali-450 left renderbuffers on an EGLImage 0x0
++    glGenTextures(1, &m_texture);
++    glBindTexture(GL_TEXTURE_2D, m_texture);
++    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, m_image);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_texture, 0);
++
++    WebProcess::singleton().parentProcessConnection()->send(Messages::AcceleratedBackingStore::DidCreateX11PixmapBuffer(m_id, size, m_pixmap), surfaceID);
++}
++
++AcceleratedSurface::RenderTargetX11Pixmap::~RenderTargetX11Pixmap()
++{
++    if (m_texture)
++        glDeleteTextures(1, &m_texture);
++    if (m_image)
++        PlatformDisplay::sharedDisplay().destroyEGLImage(m_image);
++    // the UI process holds its own reference (a Picture) while it shows it
++    XFreePixmap(x11PixmapDisplay(), m_pixmap);
++    XFlush(x11PixmapDisplay());
++}
++
++void AcceleratedSurface::RenderTargetX11Pixmap::didRenderFrame(Vector<IntRect, 1>&& damageRects)
++{
++    // all of the frame in the pixmap before X reads it
++    glFinish();
++    RenderTargetShareableBuffer::didRenderFrame(WTFMove(damageRects));
++}
++#endif
++
+ std::unique_ptr<AcceleratedSurface::RenderTarget> AcceleratedSurface::RenderTargetTexture::create(uint64_t surfaceID, const IntSize& size)
+ {
+     unsigned texture;
+@@ -511,6 +595,10 @@
+     case PlatformDisplay::Type::Surfaceless:
+         if (display.eglExtensions().MESA_image_dma_buf_export && WebProcess::singleton().rendererBufferTransportMode().contains(RendererBufferTransportMode::Hardware))
+             m_type = Type::Texture;
++#if PLATFORM(GTK) && PLATFORM(X11) && !USE(GTK4)
++        else if (x11PixmapRendererEnabled())
++            m_type = Type::X11Pixmap;
++#endif
+         else
+             m_type = Type::SharedMemory;
+         break;
+@@ -633,6 +721,10 @@
+     case Type::SharedMemory:
+         return RenderTargetSHMImage::create(m_surfaceID, m_size);
+ #endif
++#if PLATFORM(GTK) && PLATFORM(X11) && !USE(GTK4)
++    case Type::X11Pixmap:
++        return RenderTargetX11Pixmap::create(m_surfaceID, m_size);
++#endif
+ #if USE(WPE_RENDERER)
+     case Type::WPEBackend:
+         ASSERT_NOT_REACHED();
+@@ -831,6 +923,15 @@
+     return 0;
+ }
+ 
++bool AcceleratedSurface::rendersTopDown() const
++{
++#if PLATFORM(GTK) && PLATFORM(X11) && !USE(GTK4)
++    return m_swapChain.type() == SwapChain::Type::X11Pixmap;
++#else
++    return false;
++#endif
++}
++
+ void AcceleratedSurface::willRenderFrame(const IntSize& size)
+ {
+     bool sizeDidChange = m_swapChain.resize(size);
+diff -ruN a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h	2026-10-22 15:48:08.569547435 +0300
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.h	2026-10-22 15:49:17.604563703 +0300
+@@ -93,6 +93,9 @@
+         return true;
+ #endif
+     }
++    // Without a native window the frames are mirrored back in the UI process, except X pixmaps,
++    // which X shows as they are (rows top down)
++    bool rendersTopDown() const;
+ 
+     void willDestroyGLContext();
+     void willRenderFrame(const WebCore::IntSize&);
+@@ -240,6 +243,27 @@
+         const Ref<WebCore::ShareableBitmap> m_bitmap;
+     };
+ 
++#if PLATFORM(GTK) && PLATFORM(X11) && !USE(GTK4)
++    // An X pixmap as the color buffer (a texture on its EGLImage): the UI process gets its XID
++    // and has X composite it into the view, so no frame is read back and copied by the CPU.
++    // Opt-in with WEBKIT_X11_PIXMAP_RENDERER=1, for an EGL without DMA-BUF that can render to
++    // pixmaps (the Mali-450's on the OzoneHD box).
++    class RenderTargetX11Pixmap final : public RenderTargetShareableBuffer {
++    public:
++        static std::unique_ptr<RenderTarget> create(uint64_t, const WebCore::IntSize&);
++        RenderTargetX11Pixmap(uint64_t, const WebCore::IntSize&, unsigned long pixmap, EGLImage);
++        ~RenderTargetX11Pixmap();
++
++    private:
++        bool supportsExplicitSync() const override { return false; }
++        void didRenderFrame(Vector<WebCore::IntRect, 1>&&) override;
++
++        unsigned long m_pixmap { 0 };
++        EGLImage m_image { nullptr };
++        unsigned m_texture { 0 };
++    };
++#endif
++
+     class RenderTargetTexture final : public RenderTargetShareableBuffer {
+     public:
+         static std::unique_ptr<RenderTarget> create(uint64_t, const WebCore::IntSize&);
+@@ -286,6 +310,9 @@
+             SharedMemory,
+             Texture,
+ #endif
++#if PLATFORM(GTK) && PLATFORM(X11) && !USE(GTK4)
++            X11Pixmap,
++#endif
+ #if USE(WPE_RENDERER)
+             WPEBackend
+ #endif
+diff -ruN a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp
+--- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp	2026-10-22 15:48:08.590995494 +0300
++++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/ThreadedCompositor.cpp	2026-10-22 15:49:17.604970727 +0300
+@@ -131,7 +131,7 @@
+         auto nativeSurfaceHandle = (GLNativeWindowType)m_surface->window();
+         m_context = GLContext::create(PlatformDisplay::sharedDisplay(), nativeSurfaceHandle);
+         if (m_context && m_context->makeContextCurrent()) {
+-            if (!nativeSurfaceHandle)
++            if (!nativeSurfaceHandle && !m_surface->rendersTopDown())
+                 m_flipY = !m_flipY;
+         }
+     });
