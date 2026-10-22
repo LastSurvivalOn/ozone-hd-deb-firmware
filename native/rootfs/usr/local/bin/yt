@@ -11,8 +11,14 @@ hardware decoder (amplay, H.264 up to 1080p), or mpv in software if that fails.
   yt URL          play right away (what ozone-web hands over): YouTube, a media file, or any of
                   yt-dlp's sites, with the browser's sign-in (its cookies) outside YouTube
 
-Window keys: type to search, arrows to move, Enter to play, Esc to close. Results load further
-when scrolled to the end. After a video the window comes back where it was. The quality and frame
+It opens on Recommended (YouTube's related videos of the last ones watched, without what was
+watched; before any, the results of the last searches), next to History and Playlists, all kept on
+the box (~/.local/share/ozone/yt): no account. A pasted link to a YouTube playlist shows it, to be
+saved as one of ours.
+
+Window keys: type to search (the past searches drop down), arrows to move, Enter to play, Esc
+back or to close; the remote's yellow next tab, green (Insert) add to a playlist, blue (Delete)
+remove. Results load further when scrolled to the end. After a video the window comes back where it was. The quality and frame
 rate picked next to the search (kept in ~/.config/ozone/yt.json) are the most a video plays at:
 lower them when the connection can't keep up.
 """
@@ -61,6 +67,60 @@ def save_settings(s):
     os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
     with open(SETTINGS, 'w') as f:
         json.dump(s, f)
+
+
+# History, searches and playlists, all on the box: no Google account
+DATA = os.path.join(os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share'), 'ozone', 'yt')
+HISTORY = os.path.join(DATA, 'history.json')       # videos watched, newest first
+SEARCHES = os.path.join(DATA, 'searches.json')     # queries, newest first
+PLAYLISTS = os.path.join(DATA, 'playlists.json')   # {name: [video, ...]}, in the order made
+WATCH_LATER = 'Watch later'
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, value):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + '.tmp', 'w') as f:
+        json.dump(value, f)
+    os.replace(path + '.tmp', path)
+
+
+def remember(path, item, key, keep):
+    """Puts item first in the list at path, without its older copy"""
+    items = [x for x in load_json(path, []) if key(x) != key(item)]
+    save_json(path, [item] + items[:keep - 1])
+
+
+def remember_video(entry):
+    remember(HISTORY, dict(entry, live=False, watched=int(time.time())), lambda e: e['id'], 500)
+
+
+def remember_search(query):
+    remember(SEARCHES, query, lambda q: q.casefold(), 50)
+
+
+def load_playlists():
+    lists = load_json(PLAYLISTS, {})
+    lists.setdefault(WATCH_LATER, [])
+    return lists
+
+
+def youtube_id(url):
+    """The video's ID of a YouTube watch, short or embed URL, else None"""
+    u = urllib.parse.urlsplit(url)
+    if not YOUTUBE_HOST.search(u.hostname or ''):
+        return None
+    if (u.hostname or '').endswith('youtu.be'):
+        return u.path.strip('/') or None
+    m = re.match(r'^/(shorts|embed|live)/([\w-]+)', u.path)
+    return m.group(2) if m else urllib.parse.parse_qs(u.query).get('v', [None])[0]
 
 
 def video_format(height, fps):
@@ -128,8 +188,14 @@ def browser_cookies(url):
     return path
 
 
-def play(url, title='', started=None):
-    """Blocks until the video is over; started() is called when the picture is about to appear"""
+def duration_text(d):
+    d = int(d)
+    return '%d:%02d:%02d' % (d // 3600, d // 60 % 60, d % 60) if d >= 3600 else '%d:%02d' % (d // 60, d % 60)
+
+
+def play(url, title='', started=None, entry=None):
+    """Blocks until the video is over; started() is called when the picture is about to appear.
+    A YouTube video goes into the history, as entry (a search card's) or as yt-dlp describes it."""
     if MEDIA_FILE.search(urllib.parse.urlsplit(url).path):
         if started:
             started()
@@ -142,21 +208,30 @@ def play(url, title='', started=None):
                            # one video, as the output below is read as one video's lines: a watch URL
                            # in a playlist is its video, a page with several videos its first one
                            ['--no-playlist', '--playlist-items', '1',
-                            '--print', 'title', '--print', '%(height)s %(fps)s', '-g',
+                            '--print', 'title', '--print', 'channel', '--print', '%(height)s %(fps)s %(duration)s', '-g',
                             '-f', video_format(s['height'], s['fps']), url],
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     finally:
         if cookies:
             os.remove(cookies)
     out = r.stdout.split('\n')
-    video = out[2] if len(out) > 2 else ''
-    audio = out[3] if len(out) > 3 else ''
+    video = out[3] if len(out) > 3 else ''
+    audio = out[4] if len(out) > 4 else ''
     # what it plays at, for the player's title: 1080p60, 720p
+    fields = out[2].split() if len(out) > 2 else []
     try:
-        h, fps = out[1].split()
+        h, fps = fields[:2]
         quality = '%dp%s' % (int(h), round(float(fps)) if float(fps) > 30 else '')
-    except (IndexError, ValueError):   # "NA" when yt-dlp doesn't know
+    except ValueError:   # "NA" when yt-dlp doesn't know
         quality = ''
+    vid = youtube_id(url)
+    if video and vid:
+        try:
+            length = duration_text(float(fields[2]))
+        except (IndexError, ValueError):
+            length = ''
+        remember_video(entry or {'id': vid, 'title': out[0], 'channel': '' if out[1] == 'NA' else out[1],
+                                 'duration': length, 'views': '', 'published': '', 'avatar': None})
     if not video and 'ERROR:' in r.stderr:
         # removed, blocked in the region, private...: mpv would only fail the same way
         err = r.stderr[r.stderr.rindex('ERROR:'):].split('\n')[0]
@@ -230,6 +305,100 @@ def innertube(query=None, token=None):
     return entries, nxt
 
 
+def innertube_call(endpoint, body):
+    body = dict(body, context={'client': CLIENT})
+    req = urllib.request.Request('https://www.youtube.com/youtubei/v1/%s?prettyPrint=false' % endpoint,
+                                 json.dumps(body).encode(), {'Content-Type': 'application/json', 'User-Agent': UA})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.load(r)
+
+
+def lockup_entry(v):
+    """A video in the newer layout of related videos and playlists (lockupViewModel)"""
+    md = v.get('metadata', {}).get('lockupMetadataViewModel', {})
+    rows = [[p.get('text', {}).get('content', '') for p in r.get('metadataParts', [])]
+            for r in md.get('metadata', {}).get('contentMetadataViewModel', {}).get('metadataRows', [])]
+    badges = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k, x in o.items():
+                badges.append(x.get('text', '')) if k == 'thumbnailBadgeViewModel' else walk(x)
+        elif isinstance(o, list):
+            for x in o:
+                walk(x)
+    walk(v.get('contentImage'))
+    avatar = (md.get('image', {}).get('decoratedAvatarViewModel', {}).get('avatar', {})
+              .get('avatarViewModel', {}).get('image', {}).get('sources', []))
+    return {
+        'id': v['contentId'],
+        'title': md.get('title', {}).get('content', ''),
+        'channel': rows[0][0] if rows and rows[0] else '',
+        'duration': next((b for b in badges if re.match(r'^[\d:]+$', b)), ''),
+        'views': rows[1][0] + ' views' if len(rows) > 1 and rows[1] else '',
+        'published': rows[1][-1] if len(rows) > 1 and len(rows[1]) > 1 else '',
+        'live': 'LIVE' in badges,
+        'avatar': avatar[-1]['url'] if avatar else None,
+    }
+
+
+def lockups(o):
+    found = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k == 'lockupViewModel' and v.get('contentType') == 'LOCKUP_CONTENT_TYPE_VIDEO':
+                    found.append(lockup_entry(v))
+                else:
+                    walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+    walk(o)
+    return found
+
+
+def related(video_id):
+    """What YouTube shows next to a video, without signing in"""
+    data = innertube_call('next', {'videoId': video_id})
+    return lockups(data.get('contents', {}).get('twoColumnWatchNextResults', {}).get('secondaryResults'))
+
+
+def youtube_playlist(list_id):
+    """A public playlist: its title and (the first hundred of) its videos"""
+    data = innertube_call('browse', {'browseId': 'VL' + list_id})
+    title = data.get('metadata', {}).get('playlistMetadataRenderer', {}).get('title') or 'Playlist'
+    return title, lockups(data.get('contents'))
+
+
+def recommendations():
+    """Without an account: the videos YouTube shows next to the last ones watched, taken in turn,
+    without what was watched; before any, the results of the last searches"""
+    history = load_json(HISTORY, [])
+    seen = {e['id'] for e in history}
+    if history:
+        sources = [lambda vid=e['id']: related(vid) for e in history[:6]]
+    else:
+        sources = [lambda q=q: innertube(q)[0] for q in load_json(SEARCHES, [])[:3]]
+    with ThreadPoolExecutor(6) as pool:
+        lists = [f.result() for f in [pool.submit(lambda s=s: _safe(s)) for s in sources]]
+    out = []
+    for i in range(max(map(len, lists), default=0)):
+        for lst in lists:
+            if i < len(lst) and lst[i]['id'] not in seen:
+                seen.add(lst[i]['id'])
+                out.append(lst[i])
+    return out
+
+
+def _safe(f):
+    try:
+        return f()
+    except Exception:
+        return []
+
+
 def count(n):
     for div, suffix in ((1e9, 'B'), (1e6, 'M'), (1e3, 'K')):
         if n >= div:
@@ -257,8 +426,7 @@ def ytdlp_search(query, n=30):
         d = int(e.get('duration') or 0)
         entries.append({
             'id': e['id'], 'title': e.get('title') or '', 'channel': e.get('channel') or '',
-            'duration': ('%d:%02d:%02d' % (d // 3600, d // 60 % 60, d % 60) if d >= 3600 else
-                         '%d:%02d' % (d // 60, d % 60)) if d else '',
+            'duration': duration_text(d) if d else '',
             'views': count(e['view_count']) + ' views' if e.get('view_count') is not None else '',
             'published': ago(e['timestamp']) if e.get('timestamp') else '',
             'live': e.get('live_status') == 'is_live',
@@ -303,6 +471,16 @@ flowboxchild:selected, flowboxchild:hover { background: #313244; }
 .title { font-size: 14px; font-weight: bold; }
 .meta { color: #a6adc8; font-size: 12px; }
 .empty { color: #7f849c; font-size: 16px; }
+.tabs { padding: 0 16px 4px 16px; }
+.tab { font-size: 14px; background: transparent; border: 1px solid transparent; box-shadow: none;
+       border-radius: 16px; padding: 4px 14px; color: #a6adc8; }
+.tab:hover, .tab:focus { border-color: #cba6f7; }
+.tab.active { background: #cba6f7; color: #11111b; }
+.hint { color: #7f849c; font-size: 12px; }
+/* the past searches under the entry */
+window.popup, treeview.view { background-color: #1e1e2e; }
+treeview.view { font-family: "JetBrains Mono"; font-size: 15px; color: #cdd6f4; padding: 6px 16px; }
+treeview.view:selected { background-color: #cba6f7; color: #11111b; }
 '''
 
 
@@ -368,7 +546,8 @@ def window(query):
             overlay.add_overlay(self.badge)
             box.pack_start(overlay, False, False, 0)
             # the thumbnails in the results are WebP (no loader here); this one is JPEG, 320x180
-            load_image(thumb, 'https://i.ytimg.com/vi/%s/mqdefault.jpg' % e['id'], lambda d: scaled(d, tw, th))
+            if e['id']:
+                load_image(thumb, 'https://i.ytimg.com/vi/%s/mqdefault.jpg' % e['id'], lambda d: scaled(d, tw, th))
 
             row = Gtk.Box(spacing=10)
             avatar = Gtk.Image(valign=Gtk.Align.START)
@@ -431,6 +610,14 @@ def window(query):
             header.pack_start(logo, False, False, 0)
             self.entry = Gtk.Entry(placeholder_text='Search YouTube or paste a link')
             self.entry.connect('activate', lambda w: self.search(w.get_text().strip()))
+            # the searches made before, offered as the entry gets the focus or as one types
+            self.searches = Gtk.ListStore(str)
+            completion = Gtk.EntryCompletion(model=self.searches, minimum_key_length=0, popup_single_match=True)
+            completion.set_text_column(0)   # as a constructor property it shows no text
+            completion.set_match_func(lambda c, key, it: key.casefold() in self.searches[it][0].casefold())
+            completion.connect('match-selected', self.on_past_search)
+            self.entry.set_completion(completion)
+            self.entry.connect('focus-in-event', lambda *_: self.offer_searches())
             header.pack_start(self.entry, False, False, 0)
             self.status = Gtk.Label(xalign=0)
             self.status.get_style_context().add_class('status')
@@ -460,6 +647,25 @@ def window(query):
                                                                   'fps': int(self.fps.get_active_id())}))
             top.pack_start(header, False, False, 0)
 
+            # Recommended, History, Playlists; yellow on the remote goes through them
+            tabs = Gtk.Box(spacing=6)
+            tabs.get_style_context().add_class('tabs')
+            self.tabs = {}
+            for name, label in (('home', 'Recommended'), ('history', 'History'), ('playlists', 'Playlists')):
+                b = Gtk.Button(label=label, relief=Gtk.ReliefStyle.NONE)
+                b.get_style_context().add_class('tab')
+                b.connect('clicked', lambda w, n=name: self.show_view(n))
+                tabs.pack_start(b, False, False, 0)
+                self.tabs[name] = b
+            self.save_list = Gtk.Button(label='Save as a playlist', relief=Gtk.ReliefStyle.NONE, no_show_all=True)
+            self.save_list.get_style_context().add_class('tab')
+            self.save_list.connect('clicked', lambda w: self.save_remote_list())
+            tabs.pack_start(self.save_list, False, False, 0)
+            hint = Gtk.Label(label='green: add to a playlist   blue / Delete: remove   yellow: next tab', xalign=1)
+            hint.get_style_context().add_class('hint')
+            tabs.pack_start(hint, True, True, 0)
+            top.pack_start(tabs, False, False, 0)
+
             self.scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
             self.scroll.get_vadjustment().connect('value-changed', self.on_scroll)
             self.grid = Gtk.FlowBox(min_children_per_line=COLUMNS, max_children_per_line=COLUMNS,
@@ -480,11 +686,196 @@ def window(query):
             self.win.show_all()
 
             self.query, self.token, self.busy, self.gen, self.playing = None, None, False, 0, False
+            self.view, self.list_name, self.remote = None, None, None
             if query:
                 self.entry.set_text(query)
                 self.search(query)
             else:
-                self.entry.grab_focus()
+                self.show_view('home')
+
+        # views: home (recommended), history, playlists, list (one of them), remote (a YouTube
+        # playlist), search
+
+        def set_tab(self, name):
+            for n, b in self.tabs.items():
+                ctx = b.get_style_context()
+                ctx.add_class('active') if n == name else ctx.remove_class('active')
+
+        def clear(self):
+            self.gen += 1
+            self.token = None
+            for c in self.grid.get_children():
+                c.destroy()
+            self.scroll.get_vadjustment().set_value(0)
+            self.empty.hide()
+            self.save_list.hide()
+
+        def card_width(self):
+            # the window in COLUMNS, less the margins, spacing, card padding and room for a scrollbar
+            return (self.scroll.get_allocated_width() - 32 - (COLUMNS - 1) * 12 - 12) // COLUMNS - 12
+
+        def show(self, entries, status, empty, select=0):
+            tw = self.card_width()
+            for e in entries:
+                self.grid.add(Card(e, tw))
+            self.grid.show_all()
+            self.status.set_text(status)
+            if entries:
+                c = self.grid.get_child_at_index(min(select, len(entries) - 1))
+                self.grid.select_child(c)
+                c.grab_focus()
+            else:
+                self.empty.set_text(empty)
+                self.empty.show()
+
+        def show_view(self, name, select=0):
+            self.clear()
+            self.view = name
+            self.set_tab('playlists' if name == 'list' else name)
+            if name == 'home':
+                self.status.set_text('Finding recommendations…')
+                gen = self.gen
+
+                def job():
+                    entries = recommendations()
+                    GLib.idle_add(lambda: gen == self.gen and self.show(
+                        entries, '%d recommended' % len(entries),
+                        'Recommendations come from what you watch and search: search for something'))
+                threading.Thread(target=job, daemon=True).start()
+            elif name == 'history':
+                h = load_json(HISTORY, [])
+                self.show(h, '%d watched' % len(h), 'Nothing watched yet', select)
+            elif name == 'playlists':
+                cards = [{'id': v[0]['id'] if v else None, 'title': n, 'playlist': n,
+                          'channel': '%d video%s' % (len(v), '' if len(v) == 1 else 's'),
+                          'duration': '', 'views': '', 'published': '', 'live': False, 'avatar': None}
+                         for n, v in load_playlists().items()]
+                self.show(cards, '%d playlists' % len(cards), '', select)
+            elif name == 'list':
+                v = load_playlists().get(self.list_name, [])
+                self.show(v, '%s: %d videos' % (self.list_name, len(v)),
+                          'Empty: green on the remote (or Insert) adds the selected video to a playlist', select)
+
+        def show_remote(self, list_id):
+            """A YouTube playlist from a pasted link, which can be saved as one of ours"""
+            self.clear()
+            self.view = 'remote'
+            self.set_tab(None)
+            self.status.set_text('Loading the playlist…')
+            gen = self.gen
+
+            def job():
+                try:
+                    title, entries = youtube_playlist(list_id)
+                except Exception:
+                    title, entries = None, []
+
+                def done():
+                    if gen != self.gen:
+                        return
+                    self.remote = (title, entries)
+                    self.show(entries, '%s: %d videos' % (title, len(entries)) if title else
+                              'The playlist failed to load: no connection?', 'An empty playlist')
+                    if entries:
+                        self.save_list.show()
+                GLib.idle_add(done)
+            threading.Thread(target=job, daemon=True).start()
+
+        def save_remote_list(self):
+            title, entries = self.remote
+            lists = load_playlists()
+            name, n = title, 2
+            while name in lists:
+                name, n = '%s (%d)' % (title, n), n + 1
+            lists[name] = entries
+            save_json(PLAYLISTS, lists)
+            notify('Saved as the playlist "%s"' % name)
+            self.save_list.hide()
+
+        # playlists and history: adding and removing
+
+        def selected(self):
+            sel = self.grid.get_selected_children()
+            return sel[0] if sel else None
+
+        def add_to_playlist(self):
+            card = self.selected()
+            if not card or card.entry.get('playlist'):
+                return
+            menu = Gtk.Menu()
+            for name, videos in load_playlists().items():
+                mark = '✓ ' if any(v['id'] == card.entry['id'] for v in videos) else '    '
+                item = Gtk.MenuItem(label=mark + name)
+                item.connect('activate', lambda w, n=name: self.add_video(n, card.entry))
+                menu.append(item)
+            menu.append(Gtk.SeparatorMenuItem())
+            new = Gtk.MenuItem(label='    New playlist…')
+            new.connect('activate', lambda w: GLib.idle_add(self.new_playlist, card.entry))
+            menu.append(new)
+            menu.show_all()
+            menu.popup_at_widget(card, Gdk.Gravity.CENTER, Gdk.Gravity.NORTH_WEST, None)
+            menu.select_first(False)   # the arrows and OK work in it at once
+
+        def add_video(self, name, entry):
+            lists = load_playlists()
+            lists[name] = [v for v in lists.get(name, []) if v['id'] != entry['id']] + [dict(entry, live=False)]
+            save_json(PLAYLISTS, lists)
+            notify('Added to "%s"' % name)
+            if self.view == 'playlists':
+                self.show_view('playlists')
+
+        def new_playlist(self, entry):
+            dialog = Gtk.Dialog(title='New playlist', transient_for=self.win, modal=True)
+            name = Gtk.Entry(placeholder_text='Name (text on the remote types)', activates_default=True)
+            dialog.get_content_area().pack_start(name, True, True, 12)
+            dialog.add_button('Create', Gtk.ResponseType.OK)
+            dialog.set_default_response(Gtk.ResponseType.OK)
+            dialog.show_all()
+            ok = dialog.run() == Gtk.ResponseType.OK
+            text = name.get_text().strip()
+            dialog.destroy()
+            if ok and text:
+                self.add_video(text, entry)
+
+        def remove_selected(self):
+            card = self.selected()
+            if not card:
+                return
+            i, e = card.get_index(), card.entry
+            if self.view == 'history':
+                save_json(HISTORY, [x for x in load_json(HISTORY, []) if x['id'] != e['id']])
+            elif self.view == 'list':
+                lists = load_playlists()
+                lists[self.list_name] = [x for x in lists[self.list_name] if x['id'] != e['id']]
+                save_json(PLAYLISTS, lists)
+            elif self.view == 'playlists':
+                lists = load_playlists()
+                if lists[e['playlist']]:
+                    notify('Only an empty playlist can be removed')
+                    return
+                if e['playlist'] != WATCH_LATER:   # that one is always there
+                    del lists[e['playlist']]
+                    save_json(PLAYLISTS, lists)
+            else:
+                return
+            self.show_view(self.view, i)
+
+        # searches
+
+        def offer_searches(self):
+            self.searches.clear()
+            for q in load_json(SEARCHES, [])[:12]:
+                self.searches.append([q])
+            if len(self.searches) and not self.entry.get_text():
+                # GTK 3 shows the list on a change of the text only, not on complete(), and only
+                # with the device of the event at hand: so here, in the focus-in handler
+                self.entry.emit('changed')
+
+        def on_past_search(self, completion, model, it):
+            q = model[it][0]
+            self.entry.set_text(q)
+            self.search(q)
+            return True
 
         # results
 
@@ -492,13 +883,15 @@ def window(query):
             if not q:
                 return
             if re.match(r'^https?://', q):
+                playlist = urllib.parse.parse_qs(urllib.parse.urlsplit(q).query).get('list', [None])[0]
+                if playlist and not youtube_id(q):
+                    return self.show_remote(playlist)
                 return self.open(None, q)
-            self.gen += 1
-            self.query, self.token = q, None
-            for c in self.grid.get_children():
-                c.destroy()
-            self.scroll.get_vadjustment().set_value(0)
-            self.empty.hide()
+            remember_search(q)
+            self.clear()
+            self.view = 'search'
+            self.set_tab(None)
+            self.query = q
             self.load(q, None, self.gen)
 
         def load(self, q, token, gen):
@@ -532,9 +925,7 @@ def window(query):
                 self.status.set_text('Search failed: no connection?')
                 return
             first = not self.grid.get_children()
-            # thumbnail width: the window in COLUMNS, less the margins, spacing, card padding and
-            # room for a scrollbar
-            tw = (self.scroll.get_allocated_width() - 32 - (COLUMNS - 1) * 12 - 12) // COLUMNS - 12
+            tw = self.card_width()
             seen = {c.entry['id'] for c in self.grid.get_children()}
             for e in entries:
                 if e['id'] not in seen:
@@ -559,6 +950,9 @@ def window(query):
         # playback
 
         def open(self, card, url=None):
+            if card and card.entry.get('playlist'):
+                self.list_name = card.entry['playlist']
+                return self.show_view('list')
             if self.playing:
                 return
             self.playing = True
@@ -574,7 +968,7 @@ def window(query):
 
             def job():
                 try:
-                    play(url, title, started)
+                    play(url, title, started, card.entry if card else None)
                 finally:
                     GLib.idle_add(self.back, card)
             threading.Thread(target=job, daemon=True).start()
@@ -585,7 +979,10 @@ def window(query):
                 card.set_badge()
             self.win.show()
             self.win.present()
-            (card or self.entry).grab_focus()
+            if self.view == 'history':   # what was watched is first now
+                self.show_view('history')
+            else:
+                (card or self.entry).grab_focus()
 
         # keys
 
@@ -595,8 +992,24 @@ def window(query):
             if key == 'Escape':
                 if self.entry.has_focus() and self.grid.get_children():
                     self.focus_grid()
+                elif self.view == 'list':
+                    self.show_view('playlists')
+                elif self.view in ('search', 'remote'):
+                    self.show_view('home')
                 else:
                     Gtk.main_quit()
+                return True
+            # the remote's colour buttons: yellow the next tab, green add to a playlist, blue remove
+            if key == 'Launch3':
+                order = ('home', 'history', 'playlists')
+                cur = 'playlists' if self.view == 'list' else self.view
+                self.show_view(order[(order.index(cur) + 1) % len(order)] if cur in order else 'home')
+                return True
+            if key in ('Launch2', 'Insert') and not self.entry.has_focus():
+                self.add_to_playlist()
+                return True
+            if key in ('Launch4', 'Delete') and not self.entry.has_focus():
+                self.remove_selected()
                 return True
             if (ctrl and key == 'l') or key == 'slash' and not self.entry.has_focus():
                 self.entry.grab_focus()

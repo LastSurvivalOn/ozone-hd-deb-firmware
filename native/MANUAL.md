@@ -165,6 +165,19 @@ can sit on 2 and the terminal on 3.
 Open it with **Super+Y** or the YouTube button on the panel. YouTube links opened in the browser
 also come here.
 
+It opens on **Recommended**: videos like the ones you watched last (before you have watched any,
+like your last searches). Next to it are **History**, everything watched, newest first, and
+**Playlists**. All of it is kept on the box: no Google account, and nothing is sent to YouTube but
+the requests for the videos themselves. Click a tab, or press **yellow** on the remote to go to the
+next one.
+
+**Playlists.** **Green** on the remote (or **Insert**) on a card offers your playlists: choose one,
+or **New playlist…** and type a name (the remote's **text** button gives the on-screen keyboard).
+**Watch later** is always there. In Playlists, a card opens its playlist; **Esc** goes back.
+**Blue** (or **Delete**) removes the chosen video from History or from the playlist, and an empty
+playlist from Playlists. A link to a YouTube playlist pasted into the search box shows its videos,
+with a **Save as a playlist** button above them.
+
 **Searching.** Type a query and press Enter. Results arrive in about a second, as cards showing:
 - the thumbnail, with the length in the corner (a red **LIVE** marks a live broadcast);
 - the channel's avatar and name;
@@ -172,7 +185,8 @@ also come here.
 - the number of views and how long ago it was published.
 
 You can start typing anywhere in the window, not only in the search box: the text goes straight
-into it. A YouTube link pasted into the search box plays at once.
+into it. Going to the search box shows your recent searches: **↓** and **Enter** search one again.
+A YouTube link pasted into the search box plays at once.
 
 | Keys / mouse | Action |
 |---|---|
@@ -180,7 +194,8 @@ into it. A YouTube link pasted into the search box plays at once.
 | **arrows** | choose a card |
 | **Enter** or a click on a card | watch |
 | **↓** in the search box | go to the cards |
-| **Esc** | from the search box: go to the cards; from the cards: close YouTube |
+| **Esc** | from the search box: go to the cards; from search results or a playlist: back; from a tab: close YouTube |
+| yellow / green / blue (or **Insert** / **Delete**) | next tab / add to a playlist / remove |
 | **Ctrl+L** or **/** | go to the search box |
 | scrolling to the end | loads more results |
 
@@ -371,6 +386,7 @@ The box's own remote can run everything by itself: point it at the box.
 | **usb** | the drives and network folders (section 11) |
 | **info** | the panel, over a full-screen window too (in mouse mode: the right mouse button) |
 | red | YouTube |
+| yellow, green, blue | in YouTube: the next tab, add to a playlist, remove (section 4) |
 | **epg**, **dvb**, **TV/radio** | the TV window |
 | **vol+ / vol−**, **mute** | volume |
 | **page+ / page−** | in the player on TV: next / previous channel; in lists, a page up / down |
@@ -394,7 +410,7 @@ with the arrows and type the key with **OK**; **delete** erases, the digit butto
 What it types goes to the window that was being used, so first choose the search field or the
 address bar. It can be clicked with the mouse too.
 
-Green, yellow, blue and record do nothing yet. The **>>**, **|<<**, **>>|** and **menu**
+Record does nothing yet. The **>>**, **|<<**, **>>|** and **menu**
 buttons send exactly the same signal as **<<** (the remote is made that way), so they all go
 back 10 s.
 
