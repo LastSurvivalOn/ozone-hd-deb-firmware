@@ -5,6 +5,8 @@ configuration {
     display-drun: "  Apps";
     display-run: "  Command";
     font: "JetBrains Mono Bold 11";
+    /* the home menu (combi): the names alone, not the mode ("Apps") before each */
+    combi-display-format: "{text}";
 }
 
 * {

@@ -47,9 +47,9 @@ XF86AudioMute
 # keyboards, and X would never see the key go up
 @XF86PowerOff
     sudo -n ozone-standby
-# home: the open windows, then the apps (their names alone, not "Apps" before each)
+# home: the open windows, then the apps
 XF86HomePage
-    rofi -show combi -modi combi -combi-modi window,drun -display-combi "  Home" -combi-display-format "{text}"
+    rofi -show combi -modi combi -combi-modi window,drun -display-combi "  Home"
 # usb: the drives and network folders
 XF86Launch7
     ozone-media menu
