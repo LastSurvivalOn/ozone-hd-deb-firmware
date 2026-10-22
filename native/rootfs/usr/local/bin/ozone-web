@@ -130,6 +130,7 @@ SCRIPT_CDNS = ('githubassets.com', 'gstatic.com', 'googleapis.com', 'cdnjs.cloud
                'redditstatic.com', 'twimg.com', 'sstatic.net', 'wikimedia.org', 'gitlab-static.net')
 YOUTUBE_WATCH = re.compile(r'^https?://((www|m)\.)?(youtube\.com/(watch|shorts/)|youtu\.be/)')
 YOUTUBE_OTHER = re.compile(r'^https?://((www|m)\.)?youtube\.com/?(results|\?|$|#)')
+YOUTUBE_PLAYLIST = re.compile(r'^https?://((www|m)\.)?youtube\.com/playlist\?')
 
 # Font Awesome 4, like the panel
 ICON = {'back': '', 'forward': '', 'reload': '', 'stop': '', 'home': '',
@@ -455,6 +456,8 @@ class Browser(Gtk.ApplicationWindow):
         uri = decision.get_navigation_action().get_request().get_uri() or ''
         if YOUTUBE_WATCH.match(uri):
             self.play(uri)
+        elif YOUTUBE_PLAYLIST.match(uri):
+            subprocess.Popen(['yt', uri], start_new_session=True)   # its videos in yt's window
         elif YOUTUBE_OTHER.match(uri):
             # the YouTube app is far too heavy for this CPU; yt searches it in a second
             q = urllib.parse.parse_qs(urllib.parse.urlsplit(uri).query).get('search_query', [''])[0]

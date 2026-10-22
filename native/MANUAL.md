@@ -175,11 +175,13 @@ next one.
 or **New playlist…** and type a name (the remote's **text** button gives the on-screen keyboard).
 **Watch later** is always there. In Playlists, a card opens its playlist; **Esc** goes back.
 **Blue** (or **Delete**) removes the chosen video from History or from the playlist, and an empty
-playlist from Playlists. A link to a YouTube playlist pasted into the search box shows its videos,
-with a **Save as a playlist** button above them.
+playlist from Playlists. A YouTube playlist (a card in the results, a link pasted into the search
+box, or one opened in the browser) shows its first hundred videos, with a **Save as a playlist**
+button above them; **Esc** goes back to the results.
 
 **Searching.** Type a query and press Enter. Results arrive in about a second, as cards showing:
-- the thumbnail, with the length in the corner (a red **LIVE** marks a live broadcast);
+- the thumbnail, with the length in the corner (a red **LIVE** marks a live broadcast; a
+  playlist, which turns up among the videos as on YouTube, shows how many videos it has);
 - the channel's avatar and name;
 - the title;
 - the number of views and how long ago it was published.

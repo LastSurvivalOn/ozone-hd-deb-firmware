@@ -9,7 +9,8 @@ hardware decoder (amplay, H.264 up to 1080p), or mpv in software if that fails.
   yt              search window
   yt QUERY        search window with results for QUERY
   yt URL          play right away (what ozone-web hands over): YouTube, a media file, or any of
-                  yt-dlp's sites, with the browser's sign-in (its cookies) outside YouTube
+                  yt-dlp's sites, with the browser's sign-in (its cookies) outside YouTube; a
+                  YouTube playlist opens in the window
 
 It opens on Recommended (YouTube's related videos of the last ones watched, without what was
 watched; before any, the results of the last searches), next to History and Playlists, all kept on
@@ -41,10 +42,10 @@ GL = os.environ.get('YT_GL', 'UA')
 
 API = 'https://www.youtube.com/youtubei/v1/search?prettyPrint=false'
 CLIENT = {'clientName': 'WEB', 'clientVersion': '2.20260901.00.00', 'hl': HL, 'gl': GL}
-VIDEOS_ONLY = 'EgIQAQ=='   # the "Type: Video" filter: no shorts shelves, channels or playlists
 UA = 'Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0'
 
 COLUMNS = 4
+PAGE = 6 * COLUMNS   # cards made at a time
 AVATAR = 36
 
 HEIGHTS = (1080, 720, 480, 360)
@@ -121,6 +122,14 @@ def youtube_id(url):
         return u.path.strip('/') or None
     m = re.match(r'^/(shorts|embed|live)/([\w-]+)', u.path)
     return m.group(2) if m else urllib.parse.parse_qs(u.query).get('v', [None])[0]
+
+
+def youtube_list(url):
+    """The playlist's ID of a YouTube link to a playlist (not to a video in one), else None"""
+    u = urllib.parse.urlsplit(url)
+    if not YOUTUBE_HOST.search(u.hostname or '') or youtube_id(url):
+        return None
+    return urllib.parse.parse_qs(u.query).get('list', [None])[0]
 
 
 def video_format(height, fps):
@@ -281,7 +290,9 @@ def innertube(query=None, token=None):
     if token:
         body['continuation'] = token
     else:
-        body.update(query=query, params=VIDEOS_ONLY)
+        # no filter, as on YouTube: videos and now and then a playlist (shorts shelves and
+        # channels come too, and are left out below)
+        body.update(query=query)
     req = urllib.request.Request(API, json.dumps(body).encode(),
                                  {'Content-Type': 'application/json', 'User-Agent': UA})
     with urllib.request.urlopen(req, timeout=15) as r:
@@ -294,6 +305,10 @@ def innertube(query=None, token=None):
             for k, v in o.items():
                 if k == 'videoRenderer' and 'videoId' in v:
                     entries.append(video_entry(v))
+                elif k == 'lockupViewModel' and v.get('contentType') == 'LOCKUP_CONTENT_TYPE_PLAYLIST':
+                    # a mix (RD...) is no playlist one can open
+                    if not v.get('contentId', 'RD').startswith('RD'):
+                        entries.append(playlist_entry(v))
                 elif k == 'continuationItemRenderer':
                     nxt = v.get('continuationEndpoint', {}).get('continuationCommand', {}).get('token')
                 else:
@@ -342,6 +357,17 @@ def lockup_entry(v):
     }
 
 
+def playlist_entry(v):
+    """A playlist among search results, as a card: its first video's thumbnail, its size where a
+    video has its length; 'list' tells it from a video"""
+    e = lockup_entry(v)
+    thumb = re.search(r'i\.ytimg\.com/vi/([\w-]+)/', json.dumps(v.get('contentImage', {})))
+    size = next((b for b in re.findall(r'"text": "([^"]+)"', json.dumps(v.get('contentImage', {})))
+                 if re.search(r'\d+ (videos?|episodes?|lessons?)$', b)), 'Playlist')
+    return dict(e, list=v['contentId'], id=thumb.group(1) if thumb else None, duration=size,
+                views='Playlist', published='', live=False)
+
+
 def lockups(o):
     found = []
 
@@ -380,7 +406,7 @@ def recommendations():
     if history:
         sources = [lambda vid=e['id']: related(vid) for e in history[:6]]
     else:
-        sources = [lambda q=q: innertube(q)[0] for q in load_json(SEARCHES, [])[:3]]
+        sources = [lambda q=q: [e for e in innertube(q)[0] if not e.get('list')] for q in load_json(SEARCHES, [])[:3]]
     with ThreadPoolExecutor(6) as pool:
         lists = [f.result() for f in [pool.submit(lambda s=s: _safe(s)) for s in sources]]
     out = []
@@ -685,8 +711,8 @@ def window(query):
             self.win.add(top)
             self.win.show_all()
 
-            self.query, self.token, self.busy, self.gen, self.playing = None, None, False, 0, False
-            self.view, self.list_name, self.remote = None, None, None
+            self.query, self.token, self.busy, self.gen, self.playing, self.pending = None, None, False, 0, False, []
+            self.view, self.list_name, self.remote, self.remote_from = None, None, None, None
             if query:
                 self.entry.set_text(query)
                 self.search(query)
@@ -709,14 +735,18 @@ def window(query):
             self.scroll.get_vadjustment().set_value(0)
             self.empty.hide()
             self.save_list.hide()
+            self.pending = []
 
         def card_width(self):
             # the window in COLUMNS, less the margins, spacing, card padding and room for a scrollbar
             return (self.scroll.get_allocated_width() - 32 - (COLUMNS - 1) * 12 - 12) // COLUMNS - 12
 
         def show(self, entries, status, empty, select=0):
+            # cards come a page at a time, the rest as the grid is scrolled to its end (on_scroll):
+            # 100 cards at once took this CPU ~5 s
+            self.pending = list(entries[max(PAGE, select + 1):])
             tw = self.card_width()
-            for e in entries:
+            for e in entries[:max(PAGE, select + 1)]:
                 self.grid.add(Card(e, tw))
             self.grid.show_all()
             self.status.set_text(status)
@@ -756,10 +786,12 @@ def window(query):
                 self.show(v, '%s: %d videos' % (self.list_name, len(v)),
                           'Empty: green on the remote (or Insert) adds the selected video to a playlist', select)
 
-        def show_remote(self, list_id):
-            """A YouTube playlist from a pasted link, which can be saved as one of ours"""
+        def show_remote(self, list_id, back_to=None):
+            """A YouTube playlist, from the results (back_to: their query) or a pasted link, which
+            can be saved as one of ours"""
             self.clear()
             self.view = 'remote'
+            self.remote_from = back_to
             self.set_tab(None)
             self.status.set_text('Loading the playlist…')
             gen = self.gen
@@ -800,7 +832,7 @@ def window(query):
 
         def add_to_playlist(self):
             card = self.selected()
-            if not card or card.entry.get('playlist'):
+            if not card or card.entry.get('playlist') or card.entry.get('list'):
                 return
             menu = Gtk.Menu()
             for name, videos in load_playlists().items():
@@ -883,9 +915,8 @@ def window(query):
             if not q:
                 return
             if re.match(r'^https?://', q):
-                playlist = urllib.parse.parse_qs(urllib.parse.urlsplit(q).query).get('list', [None])[0]
-                if playlist and not youtube_id(q):
-                    return self.show_remote(playlist)
+                if youtube_list(q):
+                    return self.show_remote(youtube_list(q))
                 return self.open(None, q)
             remember_search(q)
             self.clear()
@@ -944,7 +975,14 @@ def window(query):
                 self.empty.show()
 
         def on_scroll(self, adj):
-            if self.token and not self.busy and adj.get_value() + 2 * adj.get_page_size() > adj.get_upper():
+            near_end = adj.get_value() + 2 * adj.get_page_size() > adj.get_upper()
+            if near_end and self.pending:
+                tw = self.card_width()
+                for e in self.pending[:PAGE]:
+                    self.grid.add(Card(e, tw))
+                self.pending = self.pending[PAGE:]
+                self.grid.show_all()
+            elif self.token and not self.busy and near_end:
                 self.load(self.query, self.token, self.gen)
 
         # playback
@@ -953,6 +991,8 @@ def window(query):
             if card and card.entry.get('playlist'):
                 self.list_name = card.entry['playlist']
                 return self.show_view('list')
+            if card and card.entry.get('list'):   # a YouTube playlist among the results
+                return self.show_remote(card.entry['list'], back_to=self.query)
             if self.playing:
                 return
             self.playing = True
@@ -994,6 +1034,9 @@ def window(query):
                     self.focus_grid()
                 elif self.view == 'list':
                     self.show_view('playlists')
+                elif self.view == 'remote' and self.remote_from:
+                    self.entry.set_text(self.remote_from)
+                    self.search(self.remote_from)
                 elif self.view in ('search', 'remote'):
                     self.show_view('home')
                 else:
@@ -1037,7 +1080,7 @@ def window(query):
 
 if __name__ == '__main__':
     arg = ' '.join(sys.argv[1:]).strip()
-    if re.match(r'^https?://', arg):
+    if re.match(r'^https?://', arg) and not youtube_list(arg):   # a playlist opens in the window
         play(arg)
     else:
         window(arg)
