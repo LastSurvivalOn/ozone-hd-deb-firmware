@@ -262,6 +262,22 @@ memory: 8 compile jobs on WebCore once took all 15 GB and froze the desktop.
 | ours, shared memory | 29.2 | 100 % | 22 % | 60 % |
 | ours, X pixmaps | 34.6 | 81 % | 9 % | 49 % |
 
+With 0002 (only the damage is drawn again, SOURCE for an opaque page) and 0003 (the view in an
+X window of its own, without GTK's double buffer), CSS animations: 35.2 a second, X at 62 %.
+
+A static page with a small spinning indicator (`tests/spinner.html`: text and an 80 px CSS
+animation) shows the damage at work, as most real pages animate a small part:
+
+| WebKit | X | UI process | web process |
+|---|---|---|---|
+| Debian's, shared memory | 101 % | 21 % | 74 % |
+| ours, shared memory | 100 % | 22 % | 71 % |
+| ours, pixmaps + damage (0002) | 29 % | 10 % | 58 % |
+| ours, + no double buffer (0003) | 76 % at 46 updates a second | 6 % | 87 % |
+
+With 0003 the spinner reaches 45.8 screen updates a second (the text around it none), so the CPU
+goes into more frames, not into whole ones.
+
 The page itself runs at 61.7 frames a second. Wheel scrolling Wikipedia in ozone-web stays at ~5
 (4.7 with pixmaps, 5.0 without): there the web process's main thread (the page's scroll handling)
 is the limit, not the frames. X is still the busiest: it composites the whole 32-bit frame onto

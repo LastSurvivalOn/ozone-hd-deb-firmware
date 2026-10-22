@@ -1,0 +1,83 @@
+X pixmap frames: draw only what changed, and without blending an opaque page
+
+The UI process redrew the whole view for every frame, so X composited the whole 32-bit frame
+each time, though the web process sends the frame's damage. A frame in an X pixmap is top down,
+so the damage is in the view's coordinates already: only those rectangles are queued for drawing
+(the window keeps the rest of the frame before). Empty damage still redraws everything.
+
+And for an opaque page the frame is composited with SOURCE, not OVER, so X doesn't read what is
+under it first.
+diff -ruN a/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.cpp b/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.cpp
+--- a/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.cpp	2026-10-22 17:15:40.449299345 +0300
++++ b/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.cpp	2026-10-22 17:15:50.738010691 +0300
+@@ -36,6 +36,7 @@
+ #include "WebPageProxy.h"
+ #include "WebProcessProxy.h"
+ #include <WebCore/GLContext.h>
++#include <WebCore/FloatRect.h>
+ #include <WebCore/IntRect.h>
+ #include <WebCore/NativeImage.h>
+ #include <WebCore/PlatformDisplay.h>
+@@ -262,8 +263,7 @@
+ AcceleratedBackingStore::AcceleratedBackingStore(WebPageProxy& webPage)
+     : m_webPage(webPage)
+     , m_fenceMonitor([this] {
+-        if (m_webPage)
+-            gtk_widget_queue_draw(m_webPage->viewWidget());
++        queueDraw();
+     })
+     , m_legacyMainFrameProcess(webPage.legacyMainFrameProcess())
+ {
+@@ -338,7 +338,10 @@
+         }
+         cairo_rectangle(cr, clipRect.x(), clipRect.y(), clipRect.width(), clipRect.height());
+         cairo_set_source_surface(cr, surface, 0, 0);
+-        cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
++        // An opaque page needs no blending: X then writes the frame without reading what is under it
++        const auto& background = m_webPage->backgroundColor();
++        bool opaque = surfaceIsTopDown() && (!background || background->isOpaque());
++        cairo_set_operator(cr, opaque ? CAIRO_OPERATOR_SOURCE : CAIRO_OPERATOR_OVER);
+         cairo_fill(cr);
+         cairo_restore(cr);
+     }
+@@ -833,6 +836,29 @@
+     m_fenceMonitor.addFileDescriptor(WTFMove(renderingFenceFD));
+ }
+ 
++void AcceleratedBackingStore::queueDraw()
++{
++    RefPtr webPage = m_webPage.get();
++    if (!webPage)
++        return;
++
++    auto* widget = webPage->viewWidget();
++#if PLATFORM(X11) && !USE(GTK4)
++    // A frame in an X pixmap is top down, so its damage (what changed since the frame on screen)
++    // is in the view's coordinates: only that is drawn again, X composites nothing else
++    if (m_pendingBuffer && m_pendingBuffer->surfaceIsTopDown() && m_committedBuffer && m_committedBuffer->surfaceIsTopDown()
++        && !m_pendingDamageRects.isEmpty()) {
++        float scale = webPage->deviceScaleFactor();
++        for (const auto& rect : m_pendingDamageRects) {
++            auto area = enclosingIntRect(FloatRect(rect.x() / scale, rect.y() / scale, rect.width() / scale, rect.height() / scale));
++            gtk_widget_queue_draw_area(widget, area.x(), area.y(), area.width(), area.height());
++        }
++        return;
++    }
++#endif
++    gtk_widget_queue_draw(widget);
++}
++
+ void AcceleratedBackingStore::frameDone()
+ {
+     if (RefPtr legacyMainFrameProcess = m_legacyMainFrameProcess.get())
+diff -ruN a/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.h b/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.h
+--- a/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.h	2026-10-22 17:15:40.437326393 +0300
++++ b/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.h	2026-10-22 17:15:40.464206079 +0300
+@@ -99,6 +99,7 @@
+     void didDestroyBuffer(uint64_t id);
+     void frame(uint64_t id, Rects&&, WTF::UnixFileDescriptor&&);
+     void frameDone();
++    void queueDraw();
+ 
+     void ensureGLContext();
+     bool swapBuffersIfNeeded();

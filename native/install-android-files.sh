@@ -28,7 +28,7 @@ du -sh "$W/android" | cut -f1
 
 echo ">> to the box"
 tar -C "$W" --owner=0 --group=0 -czf - android |
-    ssh_box 'sudo tar -C /usr/local/lib/ozone --no-same-owner --unlink-first -xzf -'
+    ssh_box 'sudo tar -C /usr/local/lib/ozone --no-same-owner -xzf -'
 tar -C "$HERE/rootfs" -czf - etc/init.d/ozone-android etc/init.d/ozone-dtv etc/init.d/ozone-input |
     ssh_box 'sudo tar -C / --no-same-owner -xzf -'
 ssh_box 'set -e

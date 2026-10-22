@@ -1,0 +1,35 @@
+X pixmap frames: draw the view without GTK's double buffer
+
+GTK 3 draws a client-side child window into a buffer of the toplevel's, which X then copies to
+the window: for every frame X composited the frame into the buffer and copied the buffer again.
+With frames in X pixmaps, the view gets a native X window drawn without double buffering, so X
+composites a frame straight into it. Every pixel of the view is drawn anyway, so its background
+is not cleared either.
+diff -ruN a/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.cpp b/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.cpp
+--- a/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.cpp	2026-10-22 17:21:34.675305036 +0300
++++ b/Source/WebKit/UIProcess/gtk/AcceleratedBackingStore.cpp	2026-10-22 17:21:34.685325759 +0300
+@@ -867,6 +867,24 @@
+ 
+ void AcceleratedBackingStore::realize()
+ {
++#if PLATFORM(X11) && !USE(GTK4)
++    // With frames in X pixmaps: the view gets an X window of its own, drawn without GTK's double
++    // buffer, so X composites a frame straight into the window instead of into a buffer that it
++    // then copies into the window again
++    const char* pixmaps = getenv("WEBKIT_X11_PIXMAP_RENDERER");
++    RefPtr webPage = m_webPage.get();
++    if (!webPage || !pixmaps || !strcmp(pixmaps, "0") || !GDK_IS_X11_DISPLAY(gdk_display_get_default()))
++        return;
++    auto* widget = webPage->viewWidget();
++    auto* window = gtk_widget_get_window(widget);
++    if (!window || !gdk_window_ensure_native(window))
++        return;
++    // nor does X clear what is exposed: every pixel is drawn anyway
++    gdk_window_set_background_pattern(window, nullptr);
++    ALLOW_DEPRECATED_DECLARATIONS_BEGIN
++    gtk_widget_set_double_buffered(widget, FALSE);
++    ALLOW_DEPRECATED_DECLARATIONS_END
++#endif
+ }
+ 
+ void AcceleratedBackingStore::unrealize()

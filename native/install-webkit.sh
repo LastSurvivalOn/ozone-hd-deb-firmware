@@ -22,6 +22,6 @@ echo ">> to the box"
 # the libraries, their helper processes (libexec) and the injected bundle; no headers or tools
 (cd "$STAGE" && tar --owner=0 --group=0 -czf - lib/libwebkit2gtk-4.1.so* lib/libjavascriptcoregtk-4.1.so* \
     lib/webkit2gtk-4.1 libexec) |
-    ssh_box "sudo mkdir -p $PREFIX && sudo tar -C $PREFIX --no-same-owner --unlink-first -xzf - && sync && du -sh $PREFIX"
+    ssh_box "sudo mkdir -p $PREFIX && sudo tar -C $PREFIX --no-same-owner -xzf - && sync && du -sh $PREFIX"
 tar -C "$HERE/rootfs" -czf - usr/local/bin/ozone-web | ssh_box 'sudo tar -C / --no-same-owner -xzf - && sync'
 echo ">> done: OZONE_WEB_GPU=1 ozone-web (an ozone-web already running keeps its WebKit until it quits)"
