@@ -357,7 +357,8 @@ class Browser(Gtk.ApplicationWindow):
         self.find.connect('activate', lambda *_: self.tab.view.get_find_controller().search_next())
         self.fast = flat_button('fast', 'Fast mode for this site: JavaScript off (F8)', self.toggle_fast)
         self.reader = flat_button('reader', 'Reader view (F9)', self.toggle_reader)
-        self.video = flat_button('video', 'Play the video on this page (F7)', self.play_page_video)
+        self.video = flat_button('video', 'Play the video on this page (F7, or pause on the remote)',
+                                 self.play_page_video)
         self.shield = flat_button('shield', 'Third-party scripts blocked on this site', self.toggle_scripts)
         bar = Gtk.Box(spacing=2)
         bar.get_style_context().add_class('toolbar')
@@ -733,6 +734,8 @@ class Browser(Gtk.ApplicationWindow):
             (1, 0, '0'): lambda: v.set_zoom_level(1),
             (1, 0, 'f'): lambda: (self.find.show(), self.find.grab_focus()),
             (0, 0, 'F7'): self.play_page_video,
+            # the remote's pause and unpause buttons (KEY_PLAYPAUSE, see /etc/ozone/remote.conf)
+            (0, 0, 'AudioPlay'): self.play_page_video,
             (0, 0, 'F8'): self.toggle_fast,
             (0, 0, 'F9'): self.toggle_reader,
             (0, 0, 'F11'): self.toggle_fullscreen,

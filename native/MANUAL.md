@@ -305,7 +305,7 @@ DuckDuckGo.
 | **Esc** | stop loading / close page search |
 | **Ctrl+F** | find on the page |
 | **Ctrl++** / **Ctrl+−** / **Ctrl+0** | zoom in / zoom out / normal size |
-| **F7** | play the video on this page |
+| **F7** (on the remote: **pause** or **unpause**) | play the video on this page |
 | **F8** | fast mode for this site |
 | **F9** | reader view |
 | **F11** | full screen |
@@ -375,7 +375,7 @@ The box's own remote can run everything by itself: point it at the box.
 | **vol+ / vol−**, **mute** | volume |
 | **page+ / page−** | in the player on TV: next / previous channel; in lists, a page up / down |
 | **0–9** | the channel number: in the TV window it selects the channel (OK watches), in the player it switches to it after a moment (or at once with OK) |
-| **pause**, **unpause** | pause / play in the player |
+| **pause**, **unpause** | pause / play in the player; in the browser, play the video on the page |
 | **stop** | stop watching |
 | **<<** | back 10 s in the player |
 | **delete** | deletes a character when typing |
