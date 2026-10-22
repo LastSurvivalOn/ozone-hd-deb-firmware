@@ -8,6 +8,8 @@ Scripts that turn an OzoneHD T2 WiFi set-top box (Amlogic S805 / Meson8B, armv7,
 
 Everything (READMEs, comments, script messages, UI labels) is in English.
 
+License: GPL-3.0-or-later with a section 7 permission to combine with the Mali and stock Android libraries (`LICENSING.md`), except `native/gpu/ddx` (MIT, ARM's), `native/gpu/kernel` (GPL-2.0-only, kernel code) and `native/webkit/patches` (BSD-2-Clause, as the WebKit files they change). New code elsewhere is GPL-3.0-or-later; never commit vendor binaries.
+
 - Box: `ssh -i ~/.ssh/id_ed25519_ozone <USER>@<BOX_IP>` (passwordless sudo), or over WiFi at `<BOX_WIFI_IP>` (`-o HostKeyAlias=<BOX_IP>`; both are DHCP reservations on the router), `adb connect <BOX_IP>:5555` (rooted, `su`). The real values are in `.env` (git-ignored; `.env.example` is the template), which `config.sh` reads for the scripts: `box_ip`, `ssh_box`, `scp_box`. Never commit the user name or the addresses: placeholders only.
 - Partition backups (boot, recovery, system, misc, logo, cache, the u-boot env, Android's part of data; **not** the bootloader) live in `ozone_backup/backup/` and also in `~/ozone_backup/backup/`, which the scripts read by default; `README.txt` there says what each is. The stock kernel can't read the bootloader (`uboot_read` is a stub; only writing works), so never write `/dev/bootloader`.
 - Rescue without Android, while u-boot is intact (env): with the reset button held at power on, u-boot tries USB burning, then `aml_sdc_burn.ini` or `aml_autoscript` on the SD card, then `recovery.img` on the SD card or a FAT USB stick, then the recovery partition. A boot partition it can't load goes the same `recovery.img` way.
