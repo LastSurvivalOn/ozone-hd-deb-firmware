@@ -13,9 +13,10 @@ What was measured on the box, and what follows from it:
   (native/gpu/egl-fix). CSS animations: 24 frames a second instead of 3; smooth scrolling
   Wikipedia 9.7 instead of 6.5. But every frame then crosses to X whole, through shared memory
   (~25 a second at most on this memory bus), where the CPU path redraws only the strip a scroll
-  exposes: with this browser's settings wheel scrolling gains nothing (4.5 against 5.2), and it
-  takes ~45 MB more memory. So off by default. With our own WebKit installed
-  (install-webkit.sh) the frames go to X as pixmaps instead: CSS animations 34.6 against 29.
+  exposes. It takes ~45 MB more memory. With our own WebKit installed (install-webkit.sh) the
+  frames go to X as pixmaps instead: CSS animations 35 against 29; wheel scrolling Wikipedia 25
+  frames a second against 12 on the CPU path (in composited mode WebKit scrolls on its own thread,
+  not waiting for the page's JavaScript), a static page 29 against 32.
 - Real wheel scrolling on heavy sites (Wikipedia, BBC) runs at 1-3 fps, and the cause is the
   sites' JavaScript reacting to every scroll, not painting: with JS off the same pages scroll at
   12-20 fps. Hence the per-site fast mode (JS off), on by default for sites that work without

@@ -2,6 +2,8 @@
 
 Samples pixels of /dev/fb0 (RGB565, 1280 wide) in a tight loop and counts the times any of them
 changes. A page's requestAnimationFrame rate says nothing about frames that reach the screen.
+X takes a few milliseconds to put a whole frame on the screen, so changes less than 12 ms after
+the one before count as the same frame (fast scrolling was counted at 50 for 30 wheel steps).
 """
 import os, sys, time
 
@@ -19,9 +21,13 @@ def sample():
 
 
 last, changes, t0 = sample(), 0, time.monotonic()
+changed_at = 0
 while time.monotonic() - t0 < secs:
     now = sample()
     if now != last:
-        changes, last = changes + 1, now
+        t = time.monotonic()
+        if t - changed_at > 0.012:
+            changes += 1
+        changed_at, last = t, now
     time.sleep(0.002)
 print('screen changed %.1f times a second' % (changes / secs))

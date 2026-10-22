@@ -278,9 +278,23 @@ animation) shows the damage at work, as most real pages animate a small part:
 With 0003 the spinner reaches 45.8 screen updates a second (the text around it none), so the CPU
 goes into more frames, not into whole ones.
 
-The page itself runs at 61.7 frames a second. Wheel scrolling Wikipedia in ozone-web stays at ~5
-(4.7 with pixmaps, 5.0 without): there the web process's main thread (the page's scroll handling)
-is the limit, not the frames. X is still the busiest: it composites the whole 32-bit frame onto
+The page itself runs at 61.7 frames a second.
+
+Wheel scrolling (`tests/scrolltest.sh`: one `xdotool click --repeat` at 30 steps a second,
+`screenfps.py` on a grid of 60 points), screen updates a second:
+
+| ozone-web | Wikipedia (JS) | `tests/long.html` (static) |
+|---|---|---|
+| CPU (the default) | 12.0, X 14 % | 32.3, X 27 % |
+| GPU, Debian's WebKit | 21.3, X 74 % | 23.7, X 86 % |
+| GPU, ours (pixmaps) | 25.3, X 48 % | 29.3, X 56 % |
+
+On a page with scripts the GPU path scrolls twice as fast: in composited mode WebKit scrolls on
+its scrolling thread (async scrolling, on by default for GTK), without waiting for the page's
+JavaScript, while the CPU path scrolls on the main thread. On a static page the CPU path is
+ahead, as it draws only the strip a scroll uncovers and X moves the rest. The earlier finding
+that scrolling gained nothing came from the method: one `xdotool` process per wheel step gave
+~10 steps a second, and 4 sampled points often fell between lines of text. X is still the busiest: it composites the whole 32-bit frame onto
 GTK's 16-bit double buffer (OVER, so it reads that too) and copies that to the window.
 
 The plan it followed, written before the build:
@@ -358,4 +372,7 @@ Risks:
 | `gpufilter.c` | GPU computing round trip (a blur), against the CPU |
 | `readpixels-spy.c` | LD_PRELOAD: glReadPixels and eglSwapBuffers calls and time |
 | `rbread.c` | WebKit's frame readback: surfaceless display, RGBA8 renderbuffer, glReadPixels(BGRA) |
-| `screenfps.py` | how often the screen really changes (samples fb0) |
+| `screenfps.py` | how often the screen really changes (samples fb0; changes within 12 ms are one frame) |
+| `scrolltest.sh` | ozone-web wheel scrolling (`MODE URL CLICKS INTERVAL`, modes cpu, debian, pixmap) |
+| `long.html`, `spinner.html` | a static page to scroll; static text with a small CSS animation |
+| `xpixmap2conn.c` | rendering into another X connection's pixmap, and its row order (our WebKit's case) |
