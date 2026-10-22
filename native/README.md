@@ -266,3 +266,6 @@ How the driver is driven, and what breaks it:
   layer the screen shows the color key. YouTube's video comes over its own connection,
   1080p60 at 3-7 Mbit/s over WiFi that does ~6, so it can fall behind the audio; amplay then
   holds the clock ("Loading…") until 3 s of video are downloaded ahead.
+- YouTube sends one long request at about twice the video's bit rate (~1 MB/s for 1080p60, on a
+  cable that does 9.5), and a request for a 10 MB range at the full line rate. amplay reads HTTP
+  files that way, as yt-dlp does: 78 MB in 45 s of 1080p60 instead of 49.

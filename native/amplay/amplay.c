@@ -32,6 +32,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <inttypes.h>
 #include <linux/input.h>
 #include <poll.h>
 #include <pthread.h>
@@ -50,6 +51,7 @@
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/opt.h>
+#include <libavutil/time.h>
 #include <libswresample/swresample.h>
 
 #include "osd.h"
@@ -87,6 +89,7 @@ struct dec_sysinfo {
 #define I2S_BLOCK       16              /* frames: the I2S driver's buffer layout, see audio_thread */
 #define BUFFER_LOW      (PTS_HZ / 2)    /* downloaded video ahead of the clock: hold the clock below */
 #define BUFFER_HIGH     (3 * PTS_HZ)    /* and let it run again from here */
+#define NET_CHUNK       (10 << 20)      /* bytes in one HTTP request, see struct chunked */
 #define SEEK_SHORT      10
 #define SEEK_LONG       60
 #define SYS             "/sys/class/"
@@ -1000,6 +1003,109 @@ static void handle_key(int code, int repeat)
     do_action(&e);
 }
 
+/* ---- network files ------------------------------------------------------------------------- */
+
+/* A file over HTTP read as a run of requests for NET_CHUNK bytes each, as yt-dlp does. YouTube
+ * sends one long request at about the video's own bit rate (1 MB/s for 1080p60: the buffer ran dry
+ * every few seconds), and a request for a range at the full line rate (7.5 MB/s on the box). */
+struct chunked {
+    char *url;
+    AVIOContext *cur;         /* the current request, NULL between requests */
+    int64_t pos;              /* the next byte to read */
+    int64_t end;              /* where the current request ends */
+    int64_t size;             /* the whole file, from the first response; -1 if unknown */
+};
+
+static int chunked_request(struct chunked *c)
+{
+    char off[24], end[24];
+    c->end = c->pos + NET_CHUNK;
+    if (c->size >= 0 && c->end > c->size)
+        c->end = c->size;
+    snprintf(off, sizeof off, "%" PRId64, c->pos);
+    snprintf(end, sizeof end, "%" PRId64, c->end);
+    AVDictionary *opts = NULL;
+    av_dict_set(&opts, "offset", off, 0);
+    av_dict_set(&opts, "end_offset", end, 0);   /* Range: bytes=offset-(end_offset - 1) */
+    AVIOInterruptCB icb = { interrupt_cb, NULL };
+    int r = avio_open2(&c->cur, c->url, AVIO_FLAG_READ, &icb, &opts);
+    av_dict_free(&opts);
+    if (r >= 0 && c->size < 0) {
+        c->size = avio_size(c->cur);   /* from Content-Range */
+        if (c->size >= 0 && c->end > c->size)
+            c->end = c->size;
+    }
+    return r;
+}
+
+static int chunked_read(void *opaque, uint8_t *buf, int len)
+{
+    struct chunked *c = opaque;
+    for (int tries = 0;; tries++) {
+        if (c->size >= 0 && c->pos >= c->size)
+            return AVERROR_EOF;
+        int r = 0;
+        if (!c->cur || c->pos >= c->end) {
+            avio_closep(&c->cur);
+            r = chunked_request(c);
+        }
+        if (r >= 0) {
+            r = avio_read_partial(c->cur, buf, FFMIN(len, c->end - c->pos));
+            if (r > 0) {
+                c->pos += r;
+                return r;
+            }
+            if (r == 0 || r == AVERROR_EOF) {
+                if (c->size < 0)
+                    return AVERROR_EOF;   /* no size to go by: the end of the file */
+                r = AVERROR(EIO);         /* the request ended early */
+            }
+        }
+        avio_closep(&c->cur);
+        /* again from here, as the reconnect option did for one long request */
+        if (r == AVERROR_EXIT || tries == 5)
+            return r;
+        logmsg("network read: %s, again", av_err2str(r));
+        av_usleep(500000 << FFMIN(tries, 3));
+    }
+}
+
+static int64_t chunked_seek(void *opaque, int64_t off, int whence)
+{
+    struct chunked *c = opaque;
+    if (whence & AVSEEK_SIZE)
+        return c->size;
+    whence &= ~AVSEEK_FORCE;
+    if (whence == SEEK_CUR)
+        off += c->pos;
+    else if (whence == SEEK_END && c->size >= 0)
+        off += c->size;
+    else if (whence != SEEK_SET)
+        return AVERROR(EINVAL);
+    if (off < 0)
+        return AVERROR(EINVAL);
+    if (off != c->pos) {
+        avio_closep(&c->cur);   /* the next read asks for a range from here */
+        c->pos = off;
+    }
+    return off;
+}
+
+/* The input's AVIOContext on chunked requests; the first one is made here, for the file size */
+static int chunked_open(AVFormatContext *fmt, const char *url)
+{
+    struct chunked *c = av_mallocz(sizeof *c);
+    c->url = av_strdup(url);
+    c->size = -1;
+    int r = chunked_request(c);
+    if (r < 0)
+        return r;
+    int bufsize = 64 * 1024;
+    fmt->pb = avio_alloc_context(av_malloc(bufsize), bufsize, 0, c, chunked_read, NULL, chunked_seek);
+    fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
+    return 0;
+}
+
 /* ---- setup --------------------------------------------------------------------------------- */
 
 static int open_input(struct input *in, const char *url)
@@ -1007,14 +1113,20 @@ static int open_input(struct input *in, const char *url)
     in->fmt = avformat_alloc_context();
     in->fmt->interrupt_callback = (AVIOInterruptCB){ interrupt_cb, NULL };
     AVDictionary *opts = NULL;
-    av_dict_set(&opts, "reconnect", "1", 0);
-    av_dict_set(&opts, "reconnect_streamed", "1", 0);
-    av_dict_set(&opts, "reconnect_delay_max", "5", 0);
+    int r = 0;
+    if (!P.live && (!strncmp(url, "http://", 7) || !strncmp(url, "https://", 8)))
+        r = chunked_open(in->fmt, url);
+    else {
+        av_dict_set(&opts, "reconnect", "1", 0);
+        av_dict_set(&opts, "reconnect_streamed", "1", 0);
+        av_dict_set(&opts, "reconnect_delay_max", "5", 0);
+    }
     if (P.live) {   /* zapping: two seconds of broadcast are enough to find the streams */
         av_dict_set(&opts, "analyzeduration", "2000000", 0);
         av_dict_set(&opts, "probesize", "2000000", 0);
     }
-    int r = avformat_open_input(&in->fmt, url, NULL, &opts);
+    if (r >= 0)
+        r = avformat_open_input(&in->fmt, url, NULL, &opts);
     av_dict_free(&opts);
     if (r < 0 || avformat_find_stream_info(in->fmt, NULL) < 0) {
         logmsg("%s: %s", url, av_err2str(r));
