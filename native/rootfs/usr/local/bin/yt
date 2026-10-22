@@ -8,7 +8,8 @@ hardware decoder (amplay, H.264 up to 1080p), or mpv in software if that fails.
 
   yt              search window
   yt QUERY        search window with results for QUERY
-  yt URL          play right away (what ozone-web hands over)
+  yt URL          play right away (what ozone-web hands over): YouTube, a media file, or any of
+                  yt-dlp's sites, with the browser's sign-in (its cookies) outside YouTube
 
 Window keys: type to search, arrows to move, Enter to play, Esc to close. Results load further
 when scrolled to the end. After a video the window comes back where it was. The quality and frame
@@ -18,8 +19,10 @@ lower them when the connection can't keep up.
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -97,6 +100,34 @@ def play_file(url, title=''):
         subprocess.call(['mpv', '--force-window=immediate', url])
 
 
+BROWSER_COOKIES = os.path.expanduser('~/.local/share/ozone-web/cookies.sqlite')
+YOUTUBE_HOST = re.compile(r'(^|\.)(youtube\.com|youtube-nocookie\.com|youtu\.be)$')
+
+
+def browser_cookies(url):
+    """ozone-web's cookies as a cookies.txt for yt-dlp, so that sites signed in to in the browser give
+    their videos (Vimeo, social networks). Not for YouTube: it plays without, and signed in yt-dlp
+    switches to another YouTube client. The file (mode 600, in the runtime directory) is the
+    caller's to remove; None without cookies."""
+    if YOUTUBE_HOST.search(urllib.parse.urlsplit(url).hostname or '') or not os.path.exists(BROWSER_COOKIES):
+        return None
+    try:
+        db = sqlite3.connect('file:%s?mode=ro' % BROWSER_COOKIES, uri=True, timeout=2)
+        rows = db.execute('SELECT host, path, isSecure, isHttpOnly, expiry, name, value FROM moz_cookies').fetchall()
+        db.close()
+    except sqlite3.Error:
+        return None
+    if not rows:
+        return None
+    fd, path = tempfile.mkstemp(prefix='yt-cookies-', suffix='.txt', dir=os.environ.get('XDG_RUNTIME_DIR'))
+    with os.fdopen(fd, 'w') as f:
+        f.write('# Netscape HTTP Cookie File\n')
+        for host, cpath, secure, httponly, expiry, name, value in rows:
+            f.write('\t'.join((('#HttpOnly_' if httponly else '') + host, 'TRUE' if host.startswith('.') else 'FALSE',
+                                cpath or '/', 'TRUE' if secure else 'FALSE', str(expiry or 0), name, value)) + '\n')
+    return path
+
+
 def play(url, title='', started=None):
     """Blocks until the video is over; started() is called when the picture is about to appear"""
     if MEDIA_FILE.search(urllib.parse.urlsplit(url).path):
@@ -105,9 +136,18 @@ def play(url, title='', started=None):
         return play_file(url, title)
     s = load_settings()
     notify('Loading video (up to %dp%s)…' % (s['height'], s['fps'] if s['fps'] > 30 else ''))
-    r = subprocess.run(ytdlp() + ['--print', 'title', '--print', '%(height)s %(fps)s', '-g',
-                                  '-f', video_format(s['height'], s['fps']), url],
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    cookies = browser_cookies(url)
+    try:
+        r = subprocess.run(ytdlp() + (['--cookies', cookies] if cookies else []) +
+                           # one video, as the output below is read as one video's lines: a watch URL
+                           # in a playlist is its video, a page with several videos its first one
+                           ['--no-playlist', '--playlist-items', '1',
+                            '--print', 'title', '--print', '%(height)s %(fps)s', '-g',
+                            '-f', video_format(s['height'], s['fps']), url],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    finally:
+        if cookies:
+            os.remove(cookies)
     out = r.stdout.split('\n')
     video = out[2] if len(out) > 2 else ''
     audio = out[3] if len(out) > 3 else ''

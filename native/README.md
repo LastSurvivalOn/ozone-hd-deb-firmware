@@ -195,7 +195,9 @@ shadows and filters, unfixing sticky headers: no gain). So:
 - no HTML5 media: YouTube watch pages (also the in-app navigation) go to `yt`/amplay, YouTube
   search to `yt`; elsewhere the play button (F7) gives `yt` a source of the page's `<video>` (a
   media file goes straight to amplay: ~2 s), an embedded player (`<iframe>` of YouTube, Vimeo,
-  Dailymotion, any `/embed/`), or the page itself for yt-dlp (~10-15 s on this CPU);
+  Dailymotion, any `/embed/`), or the page itself for yt-dlp (~10-15 s on this CPU), with
+  ozone-web's cookies for sites that need signing in (`cookies.sqlite` to a temporary cookies.txt,
+  mode 600, removed after; never for YouTube, where yt-dlp signed in changes client);
 - `WEBKIT_DISABLE_DMABUF_RENDERER`/`WEBKIT_DISABLE_COMPOSITING_MODE`, no smooth scrolling, WebGL,
   WebAudio; 350 MB memory limit per web process; zram swap (384 MB) from `ozone-hw`;
 - the CPU governor is `interactive` with all four cores (`ozone-hw`): the stock `hotplug` keeps one

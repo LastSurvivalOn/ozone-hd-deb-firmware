@@ -114,8 +114,8 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
 - [x] **Medium**: video in web pages, on the hardware decoder: the play button (F7) hands the
   page's video to `yt` (a `<video>` source, an embedded player, or yt-dlp on the page). WebKit's
   own media stays off: no GStreamer H.264 decoder here, and software decoding can't keep up.
-- [ ] **Medium**: videos of sites that need signing in (Vimeo, social networks): yt-dlp could get
-  ozone-web's cookies (its cookies.sqlite, converted to a cookies.txt).
+- [x] **Medium**: videos of sites that need signing in (Vimeo, social networks): `yt` gives yt-dlp
+  ozone-web's cookies (not for YouTube).
 - [ ] **Hard / not planned**: Android apps (Google Play, APKs) in Linux. Rebooting into Android
   is the way.
 

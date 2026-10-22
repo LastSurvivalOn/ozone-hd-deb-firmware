@@ -327,8 +327,8 @@ and then:
 
 **Video in the browser isn't played by the browser itself:** a YouTube link opens in the YouTube
 window (section 4) through the hardware decoder, and other videos open in the video player with
-the play button (F7). Some sites (Vimeo, for one) only give their videos to signed-in users, and
-those don't play.
+the play button (F7). Some sites (Vimeo, social networks) only give their videos to signed-in
+users: sign in to the site in the browser first, and the player gets the browser's sign-in.
 
 ## 8. Sound
 
