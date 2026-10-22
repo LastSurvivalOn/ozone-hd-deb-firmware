@@ -1,0 +1,48 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          ozone-android
+# Required-Start:    $local_fs
+# Required-Stop:
+# Default-Start:     S
+# Default-Stop:
+# Short-Description: The Android files native Linux runs, on /system
+# Description:       dtvfe (the TV frontend) and remotecfg (the IR remote) are Android (bionic)
+#                    programs. Their files, copied out of the stock system partition into
+#                    /usr/local/lib/ozone/android by install-android-files.sh, go on /system,
+#                    where Android's linker looks for them; Android itself is not needed.
+### END INIT INFO
+
+# Under Android, /system is Android's own
+/etc/ozone/is-native || exit 0
+
+A=/usr/local/lib/ozone/android
+
+case "$1" in
+start)
+    mkdir -p /system
+    if ! mountpoint -q /system; then
+        if [ -x $A/bin/linker ]; then
+            mount --bind $A /system && mount -o remount,ro,bind /system
+        else
+            # not copied yet (install-android-files.sh): the stock partition, while it is there
+            mount -o ro /dev/system /system
+        fi
+    fi
+
+    # bionic dereferences NULL at start-up without a property area: an empty one in the KitKat
+    # format (bytes_used = one root trie node, serial, magic "PROP", version 0xfc6ed0ab), 128 KB
+    if [ ! -s /dev/__properties__ ]; then
+        { printf '\024\000\000\000\000\000\000\000PROP\253\320\156\374'; head -c 131056 /dev/zero; } > /dev/__properties__
+        chmod 444 /dev/__properties__
+    fi
+    ;;
+stop|restart|force-reload)
+    ;;
+status)
+    mountpoint -q /system
+    ;;
+*)
+    echo "usage: $0 start" >&2
+    exit 3
+    ;;
+esac

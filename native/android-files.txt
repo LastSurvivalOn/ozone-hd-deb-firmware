@@ -1,0 +1,73 @@
+# The files of the stock Android system partition that native Debian still runs. They are copied
+# into /usr/local/lib/ozone/android (laid out as /system) by install-android-files.sh, and
+# /etc/init.d/ozone-android mounts that on /system, where Android's linker looks for them.
+# Found with strace (trace=file) on dtvfe tuning a channel and on remotecfg loading the remote's
+# keys; the TV libraries pull in most of Android's native libraries through libamplayer.so.
+
+# Android's linker (bionic's libdl is built into it)
+/system/bin/linker
+# remotecfg: teaches the kernel's IR decoder the remote's protocol and keys (ozone-input)
+/system/bin/remotecfg
+# Android's version, for System info
+/system/build.prop
+# dtvfe: the TV app's frontend libraries and everything they link
+/system/lib/libEGL.so
+/system/lib/libETC1.so
+/system/lib/libGLES_trace.so
+/system/lib/libGLESv1_CM.so
+/system/lib/libGLESv2.so
+/system/lib/libLLVM.so
+/system/lib/libRS.so
+/system/lib/libRScpp.so
+/system/lib/libamavutils.so
+/system/lib/libamplayer.so
+/system/lib/libandroid_runtime.so
+/system/lib/libandroidfw.so
+/system/lib/libaudioutils.so
+/system/lib/libbcc.so
+/system/lib/libbcinfo.so
+/system/lib/libbinder.so
+/system/lib/libc.so
+/system/lib/libcamera_client.so
+/system/lib/libcamera_metadata.so
+/system/lib/libcorkscrew.so
+/system/lib/libcrypto.so
+/system/lib/libcutils.so
+/system/lib/libexpat.so
+/system/lib/libft2.so
+/system/lib/libgabi++.so
+/system/lib/libgccdemangle.so
+/system/lib/libgui.so
+/system/lib/libhardware.so
+/system/lib/libhardware_legacy.so
+/system/lib/libharfbuzz_ng.so
+/system/lib/libhwui.so
+/system/lib/libicui18n.so
+/system/lib/libicuuc.so
+/system/lib/libinput.so
+/system/lib/libjpeg.so
+/system/lib/liblog.so
+/system/lib/libm.so
+/system/lib/libmedia.so
+/system/lib/libmemtrack.so
+/system/lib/libnativehelper.so
+/system/lib/libnetutils.so
+/system/lib/libpng.so
+/system/lib/libselinux.so
+/system/lib/libskia.so
+/system/lib/libsonivox.so
+/system/lib/libspeexresampler.so
+/system/lib/libsqlite.so
+/system/lib/libssl.so
+/system/lib/libstagefright_foundation.so
+/system/lib/libstdc++.so
+/system/lib/libstlport.so
+/system/lib/libsync.so
+/system/lib/libsystemwriteservice.so
+/system/lib/libth_dtv_external_c.so
+/system/lib/libth_dtv_pi.so
+/system/lib/libui.so
+/system/lib/libusbhost.so
+/system/lib/libutils.so
+/system/lib/libwpa_client.so
+/system/lib/libz.so

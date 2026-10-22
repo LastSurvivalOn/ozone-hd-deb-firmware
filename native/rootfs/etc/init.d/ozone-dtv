@@ -1,13 +1,14 @@
 #!/bin/sh
 ### BEGIN INIT INFO
 # Provides:          ozone-dtv
-# Required-Start:    ozone-hw
+# Required-Start:    ozone-hw ozone-android
 # Required-Stop:
 # Default-Start:     S
 # Default-Stop:
 # Short-Description: Android environment for the DVB-T2 frontend libraries
-# Description:       dtvfe runs the TV app's own frontend libraries (bionic) from the Android
-#                    system partition; this gives them what Android's init would have.
+# Description:       dtvfe runs the TV app's own frontend libraries (bionic), which
+#                    ozone-android puts on /system; this gives them the rest of what
+#                    Android's init would have.
 ### END INIT INFO
 
 # Under Android, Android does all of this itself
@@ -15,17 +16,6 @@
 
 case "$1" in
 start)
-    # The libraries and Android's linker, read-only
-    mkdir -p /system
-    mountpoint -q /system || mount -o ro /dev/system /system
-
-    # bionic dereferences NULL at start-up without a property area: an empty one in the KitKat
-    # format (bytes_used = one root trie node, serial, magic "PROP", version 0xfc6ed0ab), 128 KB
-    if [ ! -s /dev/__properties__ ]; then
-        { printf '\024\000\000\000\000\000\000\000PROP\253\320\156\374'; head -c 131056 /dev/zero; } > /dev/__properties__
-        chmod 444 /dev/__properties__
-    fi
-
     # Android's kernel logger, so the libraries' messages can be read (ozone-tv log, the session
     # logs). It shows a reader other uids' entries only if the reader is in the node's group.
     mkdir -p /dev/log

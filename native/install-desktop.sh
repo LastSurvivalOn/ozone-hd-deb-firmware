@@ -58,4 +58,7 @@ ssh_box 'set -e
     # ozone-web opens links from other programs
     sudo update-alternatives --install /usr/bin/x-www-browser x-www-browser /usr/local/bin/ozone-web 60 > /dev/null
     fc-list : family | grep -i -E "jetbrains|fontawesome" | sort -u'
+
+# remotecfg for the IR remote (and the TV's libraries): copies in Debian, not Android's partition
+"$HERE/install-android-files.sh" "$IP"
 echo ">> done; start without rebooting: sudo telinit q"

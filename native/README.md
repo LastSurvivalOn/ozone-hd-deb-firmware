@@ -80,6 +80,21 @@ reconnects it when the cable goes, unless WiFi was off from the WiFi window alre
 removes wlan0's address on any disconnect: on the same subnet as the cable, its route took the
 replies to what came in over the cable. Logs: `/var/log/wpa_supplicant.log`, `/var/log/netwatch.log`.
 
+## Android files
+
+Two things in native Linux are Android (bionic) programs: `remotecfg`, which teaches the kernel's
+IR decoder the remote's keys (`ozone-input`), and `dtvfe`, which runs the TV app's frontend
+libraries. `android-files.txt` lists what they use, found with strace: Android's linker,
+`remotecfg`, `build.prop` (for System info) and 60 libraries, 29 MB, as the TV libraries pull in
+most of Android's native ones through `libamplayer.so`.
+
+`./install-android-files.sh <ip> [system.img]` (run by `install-desktop.sh`) takes them out of the
+backup of the stock system partition with debugfs, no root needed, into
+`/usr/local/lib/ozone/android` on the box, and `/etc/init.d/ozone-android` bind-mounts that on
+`/system` at boot, where Android's linker looks. Native Linux then reads nothing of Android's
+partitions but `data`, which holds `debian.img`. If the copy is missing, `ozone-android` mounts the
+NAND partition as before.
+
 ## Television (DVB-T/T2)
 
 `./install-tv.sh <ip>` (needs the Android NDK here, `~/Android/Sdk/ndk/*`). Super+T or the TV button
@@ -105,9 +120,11 @@ reused as they are:
   hash, no packed relocations). It `dlopen`s the libraries from `/system/lib` and calls
   `External_Init`, `PI_System_Start`, `PI_Tuner_Init`, then `PI_Tuner_DVB_T_StartLock` /
   `CheckSignalStatus` (interfaces taken from the disassembly), answering `tune`/`status` on stdin.
-- `/etc/init.d/ozone-dtv` gives it what Android's init would: `/system` mounted read-only, an
-  empty KitKat property area at `/dev/__properties__` (bionic crashes without one), the kernel
-  logger nodes in `/dev/log`, and the Android names of the DVB nodes (`/dev/dvb0.demux0`...).
+- `/etc/init.d/ozone-android` puts the Android files on `/system`, read-only, and makes an empty
+  KitKat property area at `/dev/__properties__` (bionic crashes without one). The files are copies
+  in Debian, not the NAND partition: see "Android files" above.
+- `/etc/init.d/ozone-dtv` gives it the rest of what Android's init would: the kernel logger nodes
+  in `/dev/log`, and the Android names of the DVB nodes (`/dev/dvb0.demux0`...).
 - `ozone-tv` reads PAT/SDT/NIT/PMT through demux section filters (names usually ISO 8859-5, LCN from
   NIT), then for watching sets TS-tap PES filters on the service's PIDs and pipes `dvr0` into
   `amplay --live --program <sid>`.

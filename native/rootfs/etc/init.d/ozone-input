@@ -17,7 +17,7 @@ PIDFILE=/run/ozone-input.pid
 case "$1" in
 start)
     # The IR remote: its decoder in the kernel knows neither the protocol nor the keys until
-    # Android's remotecfg loads them (/system is mounted by ozone-dtv, in rcS)
+    # Android's remotecfg loads them (on /system from ozone-android, in rcS)
     [ -x /system/bin/remotecfg ] && /system/bin/remotecfg /etc/ozone/remote.conf > /var/log/remotecfg.log 2>&1
     # every key goes through it, so it must not wait behind a busy browser
     start-stop-daemon --start --quiet --background --make-pidfile --pidfile $PIDFILE --nicelevel -10 \

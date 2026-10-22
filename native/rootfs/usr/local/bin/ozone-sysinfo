@@ -324,12 +324,14 @@ HOW = [
     ('Hardware, the Android way', [
         'Android\'s own pieces drive the hardware where Linux has no driver: its WiFi module, its tool that '
         'teaches the kernel the remote\'s buttons, and its TV libraries, which tune the DVB-T2 receiver '
-        'through a small bridge program (dtvfe). Video plays on the chip\'s hardware decoder (amplay), '
-        'so 1080p costs little CPU.']),
+        'through a small bridge program (dtvfe). Copies of them live inside Debian, so Linux no longer '
+        'reads anything of Android\'s. Video plays on the chip\'s hardware decoder (amplay), so 1080p '
+        'costs little CPU.']),
     ('What is unusual', [
         'There is no systemd and no udev: small scripts of ours set up devices, input, drives and power. '
-        'There is no GPU graphics either: the desktop is drawn by the CPU into a 16-bit framebuffer, '
-        '1280×720, which the display hardware scales to the TV. Sound reaches the TV over HDMI.']),
+        'The desktop is a 16-bit framebuffer, 1280×720, which the display hardware scales to the TV. '
+        'Its GPU (Mali-450) draws games, mpv\'s video and programs started with ozone-gl, through '
+        'kernel modules and a driver of our own. Sound reaches the TV over HDMI.']),
     ('Power', [
         'Sleep turns the screen off and wakes on any key. Power off puts the chip into deep sleep (the '
         'light turns red); waking from it is a fresh start, so the filesystems are closed first. The box '
@@ -426,8 +428,12 @@ def bar(label, used, total, extra='', left='free'):
 
 def storage():
     rows = []
+    # /system is the NAND partition only before install-android-files.sh; after it, a copy in debian.img
+    nand_system = any(l.split()[:2] == ['/dev/system', '/system'] for l in read('/proc/mounts').splitlines())
     for path, label, what in (('/', 'Linux (debian.img)', ''), ('/mnt/nand', 'Data partition', ''),
                               ('/system', 'Android system', ' (read-only)')):
+        if path == '/system' and not nand_system:
+            continue
         d = df(path)
         if d:
             rows.append(bar(label, d[1], d[0], what))
