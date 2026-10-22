@@ -1,13 +1,12 @@
 #!/bin/bash
 # Installs the desktop (bspwm + polybar, Catppuccin) into an already prepared Debian.
 # Packages are installed separately (see README); this installs configs, scripts, yt-dlp and X autostart.
-# Usage: ./install-desktop.sh <box ip>
+# Usage: ./install-desktop.sh [box ip]
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-IP=${1:?specify the box IP}
-KEY=$HOME/.ssh/id_ed25519_ozone
-ssh_box() { ssh -i $KEY -o ConnectTimeout=10 <USER>@$IP "$@"; }
+. "$HERE/../config.sh"
+IP=$(box_ip "${1:-}")
 
 echo ">> system files"
 tar -C "$HERE/rootfs" -czf - \

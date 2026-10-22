@@ -4,14 +4,13 @@
 # into /usr/local/lib/ozone/android on the box, and installs ozone-android, which mounts them on
 # /system at boot. The box's own system partition is no longer read, so Android can go.
 # Needs debugfs (e2fsprogs) here; no root.
-# Usage: ./install-android-files.sh <box ip> [system.img]
+# Usage: ./install-android-files.sh [box ip] [system.img]
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-IP=${1:?specify the box IP}
+. "$HERE/../config.sh"
+IP=$(box_ip "${1:-}")
 IMG=${2:-$HOME/ozone_backup/backup/system.img}
-KEY=$HOME/.ssh/id_ed25519_ozone
-ssh_box() { ssh -i $KEY -o ConnectTimeout=10 <USER>@$IP "$@"; }
 
 [ -s "$IMG" ] || { echo "no $IMG: the stock system partition's backup (see ../CLAUDE.md)" >&2; exit 1; }
 

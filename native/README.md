@@ -10,7 +10,9 @@ recovery partition  → stock Android boot.img (T2, SmartTube)
 
 - Linux → Android: `reboot-android` or the power menu on the panel.
 - Android → Linux: any normal reboot or power cycle.
-- Login: `ssh -i ~/.ssh/id_ed25519_ozone <USER>@<BOX_IP>`
+- Login: `ssh -i ~/.ssh/id_ed25519_ozone <USER>@<BOX_IP>`. The scripts here take the box's
+  address, user and key from `../.env` (a copy of `../.env.example`), or the IP as their first
+  argument.
 
 ## Building and installing
 

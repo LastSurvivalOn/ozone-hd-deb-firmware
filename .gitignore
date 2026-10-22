@@ -1,3 +1,6 @@
+# This computer's and box's settings (see .env.example)
+.env
+
 # Partition dumps of the box (1+ GB, device-specific)
 ozone_backup/
 *.img

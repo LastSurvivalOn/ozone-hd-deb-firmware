@@ -10,7 +10,10 @@ ssh -i ~/.ssh/id_ed25519_ozone <USER>@<BOX_IP>   # passwordless sudo
 adb connect <BOX_IP>:5555                        # Android; the firmware enables network adb by itself
 ```
 
-The IP comes from the router. It's worth reserving <BOX_IP> for the box in the router's DHCP settings.
+The IP comes from the router. It's worth reserving one for the box in the router's DHCP settings.
+The scripts take the box's address, user and key from `.env` in the repository's root: copy
+`.env.example` to `.env` and fill it in (git ignores it). A box IP given to a script as its first
+argument wins over it.
 
 ## Scripts (run from the laptop)
 

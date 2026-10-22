@@ -5,14 +5,12 @@
 # - the Mali X driver (gpu/ddx), built on the box.
 # The desktop picks the Mali X driver on its next start; programs use the GPU through ozone-gl,
 # and mpv does by itself.
-# Usage: ./install-gpu.sh <box ip>
+# Usage: ./install-gpu.sh [box ip]
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-IP=${1:?specify the box IP}
-KEY=$HOME/.ssh/id_ed25519_ozone
-# the same host key on Ethernet (.200) and WiFi
-ssh_box() { ssh -i $KEY -o ConnectTimeout=10 -o HostKeyAlias=<BOX_IP> <USER>@$IP "$@"; }
+. "$HERE/../config.sh"
+IP=$(box_ip "${1:-}")
 
 LIBS_REV=31d5c21180f4d2f160332c7018ec91f8e43ca8bf   # github.com/mdrjr/c1_mali_libs: r5p0, vsync
 CACHE=$HERE/cache/gpu

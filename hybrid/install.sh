@@ -6,8 +6,9 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 CACHE=$HERE/cache
 SIZE=${1:-2G}
-USER_NAME=$(id -un)
-KEY=$HOME/.ssh/id_ed25519_ozone
+. "$HERE/../config.sh"
+USER_NAME=$BOX_USER
+KEY=$SSH_KEY
 TMP=/data/local/tmp/ozinst
 
 fetch_rootfs() {

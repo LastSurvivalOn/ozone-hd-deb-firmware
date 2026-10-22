@@ -1,14 +1,12 @@
 #!/bin/bash
 # Installs games on the GPU (needs install-gpu.sh): RetroArch with the NES, Game Boy (Color)
 # and GBA cores, and glmark2 to measure the GPU. Games go in ~/Games (or on a USB drive).
-# Usage: ./install-games.sh <box ip>
+# Usage: ./install-games.sh [box ip]
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-IP=${1:?specify the box IP}
-KEY=$HOME/.ssh/id_ed25519_ozone
-# the same host key on Ethernet (.200) and WiFi
-ssh_box() { ssh -i $KEY -o ConnectTimeout=10 -o HostKeyAlias=<BOX_IP> <USER>@$IP "$@"; }
+. "$HERE/../config.sh"
+IP=$(box_ip "${1:-}")
 
 echo ">> files"
 tar -C "$HERE/rootfs" -czf - usr/local/bin/retroarch etc/ozone/retroarch.cfg etc/ozone/retroarch-user.cfg |

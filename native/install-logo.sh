@@ -1,17 +1,16 @@
 #!/bin/bash
 # Replaces the boot picture: u-boot shows it at power-on (the logo partition, in both boot modes),
 # and native Linux takes it over on fb0 and makes it pulse until X starts (/usr/local/lib/ozone/splash).
-# Usage: ./install-logo.sh <box ip> [1920x1080 png]    (default: logo/bootup.png)
+# Usage: ./install-logo.sh [box ip] [1920x1080 png]    (default: logo/bootup.png)
 #        ./install-logo.sh <box ip> --stock            (puts the stock partition back, no splash)
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-IP=${1:?specify the box IP}
+. "$HERE/../config.sh"
+IP=$(box_ip "${1:-}")
 PNG=${2:-$HERE/logo/bootup.png}
 STOCK=$HOME/ozone_backup/backup/logo.img
-KEY=$HOME/.ssh/id_ed25519_ozone
 SPLASH=/usr/share/ozone/splash.rgb565
-ssh_box() { ssh -i $KEY -o ConnectTimeout=10 <USER>@$IP "$@"; }
 
 [ -f "$STOCK" ] || { echo "missing $STOCK (backup of the logo partition)"; exit 1; }
 mkdir -p "$HERE/out"

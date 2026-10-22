@@ -2,13 +2,12 @@
 # Installs DVB-T/T2 television for native Linux: dtvfe (built here with the Android NDK), the
 # ozone-dtv init script that gives it an Android environment, and ozone-tv (scanner and player).
 # Needs amplay and the Android files (install-desktop.sh, install-android-files.sh).
-# Usage: ./install-tv.sh <box ip> [ndk dir]
+# Usage: ./install-tv.sh [box ip] [ndk dir]
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-IP=${1:?specify the box IP}
-KEY=$HOME/.ssh/id_ed25519_ozone
-ssh_box() { ssh -i $KEY -o ConnectTimeout=10 <USER>@$IP "$@"; }
+. "$HERE/../config.sh"
+IP=$(box_ip "${1:-}")
 
 echo ">> dtvfe (Android/bionic, NDK)"
 "$HERE/dtv/build.sh" ${2:+"$2"} > /dev/null

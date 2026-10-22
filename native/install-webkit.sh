@@ -4,13 +4,12 @@
 # (OZONE_WEB_GPU=1) uses it, through LD_LIBRARY_PATH, with its frames as X pixmaps
 # (WEBKIT_X11_PIXMAP_RENDERER). OZONE_WEB_OWN_WEBKIT=0 or removing the directory goes back to
 # Debian's. Rebuild after every webkit2gtk security update: it is a copy of a fixed version.
-# Usage: ./install-webkit.sh <box ip>
+# Usage: ./install-webkit.sh [box ip]
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-IP=${1:?specify the box IP}
-KEY=$HOME/.ssh/id_ed25519_ozone
-ssh_box() { ssh -i $KEY -o ConnectTimeout=10 <USER>@$IP "$@"; }
+. "$HERE/../config.sh"
+IP=$(box_ip "${1:-}")
 PREFIX=/usr/local/lib/ozone-webkit
 STAGE=$HERE/cache/webkit/install$PREFIX
 

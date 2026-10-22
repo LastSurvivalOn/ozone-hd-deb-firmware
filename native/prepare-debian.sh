@@ -2,17 +2,16 @@
 # Prepares the already installed Debian (/data/linux/debian.img) to boot on its own:
 # sysvinit, network, time, kernel modules from Android, hardware setup.
 # Chroot mode under Android keeps working as before.
-# Usage: ./prepare-debian.sh <box ip>
+# Usage: ./prepare-debian.sh [box ip]
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-IP=${1:?specify the box IP}
-KEY=$HOME/.ssh/id_ed25519_ozone
+. "$HERE/../config.sh"
+IP=$(box_ip "${1:-}")
 ROOT=/data/linux/root
 KVER=3.10.33
 STOCK=${STOCK:-$HOME/ozone_backup/backup/boot.img}
 
-ssh_box() { ssh -i $KEY -o ConnectTimeout=10 <USER>@$IP "$@"; }
 adb_root() { adb -s $IP:5555 shell "su -c '$*'" | tr -d '\r'; }
 
 echo ">> kernel modules"
@@ -33,7 +32,7 @@ ssh_box 'sudo mkdir -p /usr/local/lib/ozone && for s in halt reboot; do
     sudo dpkg-divert --local --rename --divert /usr/local/lib/ozone/$s.distrib --add /etc/init.d/$s >/dev/null
 done'
 tar -C "$HERE/rootfs" -czf - . | ssh_box 'sudo tar -C / --no-same-owner -xzf - && sudo chown -R root:root /etc/init.d/ozone-hw /etc/ozone /etc/network/interfaces /etc/fstab'
-scp -q -i $KEY "$HERE/../hybrid/box/rc" <USER>@$IP:/tmp/ozone-rc
+scp_box "$HERE/../hybrid/box/rc" "$BOX_USER@$IP:/tmp/ozone-rc"
 ssh_box 'sudo install -m 755 /tmp/ozone-rc /etc/ozone/rc && rm /tmp/ozone-rc && sudo chmod 755 /etc/init.d/ozone-hw /etc/ozone/is-native'
 
 echo ">> packages"
