@@ -8,7 +8,8 @@ What was measured on the box, and what follows from it:
 - WebKit renders through EGL by default, which on fbdev means Mesa in software: 2.7 fps scrolling
   a plain page. WEBKIT_DISABLE_DMABUF_RENDERER + WEBKIT_DISABLE_COMPOSITING_MODE: 45 fps, 60 MB
   less. Composited mode with CPU or llvmpipe raster gained nothing on real pages.
-- OZONE_WEB_GPU=1, with the GPU on the desktop (native/gpu), runs it through ozone-gl in
+- On the GPU (OZONE_WEB_GPU=1; the default with our own WebKit installed, OZONE_WEB_GPU=0 turns
+  it off), with the GPU on the desktop (native/gpu), it runs through ozone-gl in
   composited mode on the Mali-450, its frames coming back through cached X pixmaps
   (native/gpu/egl-fix). CSS animations: 24 frames a second instead of 3; smooth scrolling
   Wikipedia 9.7 instead of 6.5. But every frame then crosses to X whole, through shared memory
@@ -80,11 +81,14 @@ if __name__ == '__main__' and sys.argv[1:2] not in (['--update-filters'], ['--ba
     if forward([to_uri(a) for a in sys.argv[1:]]):
         sys.exit(0)
 
-GPU = os.path.exists('/run/ozone-gpu-desktop') and os.environ.get('OZONE_WEB_GPU') == '1'
-# our WebKit (install-webkit.sh), which hands frames to X as pixmaps; OZONE_WEB_OWN_WEBKIT=0: Debian's
+# The GPU, when the desktop has it, with our WebKit (install-webkit.sh), which hands frames to X as
+# pixmaps: the default once that is installed. OZONE_WEB_GPU=0: the CPU path; OZONE_WEB_GPU=1 also
+# with Debian's WebKit; OZONE_WEB_OWN_WEBKIT=0: Debian's WebKit on the GPU.
 OWN_WEBKIT = '/usr/local/lib/ozone-webkit/lib'
-OWN = (GPU and os.environ.get('OZONE_WEB_OWN_WEBKIT', '1') == '1'
-       and os.path.exists(OWN_WEBKIT + '/libwebkit2gtk-4.1.so.0'))
+HAVE_OWN = os.path.exists(OWN_WEBKIT + '/libwebkit2gtk-4.1.so.0')
+GPU = (os.path.exists('/run/ozone-gpu-desktop')
+       and os.environ.get('OZONE_WEB_GPU', '1' if HAVE_OWN else '0') == '1')
+OWN = GPU and HAVE_OWN and os.environ.get('OZONE_WEB_OWN_WEBKIT', '1') == '1'
 if GPU:
     paths = [p for p in os.environ.get('LD_LIBRARY_PATH', '').split(':') if p]
     if '/usr/local/lib/mali' not in paths or (OWN and OWN_WEBKIT not in paths):

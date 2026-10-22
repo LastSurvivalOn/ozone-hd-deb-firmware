@@ -239,10 +239,13 @@ The Mali-450 MP4 draws OpenGL ES 2.0 under X: `./install-gpu.sh`, details in
 | glmark2-es2 | 81 |
 | a 3x3 blur, 720p RGBA, GPU round trip | 27 ms against 180 on the CPU |
 
-The browser can render on it: `OZONE_WEB_GPU=1 ozone-web`, through the shims in
-[gpu/egl-fix](gpu/egl-fix). CSS animations run 8 times faster. But every frame then crosses to X
-whole, about 25 a second at most, so plain wheel scrolling gains nothing (and memory goes down by
-~45 MB). That is why it's off by default.
+The browser renders on it with our own WebKit (`./install-webkit.sh <ip>`, built by
+[webkit/build.sh](webkit/build.sh)), which hands its frames to X as pixmaps: then by default, and
+`OZONE_WEB_GPU=0 ozone-web` goes back to the CPU. Wheel scrolling Wikipedia runs at 25 frames a
+second instead of 12, CSS animations several times faster; a static page scrolls a little slower
+(29 against 32), and it takes ~50 MB more memory (GPU buffers). Without our WebKit, `OZONE_WEB_GPU=1` uses
+Debian's through the shims in [gpu/egl-fix](gpu/egl-fix), slower (21 frames a second scrolling).
+See [gpu/README.md](gpu/README.md#a-webkit-of-our-own-in-progress).
 
 ## Video
 
