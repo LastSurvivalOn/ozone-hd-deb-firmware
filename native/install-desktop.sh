@@ -25,7 +25,9 @@ echo ">> user files"
 tar -C "$HERE/dotfiles" -czf - . | ssh_box 'tar -C ~ -xzf - && chmod +x ~/.xinitrc ~/.config/bspwm/bspwmrc ~/.config/polybar/launch.sh'
 
 echo ">> amplay (video through the hardware decoder), built on the box"
-tar -C "$HERE/amplay" -czf - amplay.c osd.c osd.h Makefile |
+# libzvbi decodes TV teletext (its runtime comes with FFmpeg already)
+ssh_box 'sudo apt-get install -y -qq --no-install-recommends libzvbi-dev > /dev/null'
+tar -C "$HERE/amplay" -czf - amplay.c osd.c osd.h ttx.c ttx.h Makefile |
     ssh_box 'set -e; d=$(mktemp -d); tar -C $d -xzf -; make -s -C $d; sudo make -s -C $d install; rm -r $d'
 
 echo ">> yt-dlp (latest release: the Debian version stopped working with YouTube long ago)"

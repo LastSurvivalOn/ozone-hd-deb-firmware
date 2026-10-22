@@ -7,8 +7,10 @@
  * about once a second while they are visible, and nothing while they are hidden; the video itself
  * never passes through the CPU.
  *
- * Live TV adds a channel list on the left (Enter, or a click on "Channels" in the bottom bar): the
- * arrows move in it, Enter switches, Esc or Left closes it.
+ * The TV player adds a channel list on the left (Enter, or a click on "Channels" in the bottom
+ * bar): the arrows move in it, Enter switches, Esc or Left closes it. Also an info panel on the
+ * right (info), a message box in the middle (no signal, the PIN prompt...), the radio screen, and
+ * pictures drawn straight on the screen window: subtitles and teletext pages.
  *
  * Text is anti-aliased only over the opaque bars: an edge blended with the key color would no
  * longer match it. The hardware scaler (1280x720 desktop to 1080p) blends edges anyway, around the
@@ -41,6 +43,8 @@
 #define ROW_H       54
 #define LIST_AFTER  15000       /* ms without input before the list closes too */
 #define DIGITS_AFTER 1500       /* ms after the last digit of a channel number before switching */
+#define INFO_W      560         /* the info panel */
+#define MSG_H       150
 
 /* Font Awesome 4 */
 #define ICON_PLAY   "\xef\x81\x8b"   /* f04b */
@@ -52,36 +56,53 @@
 #define ICON_CLOSE  "\xef\x80\x8d"   /* f00d */
 #define ICON_PREV   "\xef\x81\x88"   /* f048 */
 #define ICON_NEXT   "\xef\x81\x91"   /* f051 */
+#define ICON_MUSIC  "\xef\x80\x81"   /* f001 */
+#define ICON_LOCK   "\xef\x80\xa3"   /* f023 */
 #define CHANNELS_HINT "Enter: channels"   /* in the bottom bar when there is a list */
 
-enum { C_KEY, C_BG, C_TRACK, C_FILL, C_TEXT, C_SUB, NCOLORS };
-static const char *COLOR_NAMES[NCOLORS] = { KEY_COLOR, "#11111b", "#45475a", "#cba6f7", "#cdd6f4", "#a6adc8" };
+enum { C_KEY, C_BG, C_TRACK, C_FILL, C_TEXT, C_SUB, C_RED, C_GREEN, C_YELLOW, NCOLORS };
+static const char *COLOR_NAMES[NCOLORS] = { KEY_COLOR, "#11111b", "#45475a", "#cba6f7", "#cdd6f4", "#a6adc8",
+                                            "#f38ba8", "#a6e3a1", "#f9e2af" };
 
 /* clickable areas in the bottom bar: x from, x to */
 enum { HIT_BACK, HIT_PLAY, HIT_FWD, HIT_VOL, NHITS };
 
 static struct {
     Display *dpy;
-    int scr, w, h;
-    Window win, top, bar, list;
-    Pixmap top_pm, bar_pm, list_pm;
-    XftDraw *top_d, *bar_d, *list_d;
-    XftFont *font, *small, *icons;
+    int scr, w, h, tv;
+    Window win, top, bar, list, msg, info;
+    Pixmap top_pm, bar_pm, list_pm, msg_pm, info_pm;
+    XftDraw *top_d, *bar_d, *list_d, *msg_d, *info_d, *win_d;
+    XftFont *font, *small, *icons, *big, *huge, *icons_big;
     XftColor col[NCOLORS];
+    GC gc;
     Cursor arrow, blank;
-    int visible, grabbed;
+    int visible, grabbed, hide_after;
     int64_t last_input;
     char held[256];            /* keys down, to tell autorepeat from a new press */
     int hit[NHITS][2];
     int hit_list[2];           /* "Channels" in the bottom bar */
-    /* live: the channel list */
-    struct channel { char num[8], name[96], now[160]; } *ch;
+    /* TV: the channel list */
+    struct channel { char num[8], name[96], now[160]; int skip; } *ch;
     int nch, cur, sel, top_row, list_open, list_dirty, list_h;
     int digits;                /* a channel number being typed (the remote's digits), 0 if none */
     int64_t digits_at;
+    /* TV: the message box, the PIN prompt, the info panel, radio, teletext */
+    char msg_text[512];
+    int64_t msg_until;         /* 0: until replaced */
+    int msg_on, msg_dirty;
+    char pin_prompt[256];
+    char pin_typed[8];
+    int pin_on;
+    char info_text[4096], info_extra[1024];
+    int info_on, info_dirty;
+    char radio_name[256], radio_now[256];
+    int radio;
+    int ttx, ttx_page, ttx_typed, ttx_n;
+    struct image { XImage *im; int x, y, w, h; } img[2];
     struct osd_state shown;    /* what the bars show now */
     double dur;
-    char sig[256];
+    char sig[512];
 } O;
 
 static int64_t now_ms(void)
@@ -124,21 +145,53 @@ static void list_hide(void)
     O.list_open = 0;
 }
 
+static void info_hide(void)
+{
+    if (!O.info_on)
+        return;
+    XUnmapWindow(O.dpy, O.info);
+    O.info_on = 0;
+}
+
+static void info_show(void)
+{
+    if (O.info_on)
+        return;
+    XMapRaised(O.dpy, O.info);
+    O.info_on = O.info_dirty = 1;
+}
+
 static void hide(void)
 {
     if (!O.visible)
         return;
     list_hide();
+    info_hide();
     XUnmapWindow(O.dpy, O.top);
     XUnmapWindow(O.dpy, O.bar);
     XDefineCursor(O.dpy, O.win, O.blank);
     O.visible = 0;
 }
 
-int osd_open(void)
+static Window child(int x, int y, int w, int h, Pixmap *pm, XftDraw **d)
+{
+    XSetWindowAttributes a = {
+        .background_pixel = O.col[C_BG].pixel,
+        .event_mask = ButtonPressMask | PointerMotionMask | ExposureMask,
+    };
+    Window win = XCreateWindow(O.dpy, O.win, x, y, w, h, 0, CopyFromParent, InputOutput, CopyFromParent,
+                               CWBackPixel | CWEventMask, &a);
+    *pm = XCreatePixmap(O.dpy, win, w, h, DefaultDepth(O.dpy, O.scr));
+    *d = XftDrawCreate(O.dpy, *pm, DefaultVisual(O.dpy, O.scr), DefaultColormap(O.dpy, O.scr));
+    return win;
+}
+
+int osd_open(int tv)
 {
     if (!(O.dpy = XOpenDisplay(NULL)))
         return -1;
+    O.tv = tv;
+    O.hide_after = HIDE_AFTER;
     O.scr = DefaultScreen(O.dpy);
     O.w = DisplayWidth(O.dpy, O.scr);
     O.h = DisplayHeight(O.dpy, O.scr);
@@ -149,35 +202,31 @@ int osd_open(void)
     O.font = XftFontOpenName(O.dpy, O.scr, "JetBrains Mono:pixelsize=18:weight=medium");
     O.small = XftFontOpenName(O.dpy, O.scr, "JetBrains Mono:pixelsize=15");
     O.icons = XftFontOpenName(O.dpy, O.scr, "FontAwesome:pixelsize=20");
-    if (!O.font || !O.small || !O.icons)
+    O.big = XftFontOpenName(O.dpy, O.scr, "DejaVu Sans:pixelsize=26");
+    O.huge = XftFontOpenName(O.dpy, O.scr, "DejaVu Sans:pixelsize=40:weight=bold");
+    O.icons_big = XftFontOpenName(O.dpy, O.scr, "FontAwesome:pixelsize=96");
+    if (!O.font || !O.small || !O.icons || !O.big || !O.huge || !O.icons_big)
         return -1;
 
     /* override-redirect: above the panel and outside the window manager's tiling */
     XSetWindowAttributes a = {
         .background_pixel = O.col[C_KEY].pixel,
         .override_redirect = True,
-        .event_mask = KeyPressMask | KeyReleaseMask | ButtonPressMask | PointerMotionMask | StructureNotifyMask,
+        .event_mask = KeyPressMask | KeyReleaseMask | ButtonPressMask | PointerMotionMask | StructureNotifyMask |
+                      ExposureMask,
     };
     O.win = XCreateWindow(O.dpy, RootWindow(O.dpy, O.scr), 0, 0, O.w, O.h, 0, CopyFromParent, InputOutput,
                           CopyFromParent, CWBackPixel | CWOverrideRedirect | CWEventMask, &a);
     XStoreName(O.dpy, O.win, "amplay");
-    a.background_pixel = O.col[C_BG].pixel;
-    a.event_mask = ButtonPressMask | PointerMotionMask | ExposureMask;
-    O.top = XCreateWindow(O.dpy, O.win, 0, 0, O.w, TOP_H, 0, CopyFromParent, InputOutput, CopyFromParent,
-                          CWBackPixel | CWEventMask, &a);
-    O.bar = XCreateWindow(O.dpy, O.win, 0, O.h - BAR_H, O.w, BAR_H, 0, CopyFromParent, InputOutput,
-                          CopyFromParent, CWBackPixel | CWEventMask, &a);
-    int depth = DefaultDepth(O.dpy, O.scr);
-    O.top_pm = XCreatePixmap(O.dpy, O.top, O.w, TOP_H, depth);
-    O.bar_pm = XCreatePixmap(O.dpy, O.bar, O.w, BAR_H, depth);
-    O.top_d = XftDrawCreate(O.dpy, O.top_pm, vis, cmap);
-    O.bar_d = XftDrawCreate(O.dpy, O.bar_pm, vis, cmap);
-    /* between the bars, left; mapped only while open */
+    O.gc = XCreateGC(O.dpy, O.win, 0, NULL);
+    O.win_d = XftDrawCreate(O.dpy, O.win, vis, cmap);
+    O.top = child(0, 0, O.w, TOP_H, &O.top_pm, &O.top_d);
+    O.bar = child(0, O.h - BAR_H, O.w, BAR_H, &O.bar_pm, &O.bar_d);
+    /* between the bars, left and right; mapped only while open */
     O.list_h = O.h - TOP_H - BAR_H;
-    O.list = XCreateWindow(O.dpy, O.win, 0, TOP_H, LIST_W, O.list_h, 0, CopyFromParent, InputOutput,
-                           CopyFromParent, CWBackPixel | CWEventMask, &a);
-    O.list_pm = XCreatePixmap(O.dpy, O.list, LIST_W, O.list_h, depth);
-    O.list_d = XftDrawCreate(O.dpy, O.list_pm, vis, cmap);
+    O.list = child(0, TOP_H, LIST_W, O.list_h, &O.list_pm, &O.list_d);
+    O.info = child(O.w - INFO_W, TOP_H, INFO_W, O.list_h, &O.info_pm, &O.info_d);
+    O.msg = child(100, (O.h - MSG_H) / 2, O.w - 200, MSG_H, &O.msg_pm, &O.msg_d);
 
     O.arrow = XCreateFontCursor(O.dpy, XC_left_ptr);
     static char nothing[1];
@@ -196,6 +245,21 @@ int osd_open(void)
 int osd_fd(void)
 {
     return ConnectionNumber(O.dpy);
+}
+
+int osd_width(void)
+{
+    return O.w;
+}
+
+int osd_height(void)
+{
+    return O.h;
+}
+
+void osd_set_hide_after(int ms)
+{
+    O.hide_after = ms > 500 ? ms : 500;
 }
 
 unsigned osd_key565(void)
@@ -227,20 +291,51 @@ static void fit(char *t, XftFont *f, int max)
     }
 }
 
+/* ---- TV: the channel list ------------------------------------------------------------------ */
+
 void osd_set_channels(char **lines, int n, int current)
 {
-    O.ch = calloc(n, sizeof *O.ch);
+    free(O.ch);
+    O.ch = calloc(n > 0 ? n : 1, sizeof *O.ch);
     O.nch = O.ch ? n : 0;
     for (int i = 0; i < O.nch; i++) {
-        char *f[3] = { lines[i], NULL, NULL };
-        for (int k = 1; k < 3 && f[k - 1]; k++)
+        char *f[4] = { lines[i], NULL, NULL, NULL };
+        for (int k = 1; k < 4 && f[k - 1]; k++)
             if ((f[k] = strchr(f[k - 1], '\t')))
                 *f[k]++ = 0;
         snprintf(O.ch[i].num, sizeof O.ch[i].num, "%s", f[0] ? f[0] : "");
         snprintf(O.ch[i].name, sizeof O.ch[i].name, "%s", f[1] ? f[1] : "");
         snprintf(O.ch[i].now, sizeof O.ch[i].now, "%s", f[2] ? f[2] : "");
+        O.ch[i].skip = f[3] && strchr(f[3], 's');
     }
     O.cur = O.sel = current >= 0 && current < O.nch ? current : 0;
+    O.list_dirty = 1;
+}
+
+void osd_set_current(int index)
+{
+    if (index >= 0 && index < O.nch)
+        O.cur = index;
+    O.list_dirty = 1;
+}
+
+const char *osd_channel_title(int index, char *buf, int size)
+{
+    if (index < 0 || index >= O.nch)
+        return NULL;
+    snprintf(buf, size, "%s  %s", O.ch[index].num, O.ch[index].name);
+    return buf;
+}
+
+/* The next channel in a direction that isn't skipped (all skipped: the next one) */
+static int channel_step(int dir)
+{
+    for (int k = 1; k <= O.nch; k++) {
+        int i = ((O.cur + dir * k) % O.nch + O.nch) % O.nch;
+        if (!O.ch[i].skip)
+            return i;
+    }
+    return ((O.cur + dir) % O.nch + O.nch) % O.nch;
 }
 
 static void draw_list(void)
@@ -262,14 +357,269 @@ static void draw_list(void)
         text(O.list_d, O.font, i == O.cur ? C_FILL : C_SUB, PAD, y + 25, O.ch[i].num);
         snprintf(t, 256, "%s", O.ch[i].name);
         fit(t, O.font, LIST_W - PAD - 64 - 16);
-        text(O.list_d, O.font, C_TEXT, PAD + 52, y + 25, t);
+        text(O.list_d, O.font, O.ch[i].skip ? C_SUB : C_TEXT, PAD + 52, y + 25, t);
         snprintf(t, 256, "%s", O.ch[i].now);
         fit(t, O.small, LIST_W - PAD - 64 - 16);
         text(O.list_d, O.small, C_SUB, PAD + 52, y + 45, t);
     }
     XftDrawRect(O.list_d, &O.col[C_TRACK], LIST_W - 2, 0, 2, O.list_h);
-    XCopyArea(O.dpy, O.list_pm, O.list, DefaultGC(O.dpy, O.scr), 0, 0, LIST_W, O.list_h, 0, 0);
+    XCopyArea(O.dpy, O.list_pm, O.list, O.gc, 0, 0, LIST_W, O.list_h, 0, 0);
 }
+
+/* ---- TV: the message box, PIN prompt, info panel, radio screen ------------------------------ */
+
+void osd_message(const char *t, int seconds)
+{
+    snprintf(O.msg_text, sizeof O.msg_text, "%s", t ? t : "");
+    O.msg_until = seconds > 0 ? now_ms() + seconds * 1000LL : 0;
+    O.msg_dirty = 1;
+}
+
+void osd_pin(const char *prompt)
+{
+    O.pin_on = prompt != NULL;
+    snprintf(O.pin_prompt, sizeof O.pin_prompt, "%s", prompt ? prompt : "");
+    O.pin_typed[0] = 0;
+    O.msg_dirty = 1;
+}
+
+/* Lines of t, broken at spaces to fit max pixels, drawn from y on; returns the y after them */
+static int draw_wrapped(XftDraw *d, XftFont *f, int color, int x, int y, int max, int bottom, const char *t)
+{
+    char line[512];
+    while (*t && y < bottom) {
+        size_t n = strcspn(t, "\n");
+        if (!n) {   /* an empty line: half a line's space */
+            y += (f->ascent + f->descent) / 2;
+            t++;
+            continue;
+        }
+        size_t take = n < sizeof line - 1 ? n : sizeof line - 1;
+        /* the longest run of whole words that fits */
+        for (;;) {
+            memcpy(line, t, take);
+            line[take] = 0;
+            if (text_width(f, line) <= max)
+                break;
+            size_t sp = take;
+            while (sp > 0 && line[sp] != ' ')
+                sp--;
+            if (sp == 0) {   /* one long word: cut it */
+                do take--; while (take > 0 && ((unsigned char)t[take] & 0xc0) == 0x80);
+            } else {
+                take = sp;
+            }
+            if (!take)
+                break;
+        }
+        if (!take)
+            break;
+        text(d, f, color, x, y + f->ascent, line);
+        y += f->ascent + f->descent + 4;
+        t += take;
+        while (*t == ' ')
+            t++;
+        if (*t == '\n')
+            t++;
+    }
+    return y;
+}
+
+static void draw_msg(void)
+{
+    int on = O.pin_on || (O.msg_text[0] && (!O.msg_until || now_ms() < O.msg_until));
+    if (!on) {
+        if (O.msg_on) {
+            XUnmapWindow(O.dpy, O.msg);
+            O.msg_on = 0;
+        }
+        return;
+    }
+    if (!O.msg_on) {
+        XMapRaised(O.dpy, O.msg);
+        O.msg_on = O.msg_dirty = 1;
+    }
+    if (!O.msg_dirty)
+        return;
+    O.msg_dirty = 0;
+    int w = O.w - 200;
+    XftDrawRect(O.msg_d, &O.col[C_BG], 0, 0, w, MSG_H);
+    XftDrawRect(O.msg_d, &O.col[C_FILL], 0, 0, w, 3);
+    if (O.pin_on) {
+        char dots[64] = "";
+        for (int i = 0; i < 4; i++)
+            strcat(dots, i < (int)strlen(O.pin_typed) ? "●  " : "○  ");
+        text(O.msg_d, O.icons, C_FILL, PAD, 50, ICON_LOCK);
+        text(O.msg_d, O.big, C_TEXT, PAD + 40, 52, O.pin_prompt);
+        text(O.msg_d, O.huge, C_TEXT, (w - text_width(O.huge, dots)) / 2, 115, dots);
+    } else {
+        int lines = 1;
+        for (const char *p = O.msg_text; *p; p++)
+            lines += *p == '\n';
+        int lh = O.big->ascent + O.big->descent + 4;
+        int y = (MSG_H - lines * lh) / 2;
+        draw_wrapped(O.msg_d, O.big, C_TEXT, PAD, y < 8 ? 8 : y, w - 2 * PAD, MSG_H - 8, O.msg_text);
+    }
+    XCopyArea(O.dpy, O.msg_pm, O.msg, O.gc, 0, 0, w, MSG_H, 0, 0);
+}
+
+void osd_info(const char *t)
+{
+    snprintf(O.info_text, sizeof O.info_text, "%s", t ? t : "");
+    O.info_dirty = 1;
+}
+
+void osd_info_extra(const char *t)
+{
+    if (strcmp(O.info_extra, t ? t : "")) {
+        snprintf(O.info_extra, sizeof O.info_extra, "%s", t ? t : "");
+        O.info_dirty = 1;
+    }
+}
+
+int osd_info_open(void)
+{
+    return O.info_on;
+}
+
+static void draw_info(void)
+{
+    if (!O.info_on || !O.info_dirty)
+        return;
+    O.info_dirty = 0;
+    XftDrawRect(O.info_d, &O.col[C_BG], 0, 0, INFO_W, O.list_h);
+    XftDrawRect(O.info_d, &O.col[C_TRACK], 0, 0, 2, O.list_h);
+    /* ozone-tv's text: the first line as a heading */
+    const char *t = O.info_text;
+    size_t n = strcspn(t, "\n");
+    char head[260];
+    snprintf(head, sizeof head, "%.*s", (int)(n < 255 ? n : 255), t);
+    fit(head, O.font, INFO_W - 2 * PAD);
+    text(O.info_d, O.font, C_TEXT, PAD, 34, head);
+    int y = 48;
+    if (t[n])
+        y = draw_wrapped(O.info_d, O.small, C_SUB, PAD, y, INFO_W - 2 * PAD, O.list_h - 120, t + n + 1);
+    XftDrawRect(O.info_d, &O.col[C_TRACK], PAD, y + 6, INFO_W - 2 * PAD, 1);
+    draw_wrapped(O.info_d, O.small, C_TEXT, PAD, y + 16, INFO_W - 2 * PAD, O.list_h - 8, O.info_extra);
+    XCopyArea(O.dpy, O.info_pm, O.info, O.gc, 0, 0, INFO_W, O.list_h, 0, 0);
+}
+
+static void draw_radio(void)
+{
+    if (!O.radio)
+        return;
+    char t[260];
+    int cy = O.h / 2;
+    text(O.win_d, O.icons_big, C_FILL, (O.w - text_width(O.icons_big, ICON_MUSIC)) / 2, cy - 60, ICON_MUSIC);
+    snprintf(t, 256, "%s", O.radio_name);
+    fit(t, O.huge, O.w - 2 * PAD);
+    text(O.win_d, O.huge, C_TEXT, (O.w - text_width(O.huge, t)) / 2, cy + 40, t);
+    snprintf(t, 256, "%s", O.radio_now);
+    fit(t, O.big, O.w - 2 * PAD);
+    text(O.win_d, O.big, C_SUB, (O.w - text_width(O.big, t)) / 2, cy + 90, t);
+}
+
+void osd_radio(const char *name, const char *now)
+{
+    int on = name != NULL;
+    if (on && O.radio && !strcmp(name, O.radio_name) && !strcmp(now ? now : "", O.radio_now))
+        return;
+    O.radio = on;
+    snprintf(O.radio_name, sizeof O.radio_name, "%s", name ? name : "");
+    snprintf(O.radio_now, sizeof O.radio_now, "%s", now ? now : "");
+    /* the screen opaque, or the key again for the video layer */
+    XSetWindowBackground(O.dpy, O.win, O.col[on ? C_BG : C_KEY].pixel);
+    XClearWindow(O.dpy, O.win);
+    draw_radio();
+    for (int i = 0; i < 2; i++)
+        if (O.img[i].im)
+            XPutImage(O.dpy, O.win, O.gc, O.img[i].im, 0, 0, O.img[i].x, O.img[i].y, O.img[i].w, O.img[i].h);
+}
+
+void osd_teletext(int on, int page)
+{
+    O.ttx = on;
+    O.ttx_page = page;
+    O.ttx_n = O.ttx_typed = 0;
+    O.sig[0] = 0;
+}
+
+/* ---- pictures on the screen window: subtitles and teletext --------------------------------- */
+
+static unsigned long rgb_pixel(Visual *v, unsigned r, unsigned g, unsigned b)
+{
+    unsigned long p = 0;
+    unsigned long masks[3] = { v->red_mask, v->green_mask, v->blue_mask };
+    unsigned vals[3] = { r, g, b };
+    for (int i = 0; i < 3; i++) {
+        unsigned long m = masks[i];
+        int shift = 0, bits = 0;
+        while (m && !(m & 1)) {
+            m >>= 1;
+            shift++;
+        }
+        while (m & 1) {
+            m >>= 1;
+            bits++;
+        }
+        p |= (unsigned long)(vals[i] >> (8 - bits)) << shift;
+    }
+    return p;
+}
+
+void osd_image_clear(int layer)
+{
+    struct image *m = &O.img[layer];
+    if (!m->im)
+        return;
+    XClearArea(O.dpy, O.win, m->x, m->y, m->w, m->h, False);
+    XDestroyImage(m->im);
+    m->im = NULL;
+    draw_radio();
+    /* the other layer, if it was under this one */
+    struct image *o = &O.img[!layer];
+    if (o->im)
+        XPutImage(O.dpy, O.win, O.gc, o->im, 0, 0, o->x, o->y, o->w, o->h);
+    XFlush(O.dpy);
+}
+
+void osd_image(int layer, const uint8_t *rgba, int w, int h, int x, int y, int dw, int dh)
+{
+    osd_image_clear(layer);
+    if (dw <= 0 || dh <= 0 || w <= 0 || h <= 0)
+        return;
+    Visual *vis = DefaultVisual(O.dpy, O.scr);
+    XImage *im = XCreateImage(O.dpy, vis, DefaultDepth(O.dpy, O.scr), ZPixmap, 0, NULL, dw, dh, 32, 0);
+    if (!im)
+        return;
+    im->data = malloc((size_t)im->bytes_per_line * dh);
+    if (!im->data) {
+        XDestroyImage(im);
+        return;
+    }
+    unsigned long key = O.col[O.radio ? C_BG : C_KEY].pixel;
+    int fast16 = im->bits_per_pixel == 16;
+    for (int j = 0; j < dh; j++) {
+        const uint8_t *row = rgba + (size_t)(j * h / dh) * w * 4;
+        uint16_t *out16 = (uint16_t *)(im->data + (size_t)j * im->bytes_per_line);
+        for (int i = 0; i < dw; i++) {
+            const uint8_t *p = row + (i * w / dw) * 4;
+            unsigned long px = p[3] < 128 ? key : rgb_pixel(vis, p[0], p[1], p[2]);
+            if (px == O.col[C_KEY].pixel && p[3] >= 128)
+                px ^= 1;   /* an opaque pixel of exactly the key color would show the video */
+            if (fast16)
+                out16[i] = px;
+            else
+                XPutPixel(im, i, j, px);
+        }
+    }
+    struct image *m = &O.img[layer];
+    *m = (struct image){ im, x, y, dw, dh };
+    XPutImage(O.dpy, O.win, O.gc, im, 0, 0, x, y, dw, dh);
+    XFlush(O.dpy);
+}
+
+/* ---- the bars ------------------------------------------------------------------------------ */
 
 static void clock_text(char *buf, size_t n, double t)
 {
@@ -282,14 +632,18 @@ static void clock_text(char *buf, size_t n, double t)
 
 static void draw(const struct osd_state *s)
 {
-    char now[16], total[16], line[48], vol[8];
+    char now[16], total[16], line[64], vol[8], ind[160] = "", title[256];
     int track_w = O.w - 2 * PAD;
     int fill = s->dur > 0 ? (int)(track_w * (s->pos / s->dur)) : 0;
     fill = fill < 0 ? 0 : fill > track_w ? track_w : fill;
     clock_text(now, sizeof now, s->pos);
     clock_text(total, sizeof total, s->dur);
+    int shifted = s->live && s->shift >= 1;
     if (s->loading)
         snprintf(line, sizeof line, "Loading…");
+    else if (s->live && shifted)
+        snprintf(line, sizeof line, "−%s      %s", (clock_text(now, sizeof now, s->shift), now),
+                 O.nch ? CHANNELS_HINT : "");
     else if (s->live)
         snprintf(line, sizeof line, O.nch ? "LIVE      " CHANNELS_HINT : "LIVE");
     else if (s->dur > 0)
@@ -297,23 +651,43 @@ static void draw(const struct osd_state *s)
     else
         snprintf(line, sizeof line, "%s", now);
     snprintf(vol, sizeof vol, "%d%%", s->volume);
+    if (s->live) {
+        if (s->audio)
+            snprintf(ind + strlen(ind), sizeof ind - strlen(ind), "Audio %s   ", s->audio);
+        if (s->subs)
+            snprintf(ind + strlen(ind), sizeof ind - strlen(ind), "CC %s   ", s->subs);
+        if (s->signal >= 0)
+            snprintf(ind + strlen(ind), sizeof ind - strlen(ind), "Signal %d%%   ", s->signal);
+    }
+    if (O.ttx) {
+        char typed[8] = "";
+        for (int i = 0; i < 3; i++)
+            typed[i] = i < O.ttx_n ? "0123456789"[(O.ttx_typed >> (4 * (O.ttx_n - 1 - i))) & 15] : '_';
+        typed[3] = 0;
+        snprintf(title, sizeof title, "Teletext  %s    %s", O.ttx_n ? typed : "", s->title ? s->title : "");
+    } else {
+        snprintf(title, sizeof title, "%s", s->title ? s->title : "");
+    }
 
     /* redraw only when something visible changed */
     char sig[sizeof O.sig];
-    snprintf(sig, sizeof sig, "%d|%s|%d|%d|%s|%d|%d|%s", fill, line, s->paused, s->muted, vol, O.w, s->live,
-             s->title ? s->title : "");
+    snprintf(sig, sizeof sig, "%d|%s|%d|%d|%s|%d|%d|%d|%s|%s", fill, line, s->paused, s->muted, vol, O.w, s->live,
+             s->recording, ind, title);
     if (!strcmp(sig, O.sig))
         return;
     strcpy(O.sig, sig);
 
-    /* top: title and close */
+    /* top: title, recording, close */
     XftDrawRect(O.top_d, &O.col[C_BG], 0, 0, O.w, TOP_H);
-    if (s->title) {
+    int rec_w = s->recording ? text_width(O.font, "● REC") + PAD : 0;
+    if (title[0]) {
         char t[260];
-        snprintf(t, 256, "%s", s->title);
-        fit(t, O.font, O.w - 3 * PAD - 24);
+        snprintf(t, 256, "%s", title);
+        fit(t, O.font, O.w - 3 * PAD - 24 - rec_w);
         text(O.top_d, O.font, C_TEXT, PAD, 28, t);
     }
+    if (s->recording)
+        text(O.top_d, O.font, C_RED, O.w - PAD - 40 - rec_w, 28, "● REC");
     text(O.top_d, O.icons, C_SUB, O.w - PAD - 16, 29, ICON_CLOSE);
 
     /* bottom: progress, buttons, time, volume */
@@ -334,12 +708,17 @@ static void draw(const struct osd_state *s)
         text(O.bar_d, O.icons, i == 1 ? C_TEXT : C_SUB, x, y, icons[i]);
         x += 44;
     }
-    text(O.bar_d, O.font, C_TEXT, x + 8, y - 1, line);
+    text(O.bar_d, O.font, shifted ? C_YELLOW : C_TEXT, x + 8, y - 1, line);
     O.hit_list[0] = O.hit_list[1] = 0;
     if (s->live && O.nch && !s->loading) {   /* "Channels" after "LIVE", clickable */
-        int lx = x + 8 + text_width(O.font, "LIVE      ");
-        O.hit_list[0] = lx - 8;
-        O.hit_list[1] = lx + text_width(O.font, CHANNELS_HINT) + 8;
+        const char *hint = strstr(line, CHANNELS_HINT);
+        if (hint) {
+            char before[64];
+            snprintf(before, sizeof before, "%.*s", (int)(hint - line), line);
+            int lx = x + 8 + text_width(O.font, before);
+            O.hit_list[0] = lx - 8;
+            O.hit_list[1] = lx + text_width(O.font, CHANNELS_HINT) + 8;
+        }
     }
 
     int vw = text_width(O.font, vol);
@@ -348,10 +727,11 @@ static void draw(const struct osd_state *s)
     text(O.bar_d, O.icons, s->muted ? C_SUB : C_TEXT, vx - 32, y, s->muted ? ICON_MUTE : ICON_VOL);
     O.hit[HIT_VOL][0] = vx - 40;
     O.hit[HIT_VOL][1] = O.w;
+    if (ind[0])
+        text(O.bar_d, O.small, C_SUB, vx - 48 - text_width(O.small, ind), y - 2, ind);
 
-    GC gc = DefaultGC(O.dpy, O.scr);
-    XCopyArea(O.dpy, O.top_pm, O.top, gc, 0, 0, O.w, TOP_H, 0, 0);
-    XCopyArea(O.dpy, O.bar_pm, O.bar, gc, 0, 0, O.w, BAR_H, 0, 0);
+    XCopyArea(O.dpy, O.top_pm, O.top, O.gc, 0, 0, O.w, TOP_H, 0, 0);
+    XCopyArea(O.dpy, O.bar_pm, O.bar, O.gc, 0, 0, O.w, BAR_H, 0, 0);
     XFlush(O.dpy);
 }
 
@@ -363,16 +743,21 @@ void osd_update(const struct osd_state *s)
         O.grabbed = XGrabKeyboard(O.dpy, O.win, True, GrabModeAsync, GrabModeAsync, CurrentTime) == GrabSuccess;
     if (O.list_open && now_ms() - O.last_input > LIST_AFTER)
         list_hide();
-    if (O.visible && !O.list_open && !s->paused && !s->loading && now_ms() - O.last_input > HIDE_AFTER)
+    if (O.visible && !O.list_open && !O.info_on && !s->paused && !s->loading &&
+        now_ms() - O.last_input > O.hide_after)
         hide();
     if (s->paused || s->loading)
         show();
     if (O.visible) {
         draw(s);
         draw_list();
+        draw_info();
     }
+    draw_msg();
     XFlush(O.dpy);
 }
+
+/* ---- keys and clicks ----------------------------------------------------------------------- */
 
 /* A digit of a channel number: the list opens on the channel with the number typed so far;
    osd_poll switches to it once no digit has come for DIGITS_AFTER */
@@ -418,6 +803,71 @@ static int list_key(KeySym k, struct osd_event *e, int *made)
     return 1;
 }
 
+/* The PIN prompt takes digits and delete; Esc closes it. 1 if the key was its own */
+static int pin_key(KeySym k, struct osd_event *e, int *made)
+{
+    *made = 0;
+    size_t n = strlen(O.pin_typed);
+    if (k >= XK_0 && k <= XK_9) {
+        O.pin_typed[n++] = '0' + (k - XK_0);
+        O.pin_typed[n] = 0;
+        if (n == 4) {
+            *e = (struct osd_event){ OSD_PIN, atoi(O.pin_typed) };
+            *made = 1;
+            O.pin_typed[0] = 0;
+        }
+    } else if (k == XK_BackSpace) {
+        if (n)
+            O.pin_typed[n - 1] = 0;
+    } else if (k == XK_Escape || k == XF86XK_Back) {
+        osd_pin(NULL);
+    } else {
+        return 0;
+    }
+    O.msg_dirty = 1;
+    return 1;
+}
+
+/* Teletext: digits make a page number, the arrows step, the colors follow the page's links */
+static int ttx_key(KeySym k, struct osd_event *e, int *made)
+{
+    *made = 1;
+    if (k >= XK_0 && k <= XK_9) {
+        int d = k - XK_0;
+        if (O.ttx_n == 0 && (d < 1 || d > 8)) {   /* pages are 100-899 */
+            *made = 0;
+            return 1;
+        }
+        O.ttx_typed = O.ttx_typed << 4 | d;
+        if (++O.ttx_n == 3) {
+            *e = (struct osd_event){ OSD_TEXT_PAGE, O.ttx_typed };
+            O.ttx_n = O.ttx_typed = 0;
+        } else {
+            *made = 0;
+        }
+        O.sig[0] = 0;
+        show();
+        return 1;
+    }
+    switch (k) {
+    case XK_Up: case XK_Page_Up: case XK_Right: e->value = TTX_NEXT; break;
+    case XK_Down: case XK_Page_Down: case XK_Left: e->value = TTX_PREV; break;
+    case XK_Return: case XK_KP_Enter: e->value = TTX_MIX; break;
+    case XF86XK_Launch1: case XK_F1: e->value = TTX_LINK; break;
+    case XF86XK_Launch2: case XK_F2: e->value = TTX_LINK - 1; break;
+    case XF86XK_Launch3: case XK_F3: e->value = TTX_LINK - 2; break;
+    case XF86XK_Launch4: case XK_F4: e->value = TTX_LINK - 3; break;
+    case XK_Escape: case XF86XK_Back: case XK_BackSpace: case XF86XK_Launch5: case XK_t: case XK_q:
+        *e = (struct osd_event){ OSD_TEXT, 0 };
+        return 1;
+    default:
+        *made = 0;
+        return 0;
+    }
+    e->action = OSD_TEXT_PAGE;
+    return 1;
+}
+
 static int key_action(KeySym k, int repeat, struct osd_event *e)
 {
     int can_repeat = 1;
@@ -458,6 +908,52 @@ static int key_action(KeySym k, int repeat, struct osd_event *e)
     return !repeat || can_repeat;
 }
 
+/* The TV player's keys (the list, PIN prompt and teletext have had theirs) */
+static int tv_key_action(KeySym k, int repeat, struct osd_event *e)
+{
+    int shifted = O.shown.shift >= 1;
+    int step = 0;
+    switch (k) {
+    case XK_Left:  if (shifted) { *e = (struct osd_event){ OSD_SEEK_REL, -10 }; return 1; } step = -1; break;
+    case XK_Right: if (shifted) { *e = (struct osd_event){ OSD_SEEK_REL, 10 }; return 1; } step = 1; break;
+    case XK_Page_Up: case XF86XK_AudioNext: step = 1; break;
+    case XK_Page_Down: case XF86XK_AudioPrev: step = -1; break;
+    case XF86XK_AudioRewind: case XK_comma: *e = (struct osd_event){ OSD_SEEK_REL, -10 }; return 1;
+    case XF86XK_AudioForward: case XK_period: *e = (struct osd_event){ OSD_SEEK_REL, 10 }; return 1;
+    case XK_End: *e = (struct osd_event){ OSD_LIVE, 0 }; return !repeat;
+    case XF86XK_AudioStop:
+        *e = (struct osd_event){ shifted ? OSD_LIVE : OSD_QUIT, 0 };
+        return !repeat;
+    case XK_space: case XK_p: case XF86XK_AudioPlay: case XF86XK_AudioPause:
+        *e = (struct osd_event){ OSD_PAUSE, 0 };
+        return !repeat;
+    case XK_i: case XF86XK_Tools:
+        if (!repeat)
+            O.info_on ? info_hide() : info_show();
+        return 0;
+    case XK_t: case XF86XK_Launch5: *e = (struct osd_event){ OSD_TEXT, 0 }; return !repeat;
+    case XK_a: case XF86XK_Launch3: *e = (struct osd_event){ OSD_AUDIO, 0 }; return !repeat;
+    case XK_s: case XF86XK_Launch2: *e = (struct osd_event){ OSD_SUBS, 0 }; return !repeat;
+    case XK_z: case XF86XK_Launch4: *e = (struct osd_event){ OSD_ASPECT, 0 }; return !repeat;
+    case XK_f: case XF86XK_Launch1: *e = (struct osd_event){ OSD_GROUP, 0 }; return !repeat;
+    case XK_r: case XF86XK_AudioRecord: *e = (struct osd_event){ OSD_RECORD, 0 }; return !repeat;
+    case XK_v: case XF86XK_Launch9: *e = (struct osd_event){ OSD_RADIO, 0 }; return !repeat;
+    case XK_q: case XK_Escape: case XK_BackSpace: case XF86XK_Back:
+        if (O.info_on) {
+            info_hide();
+            return 0;
+        }
+        *e = (struct osd_event){ OSD_QUIT, 0 };
+        return !repeat;
+    default:
+        return key_action(k, repeat, e);
+    }
+    if (!O.nch)
+        return 0;
+    *e = (struct osd_event){ OSD_CHANNEL, channel_step(step) };
+    return 1;
+}
+
 static int click_action(XButtonEvent *b, struct osd_event *e)
 {
     if (b->button == Button4 || b->button == Button5) {
@@ -492,8 +988,14 @@ static int click_action(XButtonEvent *b, struct osd_event *e)
         for (int i = 0; i < NHITS; i++)
             if (b->x >= O.hit[i][0] && b->x < O.hit[i][1]) {
                 *e = buttons[i];
+                if (O.tv && O.nch && (i == HIT_BACK || i == HIT_FWD))
+                    *e = (struct osd_event){ OSD_CHANNEL, channel_step(i == HIT_FWD ? 1 : -1) };
                 return 1;
             }
+        return 0;
+    }
+    if (b->window == O.info) {
+        info_hide();
         return 0;
     }
     /* a click on the picture itself */
@@ -511,6 +1013,10 @@ int osd_poll(struct osd_event *ev, int max)
                 ev[n++] = (struct osd_event){ OSD_CHANNEL, i };
         list_hide();
     }
+    if (O.msg_text[0] && O.msg_until && now_ms() >= O.msg_until) {
+        O.msg_text[0] = 0;
+        O.msg_until = 0;
+    }
     while (XPending(O.dpy)) {
         XEvent x;
         XNextEvent(O.dpy, &x);
@@ -519,22 +1025,34 @@ int osd_poll(struct osd_event *ev, int max)
             unsigned kc = x.xkey.keycode & 255;
             int repeat = O.held[kc];
             O.held[kc] = 1;
-            show();
+            if (!O.ttx)
+                show();
             KeySym k = XLookupKeysym(&x.xkey, 0);
+            if (k >= XK_KP_0 && k <= XK_KP_9)
+                k = XK_0 + (k - XK_KP_0);
+            struct osd_event *e = &ev[n < max ? n : max - 1];
             int made;
+            if (O.pin_on && !repeat && pin_key(k, e, &made)) {
+                n += made && n < max;
+                break;
+            }
+            if (O.ttx && ttx_key(k, e, &made)) {
+                n += made && n < max && !(repeat && e->action == OSD_TEXT);
+                break;
+            }
             if (O.nch && !repeat && k >= XK_0 && k <= XK_9) {
                 digit_key(k - XK_0);
                 break;
             }
-            if (O.list_open && list_key(k, &ev[n < max ? n : max - 1], &made)) {
+            if (O.list_open && list_key(k, e, &made)) {
                 n += made && n < max;
                 break;
             }
-            if (O.nch && !O.list_open && (k == XK_Return || k == XK_KP_Enter || k == XK_l)) {
+            if (O.nch && !O.list_open && (k == XK_Return || k == XK_KP_Enter || k == XK_l || k == XF86XK_Launch6)) {
                 list_show();
                 break;
             }
-            if (n < max && key_action(k, repeat, &ev[n]))
+            if (n < max && (O.tv ? tv_key_action(k, repeat, &ev[n]) : key_action(k, repeat, &ev[n])))
                 n++;
             break;
         }
@@ -571,15 +1089,27 @@ int osd_poll(struct osd_event *ev, int max)
             show();
             break;
         case Expose:
+            if (x.xexpose.window == O.win) {
+                if (x.xexpose.count == 0) {
+                    draw_radio();
+                    for (int i = 0; i < 2; i++)
+                        if (O.img[i].im)
+                            XPutImage(O.dpy, O.win, O.gc, O.img[i].im, 0, 0, O.img[i].x, O.img[i].y,
+                                      O.img[i].w, O.img[i].h);
+                }
+                break;
+            }
             O.sig[0] = 0;
-            O.list_dirty = 1;
+            O.list_dirty = O.info_dirty = O.msg_dirty = 1;
             break;
         }
     }
     if (O.visible) {
         draw(&O.shown);
         draw_list();
+        draw_info();
     }
+    draw_msg();
     return n;
 }
 

@@ -42,7 +42,7 @@ xserver-xorg-input-mouse xinit x11-xserver-utils x11-utils x11-xkb-utils xfonts-
 feh lxterminal fish bash-completion fonts-jetbrains-mono fonts-font-awesome fonts-noto-color-emoji mpv alsa-utils
 python3 nodejs dbus-x11 python3-gi gir1.2-webkit2-4.1 gir1.2-gtk-3.0 libglib2.0-bin xdotool wpasupplicant` (with `--no-install-recommends`), and to build amplay: `gcc libc6-dev make
 pkg-config libavformat-dev libavcodec-dev libswresample-dev libavutil-dev libasound2-dev libx11-dev
-libxft-dev`.
+libxft-dev libzvbi-dev`.
 
 ## Desktop
 
@@ -99,17 +99,20 @@ NAND partition as before.
 
 ## Television (DVB-T/T2)
 
-`./install-tv.sh <ip>` (needs the Android NDK here, `~/Android/Sdk/ndk/*`). Super+T or the TV button
-on the panel: channel list, "Scan channels" the first time. In the player ←/→ or PgDn/PgUp switch
-channels, the rest as in amplay.
+`./install-tv.sh <ip>` (needs the Android NDK here, `~/Android/Sdk/ndk/*`, and amplay from
+`install-desktop.sh`). Super+T or the TV button on the panel: channel list, "Scan channels" the
+first time. What the TV does for the viewer is in [MANUAL.md](MANUAL.md#6-television-dvb-t2).
 
 ```sh
 ozone-tv scan                    # UHF 21..60 (474-786 MHz, 8 MHz), prints level and services per multiplex
-ozone-tv scan --freq 570000      # one multiplex
+ozone-tv scan --freq 570000      # one multiplex (bandwidth and PLP may follow)
+ozone-tv scan --nit 570000       # the multiplexes the network table lists, from that one
 ozone-tv status 570000           # signal level/quality once a second: for aiming the antenna
+ozone-tv antenna on              # 5 V on the antenna input (kept in the settings)
 ozone-tv play 3                  # channel 3 of the list
 ozone-tv log                     # what the frontend libraries say
 ozone-tv --test mux.ts scan      # without an antenna: a TS file fed into the demux from memory
+dtv/testmux.py mux.ts 150        # (here) such a file: 2 TV services, radio, DVB subtitles, teletext, EIT
 ```
 
 How it works. The kernel has the DVB demux but no frontend driver: on Android the TV app
@@ -121,31 +124,79 @@ reused as they are:
 - `dtv/dtvfe.c` is an Android (bionic) program, built with the NDK for Android 4.4's linker (SysV
   hash, no packed relocations). It `dlopen`s the libraries from `/system/lib` and calls
   `External_Init`, `PI_System_Start`, `PI_Tuner_Init`, then `PI_Tuner_DVB_T_StartLock` /
-  `CheckSignalStatus` (interfaces taken from the disassembly), answering `tune`/`status` on stdin.
+  `CheckSignalStatus` / `SetAntennaPower` (interfaces taken from the disassembly), answering
+  `tune`/`status`/`antenna` on stdin.
 - `/etc/init.d/ozone-android` puts the Android files on `/system`, read-only, and makes an empty
   KitKat property area at `/dev/__properties__` (bionic crashes without one). The files are copies
   in Debian, not the NAND partition: see "Android files" above.
 - `/etc/init.d/ozone-dtv` gives it the rest of what Android's init would: the kernel logger nodes
   in `/dev/log`, and the Android names of the DVB nodes (`/dev/dvb0.demux0`...).
 - `ozone-tv` reads PAT/SDT/NIT/PMT through demux section filters (names usually ISO 8859-5, LCN from
-  NIT), then for watching sets TS-tap PES filters on the service's PIDs and pipes `dvr0` into
-  `amplay --live --program <sid>`.
+  NIT, subtitles and teletext from the PMT, which is kept as broadcast), then sets TS-tap PES
+  filters on the PIDs of the services in use and reads `dvr0`.
 
-The TV window (`ozone-tv`, GTK) has the channels with what's on, and the selected channel's guide. The guide is the
-broadcast EIT, read by one section filter on PID 0x12 (tables 0x4e-0x6f) whenever something is tuned:
-Zeonbud's multiplexes carry now/next and a week of schedule for their own services and for the
-others', so watching or scanning fills in most of it. `ozone-tv guide` spends 25 s on each
-multiplex for the rest. It is kept in `~/.local/share/ozone-tv/epg.json`, and the TDT (PID 0x14)
-corrects the clock if the box's is off. In the player, Enter opens amplay's channel list on the left (`--channels`:
-number, name, now on); choosing one prints `channel N` and exits with status 12, and ozone-tv retunes. Channels are
-numbered by their place in the list, as the stock app does: the NIT gives the same LCNs to services of different
-multiplexes.
+One `ozone-tv` process drives the tuner: the window, the player, recordings and timers are all
+it, and `ozone-tv`, `ozone-tv play N` or a timer started again hand their request to it through a
+socket (`~/.local/share/ozone-tv/control`). It keeps `dtvfe` open (1-4 s to start) until it ends,
+when nothing is shown, watched or recorded.
 
-Not done: teletext/subtitles, recording, radio services, descrambling (channels found encrypted get a lock).
+**Watching.** The watched service's packets go into the *live buffer*: segment files of 8 MB
+(`/dev/shm/ozone-tv-live-*`, the oldest deleted beyond 64 MB, or on the recording drive), which
+`amplay --tv` reads at an offset and waits at the end of for more. amplay stays up while channels
+change, driven by commands on stdin (`play`, `stop`, `title`, `info`, `signal`, `pin`...; see the top of
+`amplay.c`) and telling ozone-tv what the viewer does on stdout (`channel N`, `audio`, `record`...).
+A switch is: the new service's PES filters, a tune only for another multiplex (~1.2 s), and in
+amplay a new demuxer that reads the service's PAT and PMT (made by ozone-tv) before the data, so
+FFmpeg knows the streams at once instead of probing 2 MB of broadcast (3 s); video starts at a
+keyframe, the first frame shows as soon as it is decoded (`show_first_frame_nosync`, as the stock
+app does) and the clock starts once 0.3 s of audio is queued. Measured from the key: the picture
+in 1.2-2.0 s on the same multiplex, 2.6-3.2 s on another (it was 3.2-5.4 and 4.3-6.5 s with a new
+amplay each time). The rest is the broadcast's keyframe interval: 1 s on most of Zeonbud's
+channels, about 2 s on СТБ.
+
+The demux's DMA (`/sys/class/stb/asyncfifo0_flush_size`) passes data to `dvr0` in blocks of
+256 KB after boot: at a service's 2-5 Mbit/s that held a new channel's first packets back by
+0.5-1.3 s. `ozone-tv` sets 16 KB.
+
+The same files are the timeshift buffer: pausing keeps the data coming; amplay keeps a keyframe
+index (timestamp, offset) and restarts its demuxer at the keyframe before the time wanted, which
+shows a picture at once. A jump in the timestamps (an encoder restarting, a test file looping)
+restarts the session there, as a switch would.
+
+**Tracks.** Audio is decoded in software (FFmpeg), so a track change is the decoder following
+another PID, and left / right is a copy of one side to both in amplay. DVB subtitles are decoded
+by FFmpeg's `dvbsub` and drawn with X onto the player window (pixels with alpha below 128 left in the
+color key, so the video shows through); teletext goes through libzvbi (`ttx.c`), its pages
+rendered to RGBA the same way, teletext subtitle pages too. The aspect key sets
+`/sys/class/video/screen_mode`.
+
+**Recording** is the service's packets written to a `.ts` (PAT and PMT first) with a `.json` next
+to it, on the first USB drive, the chosen one, or `/mnt/nand/linux/Recordings`; while the watched
+service and the recorded one differ, `ozone-tv` splits the packets by PID. Recordings play in amplay
+as files (`--program <sid>`). **Timers** are in `timers.json`; `ozone-tv timers` (from bspwmrc)
+starts the TV process 90 s before one is due if none runs, and that process starts and stops the
+recordings. Two recordings on different multiplexes conflict (one tuner).
+
+**Parental control**: locked channels, and EIT parental ratings (descriptor 0x55) at or above the
+age set, make the player ask for the PIN (amplay's prompt, digits; sha256 in `settings.json`, 0000
+until set).
+
+The TV window (`ozone-tv`, GTK) has the lists (all, favourites, radio, recordings, timers), the
+selected channel's guide, a menu per channel (info and PIDs, lists, rename, move, skip, lock,
+delete, sort) and the settings. The guide is the broadcast EIT, read by one section filter on PID
+0x12 (tables 0x4e-0x6f) whenever something is tuned: Zeonbud's multiplexes carry now/next and a
+week of schedule for their own services and for the others', so watching or scanning fills in most
+of it. `ozone-tv guide` spends 25 s on each multiplex for the rest. It is kept in
+`~/.local/share/ozone-tv/epg.json`, and the TDT (PID 0x14) corrects the clock if the box's is off.
+Channels are numbered by their place in the list, as the stock app does: the NIT gives the same
+LCNs to services of different multiplexes. A rescan keeps the viewer's order, names and flags.
+
+Not done: descrambling (channels found encrypted get a lock).
 
 Logs, for debugging without a network: every `ozone-tv` run writes `/mnt/nand/linux/logs/tv-<time>-<command>/tv.log`
-(what it did, the frontend's replies, the libraries' Android log, the kernel log, amplay, the signal
-every 3 s), and a scan adds 3 s of each multiplex found (`mux-<MHz>.ts`, replay with `--test`).
+(what it did, the frontend's replies, the libraries' Android log, the kernel log, amplay with the
+time of each step of a switch, the signal every 3 s), and a scan adds 3 s of each multiplex found
+(`mux-<MHz>.ts`, replay with `--test`).
 Under Android, `hybrid/box/android-log.sh` (installed at `/data/linux/android-log.sh`, started by
 `ozlinux.sh start` at boot) records logcat, the kernel log and the DVB sysfs state into
 `/data/linux/logs/android-N/`, i.e. `/mnt/nand/linux/logs/` seen from native Linux.
@@ -267,6 +318,8 @@ and keys are read from evdev.
 ```sh
 amplay film.mkv
 amplay --audio <audio url> <video url>      # what yt does with YouTube's DASH streams
+amplay --program 101 recording.ts           # one service of a broadcast TS
+amplay --tv                                 # the TV player, run by ozone-tv (see Television)
 amplay --reset                              # brings the desktop back if amplay was killed
 ```
 

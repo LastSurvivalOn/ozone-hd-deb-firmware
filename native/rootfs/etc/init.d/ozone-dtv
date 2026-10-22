@@ -31,7 +31,8 @@ start)
     # demux and dvr are used by the scanner and player as the regular user
     chgrp video /dev/dvb/adapter0/* && chmod g+rw /dev/dvb/adapter0/*
     # ozone-tv --test switches demux0 to memory input, and ozone-tv routes the TS-tap output to dvr0
-    for a in demux0_source asyncfifo0_source; do
+    # and sets how much of it the DMA gathers before passing it on
+    for a in demux0_source asyncfifo0_source asyncfifo0_flush_size; do
         chgrp video /sys/class/stb/$a && chmod g+w /sys/class/stb/$a
     done
     ;;

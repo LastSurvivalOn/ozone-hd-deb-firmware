@@ -3,29 +3,42 @@
 
 The frontend (AVL6762 demodulator + MxL608 tuner) is driven by dtvfe, which runs the TV app's own
 Android libraries (see ozone-dtv). Everything after the demodulator is the kernel's regular DVB
-demux: section filters for the tables (PAT, PMT, SDT, NIT), and PES filters with TS output on the
-chosen service's PIDs, read from dvr0 and piped into amplay, which decodes the video in hardware.
+demux: section filters for the tables (PAT, PMT, SDT, NIT, EIT), and PES filters with TS output on
+the services in use, read from dvr0. The watched service goes into the live buffer, a run of
+segment files that amplay --tv plays from with the hardware decoder, and that is also the
+timeshift buffer; a recording is the same data written to a drive.
 
   ozone-tv                        the TV window: channels, what's on, the guide; Enter to watch
-  ozone-tv scan [FROM TO]         scan UHF channels FROM..TO (default 21..60, 8 MHz)
-  ozone-tv scan --freq KHZ [BW]   scan one multiplex
   ozone-tv play N                 watch channel N of the list
+  ozone-tv timers                 the timer service (bspwmrc starts it): recordings and reminders
+  ozone-tv scan [FROM TO]         scan UHF channels FROM..TO (default 21..60, 8 MHz)
+  ozone-tv scan --freq KHZ [BW [PLP]]   scan one multiplex
+  ozone-tv scan --nit KHZ [BW]    the multiplexes the network lists (NIT), from the one at KHZ
   ozone-tv guide                  update the programme guide (tunes each multiplex for a while)
   ozone-tv now                    what's on every channel, from the guide
   ozone-tv status KHZ [BW]        tune and print the signal once a second (aiming the antenna)
+  ozone-tv antenna on|off         the 5 V power for an active antenna (kept in the settings)
   ozone-tv log                    the frontend libraries' messages (Android log)
   ozone-tv logs                   where the session logs are, and the latest one
 
   --test FILE: instead of the tuner, FILE (a TS) is fed into the demux from memory, as a single
   multiplex at 0 kHz; tests the scanner and player without an antenna.
-Channels are kept in ~/.local/share/ozone-tv/channels.json (with --test, channels-test.json), the
-programme guide in epg.json next to it. The guide comes from the EIT the multiplexes broadcast:
-Zeonbud's carry now/next and a week of schedule for their own services (tables 0x4e, 0x50-0x5f)
-and for the other multiplexes' (0x4f, 0x60-0x6f), so whatever is tuned, watching or scanning,
-fills in most of it; 'ozone-tv guide' visits every multiplex for the rest.
 
-In the player: Left/Right or PgDn/PgUp for the previous/next channel, Enter for the channel list
-on the left (with what's on), the arrows and Enter to switch.
+One ozone-tv process drives the tuner at a time. The TV window, the player and recordings are all
+that one process, which keeps the frontend open between them (starting it takes 1-4 s); running
+`ozone-tv`, `ozone-tv play N` or a timer again hands the request to it through a socket in the data
+directory. It ends when the window is closed and nothing is being watched or recorded.
+
+Data, in ~/.local/share/ozone-tv: channels.json (the list, with what the viewer changed: order,
+names, skips, locks, tracks, PIDs), settings.json, timers.json, epg.json (the programme guide, from
+the broadcast EIT: Zeonbud's multiplexes carry now/next and a week of schedule for all of them, so
+whatever is tuned fills in most of it; 'ozone-tv guide' visits every multiplex for the rest). With
+--test, channels-test.json. Recordings go to Recordings/ on the chosen drive, a .ts and a .json
+each.
+
+The player (amplay --tv) stays up while channels change: a switch is the tune (only for another
+multiplex, ~1.2 s) and the next keyframe (Zeonbud: one a second), not a new player. Its keys: see
+MANUAL.md, and osd.c.
 
 Every run is logged, without needing a network: /mnt/nand/linux/logs/tv-<time>-<command>/tv.log
 (the data partition, where Android's own logs go too, see hybrid/box/android-log.sh) has what
@@ -34,10 +47,14 @@ messages and the signal every 3 s while watching; a scan adds the raw tables and
 multiplex found (mux-<MHz>.ts), to replay later with --test. The last 30 runs are kept.
 """
 import fcntl
+import hashlib
 import json
 import os
+import queue
 import re
 import select
+import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -50,18 +67,28 @@ DEMUX = '/dev/dvb/adapter0/demux0'
 DVR = '/dev/dvb/adapter0/dvr0'
 DEMUX_SOURCE = '/sys/class/stb/demux0_source'
 ASYNCFIFO_SOURCE = '/sys/class/stb/asyncfifo0_source'
-NO_DATA_TIMEOUT = 10   # s without a byte from dvr0 before giving up on a channel
+ASYNCFIFO_FLUSH = '/sys/class/stb/asyncfifo0_flush_size'
+FLUSH_SIZE = 16384
+NO_DATA_TIMEOUT = 10   # s without a byte from dvr0 before saying so
 RELOCK_AFTER = 2       # signal checks (3 s apart) without lock while watching before tuning again
 DATA = os.path.join(os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share'), 'ozone-tv')
 CHANNELS = os.path.join(DATA, 'channels.json')
-LOCK = os.path.join(DATA, 'busy')   # the frontend can serve one run at a time
+SETTINGS = os.path.join(DATA, 'settings.json')
+TIMERS = os.path.join(DATA, 'timers.json')
+LOCK = os.path.join(DATA, 'busy')   # held by the process that drives the tuner
+CONTROL = os.path.join(DATA, 'control')   # its socket
 EPG = os.path.join(DATA, 'epg.json')
 OSD_CHANNELS = os.path.join(DATA, 'osd-channels.txt')   # the player's channel list
 EPG_KEEP = 3 * 3600        # s of programmes already over kept in the guide
 GUIDE_SECONDS = 25         # per multiplex, for 'ozone-tv guide'
 EIT_PID, TDT_PID = 0x12, 0x14
-LOGS = '/mnt/nand/linux/logs' if os.access('/mnt/nand/linux', os.W_OK) else os.path.join(DATA, 'logs')
+NAND = '/mnt/nand/linux'   # the data partition: logs, and recordings without a USB drive
+LOGS = NAND + '/logs' if os.access(NAND, os.W_OK) else os.path.join(DATA, 'logs')
 SAMPLE_SECONDS = 3
+SEG_BYTES = 8 << 20        # the live buffer's segment files (as amplay's SEG_BYTES)
+LIVE_MEMORY = '/dev/shm'
+RECORDINGS = 'Recordings'  # the folder on the drive
+MEDIA = '/media'
 
 # linux/dvb/dmx.h
 DMX_START = 0x6f29
@@ -73,8 +100,33 @@ DMX_CHECK_CRC, DMX_IMMEDIATE_START = 1, 4
 DMX_IN_FRONTEND, DMX_OUT_TS_TAP, DMX_PES_OTHER = 0, 2, 20
 
 VIDEO_TYPES = {0x01: 'mpeg1', 0x02: 'mpeg2', 0x1b: 'h264', 0x24: 'hevc'}
-AUDIO_TYPES = {0x03: 'mp1', 0x04: 'mp2', 0x0f: 'aac', 0x11: 'aac-latm', 0x81: 'ac3', 0x87: 'eac3'}
-TV_SERVICE_TYPES = {0x01, 0x11, 0x16, 0x19, 0x1f}
+AUDIO_TYPES = {0x03: 'mp2', 0x04: 'mp2', 0x0f: 'aac', 0x11: 'aac-latm', 0x81: 'ac3', 0x87: 'eac3'}
+RADIO_SERVICE_TYPES = {0x02, 0x07, 0x0a}
+
+DEFAULTS = {
+    'antenna_power': False,        # 5 V on the antenna input
+    'banner': 4,                   # s the player's bars stay up after a key
+    'aspect': 0,                   # the video layer's screen mode (see amplay's ASPECTS)
+    'audio_langs': ['ukr', 'eng'], # preferred audio, first and second
+    'audio_mode': 0,               # 0 stereo, 1 left, 2 right
+    'subtitles': False,            # on by default where there are some in subtitle_langs
+    'subtitle_langs': ['ukr', 'eng'],
+    'teletext_region': 0,          # characters of pages that don't say: 0 Latin, 32 Cyrillic
+    'timeshift_mb': 64,            # the live buffer in memory: ~2 min of an SD channel
+    'timeshift_drive': False,      # or on the recording drive, this much
+    'timeshift_drive_mb': 2048,
+    'drive': '',                   # recordings: a mount point, '' for the first USB drive
+    'instant': 'programme',        # an instant recording stops at the programme's end, or after N min
+    'margin_before': 1,            # min, for recordings from the guide
+    'margin_after': 5,
+    'pin': '',                     # sha256 of the PIN; '' is 0000
+    'age': 0,                      # programmes rated this age or more need the PIN; 0 off
+    'lock_menu': False,            # settings, scans and editing need the PIN
+    'groups': {'Favourites': []},  # favourites: name -> channel keys
+    'group': 'All',
+    'signals': {},                 # kHz -> [level, quality, time] last seen
+}
+ALL, RADIO, RECORDED, TIMERS_VIEW = 'All', 'Radio', 'Recordings', 'Timers'
 
 
 class Log:
@@ -226,6 +278,33 @@ def pipe_to_log(stream, src):
     threading.Thread(target=run, daemon=True).start()
 
 
+# ---- settings -----------------------------------------------------------------------------------
+
+def load_settings():
+    s = json.loads(json.dumps(DEFAULTS))   # a deep copy
+    try:
+        with open(SETTINGS) as f:
+            s.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    return s
+
+
+def save_settings(s):
+    os.makedirs(DATA, exist_ok=True)
+    with open(SETTINGS + '.tmp', 'w') as f:
+        json.dump(s, f, ensure_ascii=False, indent=1)
+    os.replace(SETTINGS + '.tmp', SETTINGS)
+
+
+def pin_hash(pin):
+    return hashlib.sha256(('ozone-tv:' + pin).encode()).hexdigest()
+
+
+def pin_ok(settings, pin):
+    return (settings.get('pin') or pin_hash('0000')) == pin_hash(pin)
+
+
 # ---- frontend -------------------------------------------------------------------------------------
 
 class Frontend:
@@ -247,16 +326,16 @@ class Frontend:
         self.lock = threading.Lock()   # the signal monitor asks while the player runs
         route_dvr()
 
-    def _ask(self, line):
+    def _ask(self, line, fields=4):
         with self.lock:
             t = time.monotonic()
             self.p.stdin.write(line + '\n')
             reply = self.p.stdout.readline().split()
             LOG.write('fe', '%s -> %s (%.2f s)' % (line, ' '.join(reply) or 'no reply, exit %s' % self.p.poll(),
                                                    time.monotonic() - t))
-        if len(reply) != 4:
+        if len(reply) != fields:
             raise RuntimeError('frontend: ' + (' '.join(reply) or 'dtvfe died'))
-        return int(reply[1]), int(reply[2]), int(reply[3])
+        return tuple(int(x) for x in reply[1:])
 
     def tune(self, khz, bw=8, plp=0):
         """(locked, strength %, quality %). The driver waits up to ~2.5 s for a lock itself;
@@ -273,6 +352,9 @@ class Frontend:
     def status(self):
         return self._ask('status')
 
+    def antenna(self, on):
+        return self._ask('antenna %d' % bool(on), 2)[0]
+
     def close(self):
         try:
             self.p.stdin.write('quit\n')
@@ -284,16 +366,19 @@ class Frontend:
 
 def route_dvr():
     """From the tuner input, TS-tap filters reach dvr0 through an asyncfifo (DMA) fed by the demux,
-    and nothing selects one after boot: without this, sections arrive but dvr0 stays empty"""
-    try:
-        with open(ASYNCFIFO_SOURCE) as f:
-            cur = f.read().strip()
-        if cur != 'dmx0':
-            with open(ASYNCFIFO_SOURCE, 'w') as f:
-                f.write('dmx0')
-        LOG.write('dmx', 'asyncfifo0 source: %r -> dmx0' % cur)
-    except OSError as e:
-        LOG.write('dmx', 'asyncfifo0 source: %s' % e)
+    and nothing selects one after boot: without this, sections arrive but dvr0 stays empty. The
+    DMA passes data on in blocks of flush_size, 256 KB after boot: at the 2-5 Mbit/s of a service
+    that was 0.5-1.3 s before a new channel's first packet; 16 KB is ~40 ms."""
+    for path, want in ((ASYNCFIFO_SOURCE, 'dmx0'), (ASYNCFIFO_FLUSH, str(FLUSH_SIZE))):
+        try:
+            with open(path) as f:
+                cur = f.read().strip()
+            if cur != want:
+                with open(path, 'w') as f:
+                    f.write(want)
+            LOG.write('dmx', '%s: %r -> %s' % (os.path.basename(path), cur, want))
+        except OSError as e:
+            LOG.write('dmx', '%s: %s' % (os.path.basename(path), e))
 
 
 class TestFrontend:
@@ -331,10 +416,22 @@ class TestFrontend:
     def status(self):
         return (1, 100, 100)
 
+    def antenna(self, on):
+        return int(bool(on))
+
     def close(self):
         self.stop.set()
         with open(DEMUX_SOURCE, 'w') as f:
             f.write('ts0')   # back to the tuner's TS input
+
+
+def open_frontend(test):
+    fe = TestFrontend(test) if test else Frontend()
+    try:
+        fe.antenna(load_settings().get('antenna_power'))
+    except RuntimeError as e:
+        LOG.write('fe', 'antenna power: %s' % e)
+    return fe
 
 
 # ---- tables -------------------------------------------------------------------------------------
@@ -418,24 +515,43 @@ def parse_pat(secs):
     return progs
 
 
+def lang_of(d):
+    return d[:3].decode('latin-1', errors='replace').strip('\0 ')
+
+
 def parse_pmt(s):
+    """A service's streams from its PMT section: the PCR PID, the video, the audio tracks, the
+    subtitles (DVB, and teletext subtitle pages), the teletext PID"""
     end = 3 + (((s[1] & 0x0f) << 8) | s[2]) - 4
     pcr = ((s[8] & 0x1f) << 8) | s[9]
     i = 12 + (((s[10] & 0x0f) << 8) | s[11])
-    video, audio = None, []
+    video, audio, subs, ttx = None, [], [], None
     while i + 5 <= end:
         stype, pid = s[i], ((s[i + 1] & 0x1f) << 8) | s[i + 2]
         n = ((s[i + 3] & 0x0f) << 8) | s[i + 4]
         desc = dict(descriptors(s[i + 5:i + 5 + n]))
-        lang = desc[0x0a][:3].decode('latin-1', errors='replace') if 0x0a in desc else ''
+        lang = lang_of(desc[0x0a]) if 0x0a in desc else ''
         if stype in VIDEO_TYPES and video is None:
             video = {'pid': pid, 'codec': VIDEO_TYPES[stype]}
         elif stype in AUDIO_TYPES:
             audio.append({'pid': pid, 'codec': AUDIO_TYPES[stype], 'lang': lang})
-        elif stype == 0x06 and (0x6a in desc or 0x7a in desc):   # AC-3 / E-AC-3 in private data
-            audio.append({'pid': pid, 'codec': 'ac3' if 0x6a in desc else 'eac3', 'lang': lang})
+        elif stype == 0x06 and (0x6a in desc or 0x7a in desc or 0x7c in desc):   # in private data
+            audio.append({'pid': pid, 'codec': 'ac3' if 0x6a in desc else 'eac3' if 0x7a in desc else 'aac',
+                          'lang': lang})
+        elif stype == 0x06 and 0x59 in desc:   # DVB subtitles, a language each 8 bytes
+            d = desc[0x59]
+            for j in range(0, len(d) - 7, 8):
+                subs.append({'pid': pid, 'type': 'd', 'lang': lang_of(d[j:j + 3]), 'page': 0})
+        elif stype == 0x06 and (0x56 in desc or 0x46 in desc):   # teletext: its pages, 5 bytes each
+            ttx = pid
+            d = desc.get(0x56) or desc[0x46]
+            for j in range(0, len(d) - 4, 5):
+                kind, mag = d[j + 3] >> 3, d[j + 3] & 7 or 8
+                if kind in (2, 5):   # subtitles, and for the hard of hearing
+                    subs.append({'pid': pid, 'type': 't', 'lang': lang_of(d[j:j + 3]) + ('·HoH' if kind == 5 else ''),
+                                 'page': mag << 8 | d[j + 4]})
         i += 5 + n
-    return pcr, video, audio
+    return pcr, video, audio, subs, ttx
 
 
 def parse_sdt(secs):
@@ -459,9 +575,11 @@ def parse_sdt(secs):
     return services
 
 
-def parse_nit_lcn(secs):
-    """Logical channel numbers (EACEM descriptor 0x83), service_id -> number"""
-    lcn = {}
+def parse_nit(secs):
+    """The logical channel numbers (EACEM descriptor 0x83), service_id -> number, and the
+    multiplexes the network lists: [(kHz, bandwidth MHz, PLP)] from terrestrial (0x5a) and T2
+    (0x7f/0x04) delivery descriptors"""
+    lcn, muxes = {}, []
     for s in secs:
         end = 3 + (((s[1] & 0x0f) << 8) | s[2]) - 4
         i = 10 + (((s[8] & 0x0f) << 8) | s[9])
@@ -472,8 +590,29 @@ def parse_nit_lcn(secs):
                 if tag == 0x83:
                     for j in range(0, len(d) - 3, 4):
                         lcn[(d[j] << 8) | d[j + 1]] = ((d[j + 2] & 0x03) << 8) | d[j + 3]
+                elif tag == 0x5a and len(d) >= 5:   # centre frequency in 10 Hz
+                    bw = {0: 8, 1: 7, 2: 6, 3: 5}.get(d[4] >> 5, 8)
+                    muxes.append((struct.unpack('>I', d[:4])[0] // 100, bw, 0))
+                elif tag == 0x7f and len(d) >= 4 and d[0] == 0x04:   # T2: PLP, system, cells
+                    plp = d[1]
+                    if len(d) < 6:
+                        continue
+                    bw = {0: 8, 1: 7, 2: 6, 3: 5, 4: 10}.get((d[4] >> 2) & 0x0f, 8)
+                    tfs = d[5] & 1
+                    j = 6
+                    while j + 2 < len(d):
+                        j += 2   # cell_id
+                        if tfs:
+                            k = d[j]
+                            freqs = [struct.unpack('>I', d[j + 1 + m:j + 5 + m])[0] for m in range(0, k, 4)]
+                            j += 1 + k
+                        else:
+                            freqs = [struct.unpack('>I', d[j:j + 4])[0]]
+                            j += 4
+                        j += 1 + (d[j] if j < len(d) else 0)   # subcells
+                        muxes += [(f // 100, bw, plp) for f in freqs]
             i += 6 + n
-    return lcn
+    return lcn, muxes
 
 
 def bcd(b):
@@ -488,7 +627,8 @@ def mjd_utc(b):
 
 
 def parse_eit(s):
-    """service_id and its events, (start, duration, title, description), from one EIT section"""
+    """service_id and its events, (start, duration, title, description, age rating or 0), from one
+    EIT section"""
     end = 3 + (((s[1] & 0x0f) << 8) | s[2]) - 4
     events = []
     i = 14
@@ -496,7 +636,7 @@ def parse_eit(s):
         start = mjd_utc(s[i + 2:i + 7])
         dur = bcd(s[i + 7]) * 3600 + bcd(s[i + 8]) * 60 + bcd(s[i + 9])
         n = ((s[i + 10] & 0x0f) << 8) | s[i + 11]
-        title, text, ext = '', '', {}
+        title, text, ext, age = '', '', {}, 0
         for tag, d in descriptors(s[i + 12:i + 12 + n]):
             if tag == 0x4d and len(d) >= 5:   # short_event: language, name, text
                 nl = d[3]
@@ -507,13 +647,89 @@ def parse_eit(s):
                 at = 5 + d[4]
                 if at < len(d):
                     ext[d[0] >> 4] = dvb_text(d[at + 1:at + 1 + d[at]])
+            elif tag == 0x55:   # parental_rating: country, minimum age - 3
+                for j in range(0, len(d) - 3, 4):
+                    if 0x01 <= d[j + 3] <= 0x0f:
+                        age = max(age, d[j + 3] + 3)
         if ext:
             text = ''.join(ext[k] for k in sorted(ext)) or text
         if start is not None and title:
-            events.append((start, dur, title, text))
+            events.append((start, dur, title, text, age))
         i += 12 + n
     return (s[3] << 8) | s[4], events
 
+
+# ---- PSI for amplay and recordings ----------------------------------------------------------------
+
+CRC_TABLE = []
+for _i in range(256):
+    _c = _i << 24
+    for _ in range(8):
+        _c = (_c << 1) ^ 0x04c11db7 if _c & 0x80000000 else _c << 1
+    CRC_TABLE.append(_c & 0xffffffff)
+
+
+def crc32_mpeg(b):
+    crc = 0xffffffff
+    for x in b:
+        crc = ((crc << 8) & 0xffffffff) ^ CRC_TABLE[((crc >> 24) ^ x) & 0xff]
+    return crc
+
+
+def section(table_id, ext, body):
+    sec = bytes([table_id]) + struct.pack('>HHBBB', 0xb000 | (5 + len(body) + 4), ext, 0xc1, 0, 0) + body
+    return sec + struct.pack('>I', crc32_mpeg(sec))
+
+
+def make_pat(ch):
+    return section(0x00, 1, struct.pack('>HH', ch['sid'], 0xe000 | ch['pmt_pid']))
+
+
+def make_pmt(ch):
+    """The PMT as broadcast (kept from the scan), or one made from the channel's fields: lists
+    scanned before it was kept, and PIDs edited by hand"""
+    if ch.get('pmt_raw') and not ch.get('pids_edited'):
+        return bytes.fromhex(ch['pmt_raw'])
+    types = {'mpeg1': 0x01, 'mpeg2': 0x02, 'h264': 0x1b, 'hevc': 0x24, 'mp1': 0x03, 'mp2': 0x03, 'aac': 0x0f,
+             'aac-latm': 0x11}
+    def es(stype, pid, desc=b''):
+        return struct.pack('>BHH', stype, 0xe000 | pid, 0xf000 | len(desc)) + desc
+    body = b''
+    if ch.get('video'):
+        body += es(types.get(ch['video']['codec'], 0x1b), ch['video']['pid'])
+    for a in ch['audio']:
+        lang = b'\x0a\x04' + a['lang'].encode('latin-1', 'replace')[:3].ljust(3, b' ') + b'\0'
+        if a['codec'] in ('ac3', 'eac3'):
+            body += es(0x06, a['pid'], (b'\x6a\x01\0' if a['codec'] == 'ac3' else b'\x7a\x01\0') + lang)
+        else:
+            body += es(types.get(a['codec'], 0x03), a['pid'], lang)
+    return section(0x02, ch['sid'], struct.pack('>HH', 0xe000 | (ch.get('pcr_pid') or 0x1fff), 0xf000) + body)
+
+
+def ts_packets(pid, sec):
+    out, first, cc = b'', True, 0
+    while sec or first:
+        head = bytes([0x47, (0x40 if first else 0) | pid >> 8, pid & 0xff, 0x10 | cc]) + (b'\0' if first else b'')
+        chunk, sec = sec[:188 - len(head)], sec[188 - len(head):]
+        out += (head + chunk).ljust(188, b'\xff')
+        first, cc = False, (cc + 1) & 15
+    return out
+
+
+def channel_pids(ch):
+    pids = {0x00, ch['pmt_pid']}
+    if ch.get('pcr_pid') and ch['pcr_pid'] != 0x1fff:
+        pids.add(ch['pcr_pid'])
+    if ch.get('video'):
+        pids.add(ch['video']['pid'])
+    pids |= {a['pid'] for a in ch['audio']}
+    pids |= {s['pid'] for s in ch.get('subtitles', [])}
+    if ch.get('teletext'):
+        pids.add(ch['teletext'])
+    return pids
+
+
+# ---- the guide ------------------------------------------------------------------------------------
 
 class Guide:
     """The programme guide: for each service_id (unique across Zeonbud's multiplexes), its events.
@@ -527,7 +743,7 @@ class Guide:
                 d = json.load(f)
         except (OSError, ValueError):
             d = {}
-        self.events = {sid: [tuple(e) for e in ev] for sid, ev in d.get('events', {}).items()}
+        self.events = {sid: [tuple(e) + (0,) * (5 - len(e)) for e in ev] for sid, ev in d.get('events', {}).items()}
         self.offset = d.get('clock_offset', 0)
         self.changed = False
 
@@ -569,9 +785,9 @@ class Guide:
         with self.lock:
             return list(self.events.get(str(sid), []))
 
-    def now_next(self, sid):
-        """(the programme on now, the one after), either None"""
-        t = self.now()
+    def now_next(self, sid, t=None):
+        """(the programme on at t (now), the one after), either None"""
+        t = self.now() if t is None else t
         ev = self.schedule(sid)
         for i, e in enumerate(ev):
             if e[0] <= t < e[0] + e[1]:
@@ -651,57 +867,57 @@ class EitReader:
         LOG.write('epg', '%d EIT sections, %d events' % (self.sections, self.events))
 
 
-def update_guide(test=None, progress=say):
+def update_guide(fe, progress=say):
     """Every multiplex of the channel list in turn, GUIDE_SECONDS each, for the guide"""
     muxes = sorted({(c['freq_khz'], c['bandwidth'], c['plp']) for c in load_channels()})
     if not muxes:
         progress('No channels yet: scan first')
         return
     guide = Guide()
-    fe = open_frontend(test)
-    try:
-        for n, (khz, bw, plp) in enumerate(muxes, 1):
-            progress('Guide %d/%d: %d MHz…' % (n, len(muxes), khz // 1000))
-            busy('updating the guide (%d/%d)' % (n, len(muxes)))
-            locked, _s, _q = fe.tune(khz, bw, plp)
-            if not locked:
-                continue
-            reader = EitReader(guide)
-            time.sleep(GUIDE_SECONDS)
-            reader.stop()
-    finally:
-        fe.close()
+    for n, (khz, bw, plp) in enumerate(muxes, 1):
+        progress('Guide %d/%d: %d MHz…' % (n, len(muxes), khz // 1000))
+        busy('updating the guide (%d/%d)' % (n, len(muxes)))
+        locked, _s, _q = fe.tune(khz, bw, plp)
+        if not locked:
+            continue
+        reader = EitReader(guide)
+        time.sleep(GUIDE_SECONDS)
+        reader.stop()
     progress('Guide updated: %d channels with programmes' % sum(1 for c in load_channels() if guide.schedule(c['sid'])))
 
 
+# ---- scanning -------------------------------------------------------------------------------------
+
 def read_mux(khz, bw, plp):
-    """The services of the multiplex the frontend is locked to"""
+    """The services of the multiplex the frontend is locked to, and the multiplexes its NIT lists"""
     progs = parse_pat(read_sections(0x00, 0x00))
     LOG.write('tv', 'PAT: %s' % ', '.join('service %d -> PMT 0x%x' % kv for kv in sorted(progs.items())))
     if not progs:
-        return []
+        return [], []
     sdt = parse_sdt(read_sections(0x11, 0x42, timeout=4))
-    lcn = parse_nit_lcn(read_sections(0x10, 0x40, timeout=4))
+    lcn, muxes = parse_nit(read_sections(0x10, 0x40, timeout=4))
     found = []
     for sid, pmt_pid in sorted(progs.items()):
         secs = read_sections(pmt_pid, 0x02, ext=sid, timeout=2)
         if not secs:
             continue
-        pcr, video, audio = parse_pmt(secs[0])
+        pcr, video, audio, subs, ttx = parse_pmt(secs[0])
         info = sdt.get(sid, {})
         found.append({
             'name': info.get('name') or 'Service %d' % sid,
             'provider': info.get('provider', ''),
             'scrambled': info.get('scrambled', False),
-            'radio': video is None,
+            'type': info.get('type'),
+            'radio': video is None or info.get('type') in RADIO_SERVICE_TYPES,
             'freq_khz': khz, 'bandwidth': bw, 'plp': plp,
             'sid': sid, 'pmt_pid': pmt_pid, 'pcr_pid': pcr,
-            'video': video, 'audio': audio,
+            'video': video, 'audio': audio, 'subtitles': subs, 'teletext': ttx,
+            'pmt_raw': secs[0].hex(),
             'lcn': lcn.get(sid),
         })
     for c in found:
         LOG.write('tv', 'service: %s' % json.dumps(c, ensure_ascii=False))
-    return found
+    return found, muxes
 
 
 def record_sample(services, path, seconds=SAMPLE_SECONDS):
@@ -709,12 +925,12 @@ def record_sample(services, path, seconds=SAMPLE_SECONDS):
     # the demux has 32 filters (31 free): tables first, then whole services while they fit
     pids = [0x00, 0x10, 0x11, 0x12, 0x14] + [c['pmt_pid'] for c in services]   # PAT NIT SDT EIT TDT, PMTs
     for c in services:
-        more = [p for p in [c['pcr_pid']] + ([c['video']['pid']] if c['video'] else []) +
-                [a['pid'] for a in c['audio']] if p not in pids and p != 0x1fff]
+        more = [p for p in channel_pids(c) if p not in pids and p != 0x1fff]
         if len(pids) + len(more) > 28:
             break
         pids += more
-    svc = Service({'pids': pids})
+    filters = Filters()
+    filters.set(set(pids))
     dvr = os.open(DVR, os.O_RDONLY | os.O_NONBLOCK)
     size = 0
     try:
@@ -731,70 +947,42 @@ def record_sample(services, path, seconds=SAMPLE_SECONDS):
                 size += len(data)
     finally:
         os.close(dvr)
-        svc.close()
+        filters.set(set())
     LOG.write('tv', 'sample: %s, %.1f MB, %.1f Mbit/s over %d PIDs' % (os.path.basename(path), size / 1e6,
                                                                      size * 8 / seconds / 1e6, len(pids)))
 
 
-# ---- channel list ---------------------------------------------------------------------------------
-
-def load_channels():
-    try:
-        with open(CHANNELS) as f:
-            channels = json.load(f)
-    except (OSError, ValueError):
-        return []
-    for c in channels:   # lists scanned before NULs were dropped
-        c['name'] = c['name'].replace('\0', '').strip()
-        c['provider'] = c.get('provider', '').replace('\0', '').strip()
-    return channels
-
-
-def lock_icon(c):
-    """Only for channels found encrypted when watched: the SDT's free_CA_mode ('scrambled') is set
-    on Zeonbud's services that Android shows without any card"""
-    return '  \U0001f512' if c.get('encrypted') else ''
-
-
-def save_channels(channels):
-    os.makedirs(DATA, exist_ok=True)
-    with open(CHANNELS + '.tmp', 'w') as f:
-        json.dump(channels, f, ensure_ascii=False, indent=1)
-    os.replace(CHANNELS + '.tmp', CHANNELS)
-
-
-def sort_channels(channels):
-    # broadcaster's numbering first, then by multiplex and service
-    return sorted(channels, key=lambda c: (c['lcn'] is None, c['lcn'] or 0, c['freq_khz'], c['sid']))
-
-
-def open_frontend(test):
-    return TestFrontend(test) if test else Frontend()
-
-
-def scan(freqs, test=None, progress=None):
-    """freqs: [(kHz, bandwidth MHz)]; progress(text), if given, gets the panel's messages too"""
+def scan(fe, freqs, test=None, progress=None, signals=None):
+    """freqs: [(kHz, bandwidth MHz, PLP)]; progress(text), if given, gets the panel's messages
+    too; signals, the levels found (else into the settings). Returns the new list, and the
+    multiplexes the networks list (NIT)"""
     def tell(text):
         notify(text)
         if progress:
             progress(text)
-    tell('Scanning %d frequencies, about %d min…' % (len(freqs), max(1, round(len(freqs) * 4.5 / 60))))
-    fe = open_frontend(test)
-    found = []
+    tell('Scanning %d frequenc%s, about %d min…' % (len(freqs), 'y' if len(freqs) == 1 else 'ies',
+                                                   max(1, round(len(freqs) * 4.5 / 60))))
+    found, listed = [], []
+    settings = None
+    if signals is None:
+        settings = load_settings()
+        signals = settings['signals']
     reader = EitReader(Guide())   # the guide fills in from every multiplex that locks
     try:
-        for n, (khz, bw) in enumerate(freqs, 1):
+        for n, (khz, bw, plp) in enumerate(freqs, 1):
             # on the panel too: a scan of the whole band takes minutes, mostly without any signal
             tell('Scan %d/%d: %d MHz… (found %d)' % (n, len(freqs), khz // 1000, sum(1 for c in found if not c['radio'])))
             busy('a channel scan is running (%d/%d)' % (n, len(freqs)))
-            locked, strength, quality = fe.tune(khz, bw)
+            locked, strength, quality = fe.tune(khz, bw, plp)
             label = '%d MHz (%d/%d)' % (khz // 1000, n, len(freqs))
             if not locked:
                 say('%s: no signal, level %d%%' % (label, strength))
                 continue
+            signals[str(khz)] = [strength, quality, time.time()]
             say('%s: locked, level %d%%, quality %d%%' % (label, strength, quality))
-            services = read_mux(khz, bw, 0)
+            services, muxes = read_mux(khz, bw, plp)
             found += services
+            listed += muxes
             if services and not test and LOG.dir:
                 try:
                     record_sample(services, LOG.path('mux-%d.ts' % (khz // 1000)))
@@ -805,26 +993,366 @@ def scan(freqs, test=None, progress=None):
                  (label, strength, quality, tv, len(services) - tv))
     finally:
         reader.stop()
-        fe.close()
-    # a rescan replaces the multiplexes it found, keeps the others
-    done = {s['freq_khz'] for s in found}
-    channels = sort_channels([c for c in load_channels() if c['freq_khz'] not in done] + found)
+    channels = merge_scan(load_channels(), found)
     save_channels(channels)
+    if settings:
+        save_settings(settings)
     tv = sum(1 for c in channels if not c['radio'])
-    tell('Scan finished: %d channels' % tv if tv else 'Scan finished: nothing found, check the antenna')
+    radio = len(channels) - tv
+    tell('Scan finished: %d channels%s' % (tv, ', %d radio' % radio if radio else '') if channels
+         else 'Scan finished: nothing found, check the antenna')
+    return channels, listed
+
+
+def nit_search(fe, khz, bw=8, test=None, progress=None, signals=None):
+    """The multiplexes the network information table lists, scanned; khz is one of its own"""
+    def tell(text):
+        notify(text)
+        if progress:
+            progress(text)
+    tell('Network search: reading the network table at %d MHz…' % (khz // 1000))
+    locked, strength, _q = fe.tune(khz, bw)
+    if not locked:
+        tell('Network search: no signal at %d MHz (level %d%%)' % (khz // 1000, strength))
+        return None
+    secs = read_sections(0x10, 0x40, timeout=6) + read_sections(0x10, 0x41, timeout=6)
+    _lcn, muxes = parse_nit(secs)
+    muxes = sorted(set(muxes) | {(khz, bw, 0)})
+    LOG.write('tv', 'NIT lists: %s' % muxes)
+    if len(muxes) == 1:
+        tell('The network lists no other frequencies (Zeonbud\'s doesn\'t): use the full scan')
+    return scan(fe, muxes, test, progress, signals)[0]
+
+
+def uhf(first, last):
+    """UHF channel numbers to (centre kHz, 8 MHz, PLP 0): channel 21 is 474 MHz"""
+    return [(306000 + 8000 * ch, 8, 0) for ch in range(first, last + 1)]
+
+
+def uhf_channel(khz):
+    ch = (khz - 306000) / 8000
+    return int(ch) if ch == int(ch) and 21 <= ch <= 69 else None
+
+
+# ---- the channel list -----------------------------------------------------------------------------
+
+USER_FIELDS = ('renamed', 'skip', 'locked', 'audio_pid', 'amode', 'subs_pid', 'encrypted')
+
+
+def key(c):
+    """A channel's identity, kept by favourites and timers: the service on its multiplex"""
+    return '%d:%d' % (c['freq_khz'], c['sid'])
+
+
+def load_channels():
+    try:
+        with open(CHANNELS) as f:
+            channels = json.load(f)
+    except (OSError, ValueError):
+        return []
+    for c in channels:   # lists scanned before NULs were dropped
+        c['name'] = c['name'].replace('\0', '').strip()
+        c['provider'] = c.get('provider', '').replace('\0', '').strip()
+        c.setdefault('subtitles', [])
+        c.setdefault('teletext', None)
     return channels
 
 
-# ---- watching ---------------------------------------------------------------------------------------
+def save_channels(channels):
+    os.makedirs(DATA, exist_ok=True)
+    with open(CHANNELS + '.tmp', 'w') as f:
+        json.dump(channels, f, ensure_ascii=False, indent=1)
+    os.replace(CHANNELS + '.tmp', CHANNELS)
 
-class Service:
-    """PES filters with TS output on one service's PIDs; while they exist, its packets reach dvr0"""
 
-    def __init__(self, ch):
-        pids = set(ch['pids']) if 'pids' in ch else (
-            {0x00, ch['pmt_pid'], ch['pcr_pid'], ch['video']['pid']} | {a['pid'] for a in ch['audio']})
-        self.fds = []
-        for pid in sorted(pids):
+def update_channel(ch, **fields):
+    """Fields of one channel changed and saved, in the list on disk too"""
+    ch.update(fields)
+    channels = load_channels()
+    for c in channels:
+        if key(c) == key(ch):
+            c.update(fields)
+    save_channels(channels)
+
+
+def sort_channels(channels, by='lcn'):
+    if by == 'name':
+        return sorted(channels, key=lambda c: c['name'].casefold())
+    # broadcaster's numbering first, then by multiplex and service
+    return sorted(channels, key=lambda c: (c['lcn'] is None, c['lcn'] or 0, c['freq_khz'], c['sid']))
+
+
+def merge_scan(old, found):
+    """A rescan: the multiplexes it found replace what the list had of them, keeping the viewer's
+    order, names, skips, locks and tracks; new services go at the end, by number"""
+    done = {c['freq_khz'] for c in found}
+    new = {key(c): c for c in found}
+    out = []
+    for c in old:
+        if c['freq_khz'] not in done:
+            out.append(c)
+            continue
+        n = new.pop(key(c), None)
+        if n is None:
+            continue   # gone from its multiplex
+        for f in USER_FIELDS:
+            if f in c:
+                n[f] = c[f]
+        if c.get('renamed'):
+            n['name'] = c['name']
+        if c.get('pids_edited'):
+            for f in ('video', 'audio', 'pcr_pid', 'pids_edited'):
+                n[f] = c[f]
+        out.append(n)
+    return out + sort_channels(list(new.values()))
+
+
+def lock_icon(c):
+    """Only for channels found encrypted when watched: the SDT's free_CA_mode ('scrambled') is set
+    on Zeonbud's services that Android shows without any card"""
+    return '  \U0001f512' if c.get('encrypted') else ''
+
+
+def groups(settings, channels):
+    """The lists the viewer can switch between: all TV channels, the favourites, radio"""
+    names = [ALL] + list(settings['groups'])
+    if any(c['radio'] for c in channels):
+        names.append(RADIO)
+    return names
+
+
+def group_list(channels, settings, group):
+    if group == RADIO:
+        return [c for c in channels if c['radio']]
+    if group in settings['groups']:
+        by_key = {key(c): c for c in channels}
+        return [by_key[k] for k in settings['groups'][group] if k in by_key]
+    return [c for c in channels if not c['radio']]
+
+
+def channel_number(ch, index):
+    """The place in the list, as the stock TV app numbers them: Zeonbud gives the same logical
+    channel numbers (NIT) to services of different multiplexes"""
+    return index + 1
+
+
+def remember_encrypted(ch, encrypted):
+    if ch.get('encrypted') != encrypted:
+        update_channel(ch, encrypted=encrypted)
+
+
+# ---- recordings -------------------------------------------------------------------------------------
+
+def drives():
+    """Mounted USB drives, SD cards and network folders (ozone-media), writable: [(path, label)]"""
+    out = []
+    try:
+        with open('/proc/mounts') as f:
+            for line in f:
+                dev, mnt, fs, opts = line.split()[:4]
+                mnt = mnt.replace('\\040', ' ')
+                if mnt.startswith(MEDIA + '/') and 'ro' not in opts.split(',') and os.access(mnt, os.W_OK):
+                    out.append((mnt, os.path.basename(mnt)))
+    except OSError:
+        pass
+    return out
+
+
+def recording_drive(settings):
+    """Where recordings go: the drive chosen, else the first USB drive, else the data partition"""
+    d = settings.get('drive')
+    if d and os.path.isdir(d) and os.access(d, os.W_OK):
+        return d
+    usb = drives()
+    if usb:
+        return usb[0][0]
+    return NAND if os.access(NAND, os.W_OK) else None
+
+
+def free_bytes(path):
+    try:
+        st = os.statvfs(path)
+        return st.f_bavail * st.f_frsize
+    except OSError:
+        return 0
+
+
+def safe_name(text):
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', text).strip(' .')[:120] or 'recording'
+
+
+class Recording:
+    """One service's packets written to a .ts on a drive, with a .json next to it: the channel,
+    the programme, when and how long"""
+
+    def __init__(self, ch, until, title, desc, drive, timer=None):
+        folder = os.path.join(drive, RECORDINGS)
+        os.makedirs(folder, exist_ok=True)
+        name = safe_name('%s %s%s' % (time.strftime('%Y-%m-%d %H.%M'), ch['name'], ' - ' + title if title else ''))
+        self.path = os.path.join(folder, name + '.ts')
+        self.f = open(self.path, 'wb')
+        self.f.write(ts_packets(0, make_pat(ch)) + ts_packets(ch['pmt_pid'], make_pmt(ch)))
+        self.ch, self.until, self.timer = ch, until, timer
+        self.key, self.pids = key(ch), channel_pids(ch)
+        self.start, self.size, self.error = time.time(), 0, None
+        self.meta = {'channel': ch['name'], 'sid': ch['sid'], 'radio': ch['radio'], 'title': title,
+                     'description': desc, 'start': self.start, 'duration': 0, 'file': os.path.basename(self.path)}
+        self.save_meta()
+        LOG.write('rec', 'recording %s until %s into %s' % (ch['name'], hhmm(until) if until else '-', self.path))
+
+    def write(self, data):
+        if self.error:
+            return
+        try:
+            self.f.write(data)
+            self.size += len(data)
+        except OSError as e:
+            self.error = e.strerror
+            LOG.write('rec', '%s: %s' % (self.path, e))
+
+    def save_meta(self):
+        try:
+            with open(self.path[:-3] + '.json', 'w') as f:
+                json.dump(self.meta, f, ensure_ascii=False, indent=1)
+        except OSError as e:
+            LOG.write('rec', 'meta: %s' % e)
+
+    def close(self):
+        try:
+            self.f.close()
+        except OSError:
+            pass
+        self.meta['duration'] = time.time() - self.start
+        self.meta['size'] = self.size
+        self.save_meta()
+        LOG.write('rec', 'recorded %s: %.0f min, %.0f MB%s' % (self.ch['name'], self.meta['duration'] / 60,
+                                                              self.size / 1e6, ', ' + self.error if self.error else ''))
+
+
+def list_recordings(settings):
+    """The recordings on every drive and the data partition, newest first"""
+    out, seen = [], set()
+    for d in [settings.get('drive')] + [p for p, _l in drives()] + [NAND]:
+        folder = os.path.join(d, RECORDINGS) if d else None
+        if not folder or folder in seen or not os.path.isdir(folder):
+            continue
+        seen.add(folder)
+        for n in os.listdir(folder):
+            if not n.endswith('.ts'):
+                continue
+            path = os.path.join(folder, n)
+            try:
+                with open(path[:-3] + '.json') as f:
+                    meta = json.load(f)
+            except (OSError, ValueError):
+                meta = {'title': n[:-3], 'channel': '', 'start': os.path.getmtime(path), 'duration': 0}
+            meta['path'] = path
+            meta['size'] = os.path.getsize(path)
+            out.append(meta)
+    return sorted(out, key=lambda m: -m.get('start', 0))
+
+
+# ---- timers ---------------------------------------------------------------------------------------
+
+def load_timers():
+    try:
+        with open(TIMERS) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def save_timers(timers):
+    os.makedirs(DATA, exist_ok=True)
+    with open(TIMERS + '.tmp', 'w') as f:
+        json.dump(timers, f, ensure_ascii=False, indent=1)
+    os.replace(TIMERS + '.tmp', TIMERS)
+
+
+def timer_conflict(timers, new):
+    """A recording timer that overlaps new on another multiplex (there is one tuner), or None"""
+    if new['action'] != 'record':
+        return None
+    mux = new['key'].split(':')[0]
+    for t in timers:
+        if (t['action'] == 'record' and t.get('state', '') in ('', 'running') and t['id'] != new['id'] and
+                t['start'] < new['end'] and new['start'] < t['end'] and t['key'].split(':')[0] != mux):
+            return t
+    return None
+
+
+def add_timer(ch, start, end, action, title, repeat=''):
+    """A timer (record, or switch to the channel at the start); returns (timer, conflicting timer)"""
+    timers = load_timers()
+    t = {'id': '%x' % int(time.time() * 1000), 'key': key(ch), 'channel': ch['name'], 'title': title,
+         'start': int(start), 'end': int(end), 'action': action, 'repeat': repeat, 'state': ''}
+    other = timer_conflict(timers, t)
+    if other:
+        return None, other
+    timers.append(t)
+    save_timers(timers)
+    LOG.write('timer', 'added: %s' % json.dumps(t, ensure_ascii=False))
+    return t, None
+
+
+def timer_for(timers, ch, event):
+    """The timer set on a programme of the guide, if any"""
+    k = key(ch)
+    for t in timers:
+        if t['key'] == k and t.get('state', '') in ('', 'running') and t['start'] <= event[0] + 60 and \
+                t['end'] >= event[0] + event[1] - 60:
+            return t
+    return None
+
+
+def timer_service():
+    """ozone-tv timers: wakes the TV process for timers due when it isn't running (it does the
+    rest itself). From standby too, which only turns the screen off; not from power off, which
+    nothing but the remote can end (the RTC has no wake alarm)."""
+    env = dict(os.environ)
+    env.setdefault('DISPLAY', ':0')   # the TV process is a window's, even when it starts hidden
+    started = []
+    while True:
+        now = time.time()
+        due = [t for t in load_timers() if t.get('state', '') == '' and t['start'] - 90 <= now < t['end']]
+        if due and not control('timers'):
+            print('%s: starting the TV for %s' % (time.strftime('%F %T'), due[0]['title']), flush=True)
+            started.append(subprocess.Popen(['ozone-tv', 'timer', due[0]['id']], stdin=subprocess.DEVNULL,
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+                                            start_new_session=True))
+        started = [p for p in started if p.poll() is None]
+        time.sleep(30)
+
+
+# ---- the control socket ---------------------------------------------------------------------------
+
+def control(line):
+    """Hands a request to the running TV process; its reply, or None if none is running"""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect(CONTROL)
+        s.sendall(line.encode() + b'\n')
+        reply = s.makefile().readline().strip()
+        s.close()
+        return reply or 'ok'
+    except OSError:
+        return None
+
+
+# ---- the tuner in use: filters, dvr0, the live buffer -----------------------------------------------
+
+class Filters:
+    """PES filters with TS output on a set of PIDs; while a PID's filter exists, its packets reach
+    dvr0. Changed a PID at a time, so services that stay keep flowing."""
+
+    def __init__(self):
+        self.fds = {}
+
+    def set(self, pids):
+        for pid in [p for p in self.fds if p not in pids]:
+            os.close(self.fds.pop(pid))
+        for pid in sorted(p for p in pids if p not in self.fds):
             fd = os.open(DEMUX, os.O_RDWR)
             try:
                 fcntl.ioctl(fd, DMX_SET_PES_FILTER, struct.pack('<H2xiiiI', pid, DMX_IN_FRONTEND, DMX_OUT_TS_TAP,
@@ -833,21 +1361,88 @@ class Service:
                 LOG.write('dmx', 'PES filter on 0x%x: %s' % (pid, e.strerror))
                 os.close(fd)
                 continue
-            self.fds.append(fd)
-        LOG.write('dmx', 'PES filters on %s' % ' '.join('0x%x' % p for p in sorted(pids)))
+            self.fds[pid] = fd
+        LOG.write('dmx', 'PES filters on %s' % (' '.join('0x%x' % p for p in sorted(self.fds)) or 'nothing'))
+
+
+def only(data, pids):
+    """The TS packets of data on pids"""
+    out = bytearray()
+    for i in range(0, len(data) - 187, 188):
+        if ((data[i + 1] & 0x1f) << 8 | data[i + 2]) in pids:
+            out += data[i:i + 188]
+    return bytes(out)
+
+
+class LiveBuffer:
+    """The watched service's packets in segment files that amplay --tv reads behind the writer:
+    SEG_BYTES each, the oldest deleted once there are more than the size given. In memory by
+    default (a couple of minutes of timeshift), or on the recording drive."""
+
+    def __init__(self, directory, max_bytes, on_low):
+        self.dir = directory
+        self.prefix = os.path.join(directory, 'ozone-tv-live-%d-' % os.getpid())
+        for n in os.listdir(directory):   # from a run that crashed
+            m = re.match(r'ozone-tv-live-(\d+)-\d+\.ts$', n)
+            if m and not os.path.exists('/proc/' + m.group(1)):
+                try:
+                    os.unlink(os.path.join(directory, n))
+                except OSError:
+                    pass
+        self.keep = max(3, max_bytes // SEG_BYTES)
+        self.offset = self.low = 0
+        self.f, self.seg, self.on_low = None, -1, on_low
+        self.lock = threading.Lock()
+        self.full = False
+        LOG.write('live', 'buffer %s*, %d MB' % (self.prefix, self.keep * SEG_BYTES >> 20))
+
+    def path(self, seg):
+        return '%s%06d.ts' % (self.prefix, seg)
+
+    def write(self, data):
+        with self.lock:
+            while data:
+                seg, pos = divmod(self.offset, SEG_BYTES)
+                try:
+                    if seg != self.seg:
+                        if self.f:
+                            self.f.close()
+                        self.f = open(self.path(seg), 'wb', buffering=0)
+                        self.seg = seg
+                        if seg >= self.keep:
+                            try:
+                                os.unlink(self.path(seg - self.keep))
+                            except OSError:
+                                pass
+                            self.low = (seg - self.keep + 1) * SEG_BYTES
+                            self.on_low(self.low)
+                    n = min(len(data), SEG_BYTES - pos)
+                    self.f.write(data[:n])
+                except OSError as e:   # the memory or drive full: dropped
+                    if not self.full:
+                        LOG.write('live', 'buffer: %s' % e)
+                    self.full = True
+                    return
+                self.full = False
+                self.offset += n
+                data = data[n:]
 
     def close(self):
-        for fd in self.fds:
-            os.close(fd)
-
-
-WATCHED = 0   # the channel the last watch() ended on, for the TV window
+        with self.lock:
+            if self.f:
+                self.f.close()
+            for seg in range(max(0, self.seg - self.keep), self.seg + 1):
+                try:
+                    os.unlink(self.path(seg))
+                except OSError:
+                    pass
 
 
 def tune_until_locked(fe, ch, waiting=None, cancel=None):
     """Tunes to ch's multiplex and, without a lock, tunes again and again, as the stock TV app does:
     a weak or disturbed multiplex (506 MHz here at night) locks after a few tries, or later.
-    waiting(text) gets what's going on, cancel (an Event) stops it. True once locked"""
+    waiting(text) gets what's going on; cancel(seconds) waits that long and says whether to stop.
+    True once locked"""
     tries = 0
     while True:
         locked, strength, _q = fe.tune(ch['freq_khz'], ch['bandwidth'], ch['plp'])
@@ -863,182 +1458,551 @@ def tune_until_locked(fe, ch, waiting=None, cancel=None):
             notify(text)
         if tries == 1 or tries % 10 == 0:
             LOG.write('tv', '%d MHz: no lock after %d tries' % (ch['freq_khz'] // 1000, tries))
-        if cancel and cancel.wait(0.5):
-            return False
+        if cancel:
+            if cancel(0.5):
+                return False
+        else:
+            time.sleep(0.5)
 
 
-def watch(index, test=None, waiting=None, cancel=None):
-    """Plays channel `index`; amplay's exit status 10/11 moves to the next/previous channel, 12 to
-    the one chosen in its list. Without a signal it keeps trying (see tune_until_locked); waiting
-    and cancel are passed on to it, and waiting(None) means the player is about to start"""
-    global WATCHED
-    channels = [c for c in load_channels() if not c['radio']]
-    if not channels:
-        notify('No channels yet: scan first')
-        return 1
-    fe = open_frontend(test)
-    guide = Guide()
-    reader = None
-    try:
-        index %= len(channels)
-        while True:
-            WATCHED = index
-            ch = channels[index]
-            LOG.write('tv', 'channel %d: %s' % (index + 1, json.dumps(ch, ensure_ascii=False)))
-            busy('watching %s' % ch['name'])
-            # another multiplex, or this one lost
-            if fe.khz != ch['freq_khz'] or not fe.status()[0]:
-                if not tune_until_locked(fe, ch, waiting, cancel):
-                    LOG.write('tv', 'stopped waiting for a signal')
-                    return 0
-            if waiting:
-                waiting(None)
-            if not reader:
-                reader = EitReader(guide)
-            status, chosen = play(ch, index, fe, guide, channels)
-            LOG.write('tv', 'player exit status %s%s' % (status, ', channel %d' % (chosen + 1) if chosen is not None else ''))
-            if status == 10:
-                index = (index + 1) % len(channels)
-            elif status == 11:
-                index = (index - 1) % len(channels)
-            elif status == 12 and chosen is not None:
-                index = chosen % len(channels)
-            else:
-                return status
-    finally:
-        if reader:
-            reader.stop()
-        fe.close()
+class Tuner:
+    """The frontend tuned to one multiplex, and dvr0 read in a thread: the watched service's packets
+    go to the live buffer, each recording's to its file. Also the signal every 3 s (relocking when
+    it is lost) and the guide from the multiplex's EIT."""
 
-
-def monitor_signal(fe, ch, stop):
-    """The signal every 3 s while watching, into the log. When the lock is gone for a while the
-    demodulator does not get it back by itself, so tune again until it does (the picture stands
-    still meanwhile and goes on when the data is back)"""
-    unlocked = 0
-    while not stop.wait(3):
+    def __init__(self, app):
+        self.app = app
+        self.fe = app.frontend()
+        self.lock = threading.RLock()
+        self.watched, self.buf, self.events = None, None, None
+        self.recordings = []
+        self.filters = Filters()
+        self.split = False
+        self.eit = None
+        self.dvr = os.open(DVR, os.O_RDONLY | os.O_NONBLOCK)
         try:
-            locked, strength, quality = fe.status()
+            fcntl.ioctl(self.dvr, DMX_SET_BUFFER_SIZE, 4 << 20)
+        except OSError as e:
+            LOG.write('dmx', 'dvr buffer size: %s' % e.strerror)
+        self.stopped = threading.Event()
+        self._checks(None)
+        self.threads = [threading.Thread(target=f, daemon=True) for f in (self._read, self._monitor)]
+        for t in self.threads:
+            t.start()
+
+    def mux(self):
+        """The multiplex recordings hold the tuner on, or None"""
+        with self.lock:
+            return self.recordings[0].ch['freq_khz'] if self.recordings else None
+
+    def tune(self, ch, waiting=None, cancel=None):
+        if self.fe.khz == ch['freq_khz'] and self.fe.status()[0]:
+            return True
+        if not tune_until_locked(self.fe, ch, waiting, cancel):
+            return False
+        if not self.eit:
+            self.eit = EitReader(self.app.guide)
+        return True
+
+    def _refilter(self):
+        sets = ([channel_pids(self.watched)] if self.watched else []) + [r.pids for r in self.recordings]
+        self.filters.set(set().union(*sets) if sets else set())
+        self.split = len({frozenset(s) for s in sets}) > 1
+
+    def _checks(self, ch):
+        self.since, self.total, self.checked, self.scrambled, self.nodata_told = time.monotonic(), 0, 0, 0, False
+        self.vpid = ch['video']['pid'] if ch and ch.get('video') else None
+
+    def watch(self, ch):
+        """ch's packets to the live buffer from now on (None: nobody's); where in it they start"""
+        with self.lock:
+            self.watched = ch
+            self._refilter()
+            self._checks(ch)
+            return self.buf.offset if self.buf else 0
+
+    def add_recording(self, rec):
+        with self.lock:
+            self.recordings.append(rec)
+            self._refilter()
+
+    def remove_recording(self, rec):
+        with self.lock:
+            if rec in self.recordings:
+                self.recordings.remove(rec)
+            self._refilter()
+        rec.close()
+
+    def recording(self, ch):
+        with self.lock:
+            return next((r for r in self.recordings if r.key == key(ch)), None)
+
+    def idle(self):
+        with self.lock:
+            return not self.watched and not self.recordings
+
+    def _read(self):
+        got, since = 0, time.monotonic()
+        while not self.stopped.is_set():
+            if time.monotonic() - since >= 10 and got:
+                LOG.write('dvr', '%.2f Mbit/s' % (got * 8 / (time.monotonic() - since) / 1e6))
+                got, since = 0, time.monotonic()
+            if not select.select([self.dvr], [], [], 0.5)[0]:
+                continue
+            try:
+                data = os.read(self.dvr, 188 * 1024)
+            except BlockingIOError:
+                continue
+            except OSError as e:   # EOVERFLOW: we fell behind, the driver dropped data
+                LOG.write('dvr', 'read: %s' % e.strerror)
+                continue
+            got += len(data)
+            with self.lock:
+                if self.watched and self.buf:
+                    self.buf.write(only(data, channel_pids(self.watched)) if self.split else data)
+                    self._check(data)
+                for r in self.recordings:
+                    r.write(only(data, r.pids) if self.split else data)
+
+    def _check(self, data):
+        """Whether the watched channel's video is scrambled: then it needs the provider's card"""
+        self.total += len(data)
+        if self.vpid is None or self.checked >= 2000:
+            return
+        for i in range(0, len(data) - 187, 188):
+            if data[i] == 0x47 and ((data[i + 1] & 0x1f) << 8 | data[i + 2]) == self.vpid:
+                self.checked += 1
+                self.scrambled += bool(data[i + 3] & 0xc0)   # transport_scrambling_control
+        if self.checked >= 2000:
+            encrypted = self.scrambled > self.checked // 2
+            LOG.write('tv', 'video packets: %d of %d scrambled' % (self.scrambled, self.checked))
+            remember_encrypted(self.watched, encrypted)
+            if encrypted and self.events:
+                self.events.put(('encrypted',))
+
+    def _monitor(self):
+        """The signal every 3 s, into the log. When the lock is gone for a while the demodulator
+        does not get it back by itself, so tune again until it does (the picture stands still
+        meanwhile and goes on when the data is back)"""
+        unlocked = 0
+        while not self.stopped.wait(3):
+            if self.fe.khz is None or self.idle():
+                continue
+            try:
+                locked, strength, quality = self.fe.status()
+            except (RuntimeError, OSError) as e:
+                LOG.write('signal', str(e))
+                return
             LOG.write('signal', '%s, level %d%%, quality %d%%' % ('locked' if locked else 'NO LOCK', strength, quality))
+            self.app.note_signal(self.fe.khz, strength, quality)
+            if self.events:
+                self.events.put(('signal', locked, strength, quality))
+            with self.lock:
+                w = self.watched
+                if w and not self.nodata_told and time.monotonic() - self.since > NO_DATA_TIMEOUT and \
+                        (not self.total or (self.vpid is not None and not self.checked)):
+                    self.nodata_told = True
+                    LOG.write('tv', 'nothing from the tuner in %d s: %d bytes, %d video packets' %
+                              (NO_DATA_TIMEOUT, self.total, self.checked))
+                    if self.events:
+                        self.events.put(('nodata', 'video' if self.total else 'data'))
             unlocked = 0 if locked else unlocked + 1
             if unlocked >= RELOCK_AFTER:
-                locked, strength, _q = fe.tune(ch['freq_khz'], ch['bandwidth'], ch['plp'])
-                LOG.write('signal', 'tuned again: %s, level %d%%' % ('locked' if locked else 'no lock', strength))
-                if locked:
-                    unlocked = 0
-        except (RuntimeError, OSError) as e:
-            LOG.write('signal', str(e))
-            return
+                khz = self.fe.khz
+                ch = w or (self.recordings[0].ch if self.recordings else None)
+                if ch and ch['freq_khz'] == khz:
+                    locked, strength, _q = self.fe.tune(khz, ch['bandwidth'], ch['plp'])
+                    LOG.write('signal', 'tuned again: %s, level %d%%' % ('locked' if locked else 'no lock', strength))
+                    if locked:
+                        unlocked = 0
+
+    def close(self):
+        self.stopped.set()
+        for t in self.threads:
+            t.join(4)
+        with self.lock:
+            for r in list(self.recordings):
+                self.remove_recording(r)
+            self.watched = None
+            self.filters.set(set())
+        if self.eit:
+            self.eit.stop()
+        os.close(self.dvr)
 
 
-def channel_number(ch, index):
-    """The place in the list, as the stock TV app numbers them: Zeonbud gives the same logical
-    channel numbers (NIT) to services of different multiplexes"""
-    return index + 1
+# ---- the player -----------------------------------------------------------------------------------
+
+class Player:
+    """amplay --tv: commands to its stdin, what the viewer does from its stdout into events"""
+
+    def __init__(self, events, banner):
+        self.events = events
+        self.lock = threading.Lock()
+        self.p = subprocess.Popen(['amplay', '-v', '--tv', '--banner', str(banner)], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+                                  errors='replace')
+        pipe_to_log(self.p.stderr, 'amplay')
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        for line in self.p.stdout:
+            words = line.split()
+            if words:
+                LOG.write('player', line.strip())
+                self.events.put(tuple(words))
+        self.events.put(('quit', 'exit'))
+
+    def send(self, *fields):
+        line = '\t'.join(str(f).replace('\t', ' ').replace('\n', '\\n') for f in fields)
+        with self.lock:
+            try:
+                self.p.stdin.write(line + '\n')
+                self.p.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+
+    def close(self):
+        self.send('quit')
+        try:
+            self.p.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.p.wait(5)
+        except subprocess.TimeoutExpired:
+            self.p.kill()
+            self.p.wait()
+        LOG.write('tv', 'player exit status %s' % self.p.returncode)
+        subprocess.call(['amplay', '--reset'])
 
 
-def play(ch, index, fe=None, guide=None, channels=None):
-    """(amplay's exit status, the channel chosen in its list or None)"""
-    service = Service(ch)
-    dvr = os.open(DVR, os.O_RDONLY | os.O_NONBLOCK)
-    try:
-        fcntl.ioctl(dvr, DMX_SET_BUFFER_SIZE, 4 << 20)
-    except OSError as e:
-        LOG.write('dmx', 'dvr buffer size: %s' % e.strerror)
-    title = '%d  %s%s' % (channel_number(ch, index), ch['name'], lock_icon(ch))
-    cmd = ['amplay', '-v', '--live', '--program', str(ch['sid'])]
-    if guide:
-        # what's on now and next in the title, and every channel's in the list on the left
-        now, nxt = guide.now_next(ch['sid'])
+def clean(text):
+    return ' '.join(str(text).split())
+
+
+class Watch:
+    """Watching: one amplay --tv for the whole time, on the tuner's live buffer. Runs in a thread,
+    taking events from the player, the tuner and the app in turn."""
+
+    def __init__(self, app, group, index):
+        self.app, self.group, self.index = app, group, index
+        self.events = queue.Queue()
+        s = app.settings
+        if s.get('timeshift_drive') and recording_drive(s) and recording_drive(s) != NAND:
+            where, size = recording_drive(s), s['timeshift_drive_mb'] << 20
+        else:
+            where, size = LIVE_MEMORY, s['timeshift_mb'] << 20
+        self.buf = LiveBuffer(where, size, lambda low: self.player.send('buffer', low))
+        self.player = Player(self.events, s['banner'])
+        self.tuner = None
+        self.unlocked = set()
+        self.pending = None      # a locked channel waiting for the PIN
+        self.ch = None
+        self.started = False
+
+    @property
+    def list(self):
+        return group_list(self.app.channels, self.app.settings, self.group)
+
+    def run(self):
+        try:
+            self.tuner = self.app.tuner()
+            with self.tuner.lock:
+                self.tuner.buf = self.buf
+                self.tuner.events = self.events
+            self.player.send('aspect', self.app.settings['aspect'])
+            self.send_list()
+            self.switch(self.index)
+            self.loop()
+        except Exception:
+            LOG.write('tv', traceback.format_exc())
+        finally:
+            if self.tuner:
+                with self.tuner.lock:
+                    self.tuner.watch(None)
+                    self.tuner.buf = self.tuner.events = None
+            self.player.close()
+            self.buf.close()
+            self.app.watch_ended(self)
+
+    def loop(self):
+        tick = time.monotonic()
+        while True:
+            try:
+                ev = self.events.get(timeout=5)
+            except queue.Empty:
+                ev = None
+            if time.monotonic() - tick >= 30:
+                tick = time.monotonic()
+                self.refresh()
+            if not ev:
+                continue
+            what = ev[0]
+            if what == 'quit':
+                return
+            if what == 'channel':
+                # the viewer pressed on: only the last one counts
+                target = int(ev[1])
+                while True:
+                    with self.events.mutex:
+                        nxt = next((e for e in self.events.queue if e[0] in ('channel', 'quit', 'play')), None)
+                    if not nxt or nxt[0] != 'channel':
+                        break
+                    target = int(self.events.get()[1])
+                self.switch(target)
+            elif what == 'play':   # from the app: a channel by its key (the window, a timer)
+                lst = self.list
+                i = next((i for i, c in enumerate(lst) if key(c) == ev[1]), None)
+                if i is None:
+                    self.group = ALL if not ev[2] else RADIO
+                    self.send_list()
+                    i = next((i for i, c in enumerate(self.list) if key(c) == ev[1]), 0)
+                self.switch(i)
+            elif what == 'pin':
+                self.on_pin(ev[1])
+            elif what == 'audio' and self.ch:
+                update_channel(self.ch, audio_pid=int(ev[1]), amode=int(ev[2]))
+            elif what == 'subs' and self.ch:
+                update_channel(self.ch, subs_pid=int(ev[1]), subs_page=int(ev[2], 16))
+            elif what == 'aspect':
+                self.app.set_setting('aspect', int(ev[1]))
+            elif what == 'record':
+                self.toggle_recording()
+            elif what in ('group', 'tvradio'):
+                self.next_group(what == 'tvradio')
+            elif what == 'signal':
+                self.player.send('signal', '%d %d %d' % ev[1:4])
+            elif what == 'encrypted':
+                self.player.send('message', 0, '%s is encrypted: it needs the provider\'s card' % self.ch['name'])
+            elif what == 'nodata':
+                self.player.send('message', 0, '%s: no %s from the tuner' % (self.ch['name'], ev[1]))
+            elif what == 'recordings':   # started or stopped elsewhere (a timer)
+                self.player.send('rec', 1 if self.ch and self.tuner.recording(self.ch) else 0)
+            elif what == 'error':
+                LOG.write('tv', 'player: %s' % ' '.join(ev))
+
+    def _interrupt(self, timeout):
+        """For the tuning loop: wait, and stop if the viewer moved on"""
+        end = time.monotonic() + timeout
+        while True:
+            with self.events.mutex:
+                if any(e[0] in ('channel', 'quit', 'play') for e in self.events.queue):
+                    return True
+            if time.monotonic() >= end:
+                return False
+            time.sleep(0.05)
+
+    def title(self, ch, index):
+        title = '%d  %s%s' % (channel_number(ch, index), ch['name'], lock_icon(ch))
+        now, nxt = self.app.guide.now_next(ch['sid'])
         if now:
             title += '   %s–%s %s' % (hhmm(now[0]), hhmm(now[0] + now[1]), now[2])
         if nxt:
             title += '   ·   %s %s' % (hhmm(nxt[0]), nxt[2])
+        return clean(title)
+
+    def send_list(self):
+        lst = self.list
         try:
             with open(OSD_CHANNELS, 'w') as f:
-                for i, c in enumerate(channels):
-                    f.write('%d\t%s%s\t%s\n' % (channel_number(c, i), c['name'], lock_icon(c),
-                                                 on_now(guide, c).replace('\t', ' ').replace('\n', ' ')))
-            cmd += ['--channels', OSD_CHANNELS, '--channel', str(index)]
+                for i, c in enumerate(lst):
+                    f.write('%d\t%s%s\t%s\t%s\n' % (channel_number(c, i), clean(c['name']), lock_icon(c),
+                                                     clean(on_now(self.app.guide, c)), 's' if c.get('skip') else ''))
         except OSError as e:
             LOG.write('tv', 'channel list for the player: %s' % e)
-    player = subprocess.Popen(cmd + ['--title', title, 'pipe:0'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True, errors='replace')
-    pipe_to_log(player.stderr, 'amplay')
-    stop = threading.Event()
-    if fe:
-        threading.Thread(target=monitor_signal, args=(fe, ch, stop), daemon=True).start()
-    out = player.stdin.fileno()
-    # what came out of the demux, every 5 s: no data means no signal or wrong PIDs
-    got, overflows, since = 0, 0, time.monotonic()
-    started, total = time.monotonic(), 0
-    vpid = ch['video']['pid'] if ch.get('video') else None
-    checked, scrambled = 0, 0   # video packets looked at, and how many had scrambling bits
-    try:
-        while player.poll() is None:
-            if time.monotonic() - since >= 5:
-                LOG.write('dvr', '%.2f Mbit/s, %d overflow(s)' % (got * 8 / (time.monotonic() - since) / 1e6, overflows))
-                got, overflows, since = 0, 0, time.monotonic()
-            if (not checked if vpid is not None else not total) and time.monotonic() - started > NO_DATA_TIMEOUT:
-                # amplay is still waiting for the picture, with nothing on screen
-                notify('%s: no %s from the tuner' % (ch['name'], 'video' if total else 'data'))
-                LOG.write('tv', 'gave up: %d bytes in %d s, none of them video' % (total, NO_DATA_TIMEOUT))
-                player.terminate()
-                break
-            if not select.select([dvr], [], [], 0.5)[0]:
-                continue
-            try:
-                data = os.read(dvr, 188 * 1024)
-            except BlockingIOError:
-                continue
-            except OSError:   # EOVERFLOW: the reader fell behind, the driver dropped data
-                overflows += 1
-                continue
-            got += len(data)
-            total += len(data)
-            if vpid is not None and checked < 2000:
-                for i in range(0, len(data) - 187, 188):
-                    if data[i] == 0x47 and ((data[i + 1] & 0x1f) << 8 | data[i + 2]) == vpid:
-                        checked += 1
-                        scrambled += bool(data[i + 3] & 0xc0)   # transport_scrambling_control
-                if checked >= 2000:
-                    encrypted = scrambled > checked // 2
-                    LOG.write('tv', 'video packets: %d of %d scrambled' % (scrambled, checked))
-                    remember_encrypted(ch, encrypted)
-                    if encrypted:
-                        notify('%s is encrypted: it needs the provider\'s card' % ch['name'])
-                        player.terminate()
-                        break
-            try:
-                os.write(out, data)
-            except BrokenPipeError:
-                break
-    finally:
-        stop.set()
-        os.close(dvr)
-        service.close()
-        try:
-            player.stdin.close()
-        except OSError:
-            pass
-    status = player.wait()
-    m = re.search(r'^channel (\d+)$', player.stdout.read(), re.M)
-    subprocess.call(['amplay', '--reset'])
-    return status, int(m.group(1)) if m else None
+            return
+        cur = next((i for i, c in enumerate(lst) if self.ch and key(c) == key(self.ch)), -1)
+        self.player.send('channels', OSD_CHANNELS, cur)
+
+    def next_group(self, radio):
+        names = groups(self.app.settings, self.app.channels)
+        if radio:
+            self.group = RADIO if self.group != RADIO and RADIO in names else ALL
+        else:
+            tv = [n for n in names if n != RADIO]
+            self.group = tv[(tv.index(self.group) + 1) % len(tv)] if self.group in tv else ALL
+        lst = self.list
+        self.send_list()
+        self.player.send('message', 2, '%s: %d channel%s' % (self.group_label(), len(lst), '' if len(lst) == 1 else 's'))
+        if radio and lst:   # TV/radio switches to it, the color key only shows the list
+            self.switch(0)
+
+    def group_label(self):
+        return {ALL: 'All channels', RADIO: 'Radio'}.get(self.group, self.group)
+
+    def locked(self, ch):
+        """The PIN first: a locked channel, or a programme rated above the age limit"""
+        if key(ch) in self.unlocked:
+            return None
+        if ch.get('locked'):
+            return 'Locked channel: enter the PIN'
+        age = self.app.settings.get('age') or 0
+        now, _n = self.app.guide.now_next(ch['sid'])
+        if age and now and now[4] >= age:
+            return 'Rated %d+: enter the PIN' % now[4]
+        return None
+
+    def switch(self, i):
+        lst = self.list
+        if not lst:
+            self.player.send('message', 0, 'No channels in %s' % self.group_label())
+            return
+        i %= len(lst)
+        ch = lst[i]
+        LOG.write('tv', 'channel %d: %s' % (i + 1, json.dumps(ch, ensure_ascii=False)))
+        busy('watching %s' % ch['name'])
+        mux = self.tuner.mux()
+        if mux and mux != ch['freq_khz']:
+            rec = self.tuner.recordings[0]
+            self.player.send('message', 4, 'Recording %s: only channels of %d MHz until %s' % (
+                rec.ch['name'], mux // 1000, hhmm(rec.until) if rec.until else 'it is stopped'))
+            if self.ch:   # stays where it was
+                self.player.send('current', next((k for k, c in enumerate(lst) if key(c) == key(self.ch)), -1))
+                self.player.send('title', self.title(self.ch, self.index))
+                self.play(self.ch, self.tuner.watch(self.ch))
+            return
+        self.index, self.ch, self.pending = i, ch, None
+        self.app.watched = key(ch)
+        self.player.send('current', i)
+        self.player.send('stop', self.title(ch, i))
+        self.player.send('message', 0, '')
+        self.player.send('pin', '')
+        self.tuner.watch(None)
+        if not self.tuner.tune(ch, lambda t: self.player.send('message', 0, t), self._interrupt):
+            LOG.write('tv', 'stopped waiting for a signal')
+            return
+        self.player.send('message', 0, '')
+        off = self.tuner.watch(ch)
+        prompt = self.locked(ch)
+        if prompt:
+            self.pending = ch
+            self.player.send('pin', prompt)
+            return
+        self.play(ch, off)
+
+    def tracks(self, ch):
+        """The audio track (index) and subtitles (index or -1) to start with: as last chosen on
+        this channel, else the preferred languages"""
+        s = self.app.settings
+        audio = ch['audio']
+        asel = next((i for i, a in enumerate(audio) if a['pid'] == ch.get('audio_pid')), None)
+        for lang in s['audio_langs']:
+            if asel is None:
+                asel = next((i for i, a in enumerate(audio) if lang and a['lang'] == lang), None)
+        subs = ch.get('subtitles', [])
+        if 'subs_pid' in ch:
+            ssel = next((i for i, t in enumerate(subs) if t['pid'] == ch['subs_pid'] and
+                         t['page'] == ch.get('subs_page', 0)), -1)
+        else:
+            ssel = -1
+            for lang in s['subtitle_langs'] if s['subtitles'] else []:
+                if ssel < 0:
+                    ssel = next((i for i, t in enumerate(subs) if lang and t['lang'].startswith(lang)), -1)
+        return asel or 0, ch.get('amode', s['audio_mode']), ssel
+
+    def play(self, ch, off):
+        asel, amode, ssel = self.tracks(ch)
+        now, _n = self.app.guide.now_next(ch['sid'])
+        fields = {
+            'src': self.buf.prefix, 'off': off, 'pmt': ch['pmt_pid'],
+            'psi': '%s,%s' % (make_pat(ch).hex(), make_pmt(ch).hex()),
+            'v': ch['video']['pid'] if ch.get('video') and not ch['radio'] else 0,
+            'a': ','.join('%d:%s' % (a['pid'], clean(a['lang']) or '-') for a in ch['audio']),
+            'asel': asel, 'amode': amode,
+            's': ','.join('%d:%s:%s:%x' % (t['pid'], t['type'], clean(t['lang']) or '-', t['page'])
+                          for t in ch.get('subtitles', [])),
+            'ssel': ssel, 'ttx': ch.get('teletext') or 0, 'ttxregion': self.app.settings['teletext_region'],
+            'title': self.title(ch, self.index) if not ch['radio'] else ch['name'],
+            'now': '%s–%s %s' % (hhmm(now[0]), hhmm(now[0] + now[1]), now[2]) if now else '',
+        }
+        self.player.send('play', *('%s=%s' % (k, clean(v) if k in ('title', 'now') else v) for k, v in fields.items()))
+        self.player.send('info', self.info(ch))
+        self.player.send('rec', 1 if self.tuner.recording(ch) else 0)
+        if not self.started:
+            self.started = True
+            self.app.player_started()
+
+    def info(self, ch):
+        """The info panel's text (the first line is its heading)"""
+        lines = ['%d  %s' % (channel_number(ch, self.index), ch['name'])]
+        uhf_ch = uhf_channel(ch['freq_khz'])
+        lines.append('%s · %d MHz%s%s · service %d%s' % (
+            ch.get('provider') or '-', ch['freq_khz'] // 1000, ' (UHF %d)' % uhf_ch if uhf_ch else '',
+            ', PLP %d' % ch['plp'] if ch['plp'] else '', ch['sid'], ', LCN %d' % ch['lcn'] if ch.get('lcn') else ''))
+        now, nxt = self.app.guide.now_next(ch['sid'])
+        if now:
+            lines.append('')
+            lines.append('Now %s–%s  %s%s' % (hhmm(now[0]), hhmm(now[0] + now[1]), now[2],
+                                              '  (%d+)' % now[4] if now[4] else ''))
+            if now[3] and now[3].strip() != now[2].strip():
+                lines.append(now[3][:400])
+        if nxt:
+            lines.append('Next %s  %s' % (hhmm(nxt[0]), nxt[2]))
+        lines.append('')
+        v = ch.get('video')
+        lines.append('Video: %s' % ('%s, PID %d' % (v['codec'], v['pid']) if v else 'none (radio)'))
+        lines.append('Audio: %s' % (', '.join('%s %s PID %d' % (a['codec'], a['lang'] or '-', a['pid'])
+                                              for a in ch['audio']) or 'none'))
+        subs = ch.get('subtitles', [])
+        if subs:
+            lines.append('Subtitles: %s' % ', '.join('%s%s' % (t['lang'] or '-', ' (teletext %x)' % t['page']
+                                                               if t['type'] == 't' else '') for t in subs))
+        if ch.get('teletext'):
+            lines.append('Teletext: PID %d' % ch['teletext'])
+        lines.append('PMT %d · PCR %d%s' % (ch['pmt_pid'], ch['pcr_pid'], ' · PIDs edited' if ch.get('pids_edited') else ''))
+        return '\n'.join(lines)
+
+    def on_pin(self, pin):
+        if not self.pending:
+            return
+        if not pin_ok(self.app.settings, pin):
+            LOG.write('tv', 'wrong PIN')
+            self.player.send('pin', 'Wrong PIN, again')
+            return
+        ch, self.pending = self.pending, None
+        self.unlocked.add(key(ch))
+        self.player.send('pin', '')
+        self.play(ch, self.buf.offset)
+
+    def toggle_recording(self):
+        ch = self.ch
+        if not ch:
+            return
+        rec = self.tuner.recording(ch)
+        if rec:
+            self.app.stop_recording(rec)
+            self.player.send('message', 3, 'Recording stopped: %s, %d min' % (os.path.basename(rec.path)[:-3],
+                                                                            rec.meta['duration'] // 60))
+        else:
+            rec, why = self.app.record_now(ch)
+            self.player.send('message', 4, why if not rec else 'Recording %s until %s' % (
+                ch['name'], hhmm(rec.until) if rec.until else 'stopped'))
+        self.player.send('rec', 1 if self.tuner.recording(ch) else 0)
+
+    def refresh(self):
+        """Every 30 s: the title, the list's "now on", and the PIN for a programme rated over the
+        limit that has begun"""
+        if not self.ch:
+            return
+        self.player.send('title', self.title(self.ch, self.index), self.info_now())
+        self.player.send('info', self.info(self.ch))
+        self.send_list()
+        if not self.pending and self.locked(self.ch):
+            self.player.send('stop', self.title(self.ch, self.index))
+            self.pending = self.ch
+            self.player.send('pin', self.locked(self.ch))
+
+    def info_now(self):
+        now, _n = self.app.guide.now_next(self.ch['sid'])
+        return clean('%s–%s %s' % (hhmm(now[0]), hhmm(now[0] + now[1]), now[2])) if now else ''
 
 
-def remember_encrypted(ch, encrypted):
-    ch['encrypted'] = encrypted
-    channels = load_channels()
-    for c in channels:
-        if c['freq_khz'] == ch['freq_khz'] and c['sid'] == ch['sid']:
-            c['encrypted'] = encrypted
-    save_channels(channels)
-
+# ---- the TV process -------------------------------------------------------------------------------
 
 TV_CSS = b"""
 * { font-family: "DejaVu Sans"; font-size: 13px; color: #cdd6f4; }
-window, scrolledwindow, list, viewport { background: #11111b; }
+window, dialog, messagedialog, .message-dialog, .message-dialog box, scrolledwindow, list, viewport,
+notebook stack { background: #11111b; }
 .header { padding: 10px 16px; }
 .logo { font-family: "FontAwesome"; font-size: 24px; color: #cba6f7; }
 .heading { font-size: 18px; font-weight: bold; }
@@ -1050,11 +2014,15 @@ button.close { font-family: "FontAwesome"; font-size: 16px; background: transpar
                padding: 4px 10px; color: #a6adc8; }
 button.close:hover { background: #f38ba8; color: #11111b; }
 .channels { border-right: 1px solid #313244; }
+.groups { padding: 6px 12px; border-bottom: 1px solid #313244; }
 row { padding: 6px 12px; outline: none; }
 row:selected { background: #313244; }
 .num { font-family: "JetBrains Mono"; font-size: 15px; font-weight: bold; color: #cba6f7; }
 .name { font-size: 15px; font-weight: bold; }
+.skipped .name { color: #7f849c; }
 .now { color: #a6adc8; font-size: 12px; }
+.signal { color: #7f849c; font-size: 11px; font-family: "JetBrains Mono"; }
+.rec { color: #f38ba8; font-weight: bold; }
 progressbar trough { min-height: 3px; background: #313244; border: none; border-radius: 2px; }
 progressbar progress { min-height: 3px; background: #cba6f7; border: none; border-radius: 2px; }
 .day { font-weight: bold; color: #f9e2af; padding: 12px 12px 4px 12px; }
@@ -1064,310 +2032,1413 @@ progressbar progress { min-height: 3px; background: #cba6f7; border: none; borde
 .current .time, .current .title { color: #a6e3a1; }
 .badge { background: #a6e3a1; color: #11111b; border-radius: 4px; padding: 0 5px; font-size: 11px;
          font-weight: bold; }
+.badge.timer { background: #f38ba8; }
 .empty { color: #7f849c; font-size: 15px; padding: 40px; }
+entry, spinbutton { background: #1e1e2e; border: 1px solid #313244; border-radius: 6px; padding: 4px 8px; }
+entry:focus, spinbutton:focus { border-color: #cba6f7; }
+menu, .menu, .context-menu { background: #1e1e2e; border: 1px solid #45475a; padding: 4px 0; }
+menuitem { padding: 6px 16px; }
+menuitem:hover { background: #313244; }
+notebook header { background: #11111b; border-bottom: 1px solid #313244; }
+notebook tab { padding: 6px 16px; }
+notebook tab:checked { border-bottom: 2px solid #cba6f7; }
+notebook tab:hover { background: #313244; }
+switch { background: #313244; border-radius: 12px; }
+switch:checked { background: #cba6f7; }
+.section { font-weight: bold; color: #f9e2af; margin-top: 10px; }
+.hint { color: #7f849c; font-size: 12px; }
 """
 
 
-def window(test=None):
-    """The TV window: the channels with what's on (left), the selected one's schedule (right)"""
-    import gi
-    gi.require_version('Gtk', '3.0')
-    gi.require_version('Gdk', '3.0')
-    from gi.repository import Gdk, GLib, Gtk, Pango
+class TvApp:
+    """The process that drives the tuner: the window (when shown), the player, recordings, timers"""
 
-    def label(text='', cls=None, **kw):
+    def __init__(self, test):
+        self.test = test
+        self.settings = load_settings()
+        self.channels = load_channels()
+        self.guide = Guide()
+        self.fe = None
+        self.fe_lock = threading.Lock()
+        self._tuner = None
+        self.watching = None      # the Watch while the player is up
+        self.watched = None       # the key of the channel last watched
+        self.job = None           # a scan or guide update running
+        self.window = None
+        self.menu_unlocked = False
+        self.starting = 0         # timer recordings being started
+        self.lock = threading.RLock()
+
+    # the frontend and tuner, shared by everything in this process
+
+    def frontend(self):
+        with self.fe_lock:
+            if not self.fe:
+                self.fe = open_frontend(self.test)
+            return self.fe
+
+    def tuner(self):
+        with self.lock:
+            if not self._tuner:
+                self._tuner = Tuner(self)
+            return self._tuner
+
+    def release_tuner(self):
+        """The tuner closed once nothing uses it (the frontend stays open while the process runs)"""
+        with self.lock:
+            if self._tuner and self._tuner.idle() and not self.watching:
+                self._tuner.close()
+                self._tuner = None
+
+    def tuner_busy(self):
+        with self.lock:
+            return self.watching is not None or (self._tuner is not None and not self._tuner.idle()) or self.job
+
+    def note_signal(self, khz, strength, quality):
+        self.settings['signals'][str(khz)] = [strength, quality, time.time()]
+
+    def set_setting(self, name, value):
+        self.settings[name] = value
+        save_settings(self.settings)
+
+    def reload(self):
+        self.channels = load_channels()
+        if not self._tuner:   # else its EIT reader fills this one
+            self.guide = Guide()
+
+    def save_signals(self):
+        s = load_settings()
+        s['signals'] = self.settings['signals']
+        save_settings(s)
+
+    # watching
+
+    def watch(self, group, index):
+        """The player on channel index of group; if it's up already, switch it"""
+        lst = group_list(self.channels, self.settings, group)
+        if not lst:
+            return
+        with self.lock:
+            if self.watching:
+                ch = lst[index % len(lst)]
+                self.watching.events.put(('play', key(ch), ch['radio']))
+                return
+            if self.job:
+                notify('TV is busy: %s' % self.job)
+                return
+            LOG.write('tv', 'watch %s channel %d' % (group, index + 1))
+            self.watching = Watch(self, group, index)
+        threading.Thread(target=self.watching.run, daemon=True).start()
+
+    def watch_key(self, k):
+        for group in (self.settings.get('group', ALL), ALL, RADIO):
+            lst = group_list(self.channels, self.settings, group)
+            i = next((i for i, c in enumerate(lst) if key(c) == k), None)
+            if i is not None:
+                return self.watch(group, i)
+        LOG.write('tv', 'no channel %s' % k)
+
+    def player_started(self):
+        from gi.repository import GLib
+        GLib.idle_add(lambda: self.window and self.window.win.hide())
+
+    def watch_ended(self, w):
+        from gi.repository import GLib
+        with self.lock:
+            if self.watching is w:
+                self.watching = None
+        self.save_signals()
+        self.release_tuner()
+        GLib.idle_add(self.after_watch, w)
+
+    def after_watch(self, w):
+        if self.window:
+            self.window.reload(select_key=self.watched)
+            self.window.win.show()
+            self.window.win.present()
+        self.maybe_quit()
+
+    # recordings
+
+    def record(self, ch, until, title, desc, timer=None):
+        """Starts recording ch until until (None: until stopped); (Recording, None) or (None, why)"""
+        drive = recording_drive(self.settings)
+        if not drive:
+            return None, 'No drive to record to'
+        if free_bytes(drive) < 200 << 20:
+            return None, 'The drive is full (%s)' % drive
+        tuner = self.tuner()
+        mux = tuner.mux()
+        if mux and mux != ch['freq_khz']:
+            other = tuner.recordings[0]
+            return None, 'Already recording %s on %d MHz' % (other.ch['name'], mux // 1000)
+        w = self.watching
+        if w and w.ch and w.ch['freq_khz'] != ch['freq_khz']:
+            if not timer:
+                return None, 'Another multiplex than the one watched'
+            w.events.put(('play', key(ch), ch['radio']))   # a timer wins: the viewer follows it
+            time.sleep(2.5)
+        deadline = time.monotonic() + 60
+        if not tuner.tune(ch, cancel=lambda t: time.sleep(t) or time.monotonic() > deadline):
+            return None, 'No signal on %d MHz' % (ch['freq_khz'] // 1000)
+        try:
+            rec = Recording(ch, until, title, desc, drive, timer)
+        except OSError as e:
+            return None, 'Can\'t record to %s: %s' % (drive, e.strerror)
+        tuner.add_recording(rec)
+        if w:
+            w.events.put(('recordings',))
+        self.refresh_window()
+        return rec, None
+
+    def record_now(self, ch):
+        """The record key: until the programme ends (and the margin), or for so many minutes"""
+        now, _n = self.guide.now_next(ch['sid'])
+        instant = self.settings.get('instant', 'programme')
+        if instant == 'programme' and now:
+            until = now[0] + now[1] + self.settings['margin_after'] * 60
+        elif instant == 'programme':
+            until = time.time() + 2 * 3600
+        else:
+            until = time.time() + int(instant) * 60 if int(instant) else None
+        return self.record(ch, until, now[2] if now else '', now[3] if now else '')
+
+    def stop_recording(self, rec):
+        tuner = self._tuner
+        if tuner:
+            tuner.remove_recording(rec)
+        if rec.timer:
+            timers = load_timers()
+            for t in timers:
+                if t['id'] == rec.timer:
+                    t['state'] = 'done'
+                    self.repeat(timers, t)
+            save_timers(timers)
+        w = self.watching
+        if w:
+            w.events.put(('recordings',))
+        self.release_tuner()
+        self.refresh_window()
+        from gi.repository import GLib
+        GLib.idle_add(self.maybe_quit)
+
+    def repeat(self, timers, t):
+        step = {'daily': 86400, 'weekly': 7 * 86400}.get(t.get('repeat'))
+        if step:
+            n = dict(t, id='%x' % int(time.time() * 1000), start=t['start'] + step, end=t['end'] + step, state='')
+            timers.append(n)
+
+    def recordings(self):
+        return list(self._tuner.recordings) if self._tuner else []
+
+    # timers
+
+    def check_timers(self):
+        """Every 15 s: timers due start, recordings whose time is over stop"""
+        now = time.time()
+        for rec in self.recordings():
+            if rec.until and now >= rec.until:
+                LOG.write('timer', 'recording of %s over' % rec.ch['name'])
+                threading.Thread(target=self.stop_recording, args=(rec,), daemon=True).start()
+        timers = load_timers()
+        changed = False
+        for t in timers:
+            if t.get('state', '') != '':
+                continue
+            if now >= t['end']:
+                t['state'] = 'missed'
+                changed = True
+                self.repeat(timers, t)
+                continue
+            if t['start'] > now:
+                continue
+            ch = next((c for c in self.channels if key(c) == t['key']), None)
+            if not ch:
+                t['state'] = 'failed'
+                changed = True
+                continue
+            t['state'] = 'running' if t['action'] == 'record' else 'done'
+            changed = True
+            LOG.write('timer', 'due: %s' % json.dumps(t, ensure_ascii=False))
+            if t['action'] == 'record':
+                self.starting += 1
+                threading.Thread(target=self.timer_record, args=(t, ch), daemon=True).start()
+            else:
+                if os.path.exists('/run/ozone-standby.lock'):   # asleep: the screen on first
+                    subprocess.call(['sudo', '-n', 'ozone-standby', 'wake'])
+                notify('%s: %s' % (ch['name'], t['title']))
+                self.watch_key(t['key'])
+                self.repeat(timers, t)
+        cut = now - 7 * 86400
+        kept = [t for t in timers if t.get('state', '') in ('', 'running') or t['end'] > cut]
+        if changed or len(kept) != len(timers):
+            save_timers(kept)
+            self.refresh_window()
+        self.maybe_quit()
+        return True
+
+    def timer_record(self, t, ch):
+        try:
+            rec, why = self.record(ch, t['end'], t['title'], '', timer=t['id'])
+        except Exception as e:
+            LOG.write('tv', traceback.format_exc())
+            rec, why = None, str(e)
+        finally:
+            self.starting -= 1
+        if not rec:
+            LOG.write('timer', 'recording %s failed: %s' % (t['title'], why))
+            notify('Recording %s failed: %s' % (t['title'], why))
+            timers = load_timers()
+            for x in timers:
+                if x['id'] == t['id']:
+                    x['state'] = 'failed'
+            save_timers(timers)
+            from gi.repository import GLib
+            GLib.idle_add(self.maybe_quit)
+        else:
+            notify('Recording %s: %s' % (ch['name'], t['title']))
+
+    # the window, the control socket, the end
+
+    def refresh_window(self):
+        from gi.repository import GLib
+        GLib.idle_add(lambda: self.window and self.window.refresh())
+
+    def show_window(self):
+        if self.window:
+            if not self.watching:
+                self.window.win.show()
+                self.window.win.present()
+            return
+        self.window = TvWindow(self)
+        if self.watching:
+            self.window.win.hide()
+
+    def window_closed(self):
+        self.window = None
+        self.maybe_quit()
+
+    def maybe_quit(self):
+        """The process ends with nothing to do: no window, player, recording, scan, or timer due
+        within two minutes"""
+        from gi.repository import Gtk
+        now = time.time()
+        soon = any(t.get('state', '') == '' and t['start'] - 120 <= now < t['end'] for t in load_timers())
+        if not self.window and not self.watching and not self.recordings() and not self.job and not self.starting \
+                and not soon:
+            Gtk.main_quit()
+        return False
+
+    def on_control(self, sock, _cond):
+        conn, _a = sock.accept()
+        try:
+            conn.settimeout(2)
+            line = conn.makefile().readline().split()
+            LOG.write('tv', 'request: %s' % ' '.join(line))
+            reply = 'ok'
+            if not line or line[0] == 'show':
+                self.show_window()
+            elif line[0] == 'play' and len(line) > 1:
+                lst = group_list(self.channels, self.settings, ALL)
+                n = int(line[1]) - 1
+                if 0 <= n < len(lst):
+                    self.watch(ALL, n)
+                else:
+                    reply = 'no channel %s' % line[1]
+            elif line[0] in ('timers', 'timer'):
+                self.check_timers()
+            else:
+                reply = 'unknown request'
+            conn.sendall(reply.encode() + b'\n')
+        except (OSError, ValueError) as e:
+            LOG.write('tv', 'request: %s' % e)
+        finally:
+            conn.close()
+        return True
+
+    def run(self, action):
+        import gi
+        gi.require_version('Gtk', '3.0')
+        gi.require_version('Gdk', '3.0')
+        from gi.repository import Gdk, GLib, Gtk
+        GLib.set_prgname('ozone-tv')
+        # GTK's CSS parser loses the first number of the first stylesheet to a stale errno (see yt)
+        try:
+            Gtk.CssProvider().load_from_data(b'* { padding: 0px; }')
+        except GLib.Error:
+            pass
+        style = Gtk.CssProvider()
+        style.load_from_data(TV_CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), style,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        try:
+            os.unlink(CONTROL)
+        except OSError:
+            pass
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(CONTROL)
+        sock.listen(4)
+        GLib.io_add_watch(sock.fileno(), GLib.IO_IN, lambda fd, cond: self.on_control(sock, cond))
+        GLib.timeout_add_seconds(15, self.check_timers)
+        if action[0] == 'menu':
+            self.show_window()
+        elif action[0] == 'play':
+            lst = group_list(self.channels, self.settings, ALL)
+            if not lst:
+                notify('No channels yet: scan first')
+                return 1
+            self.watch(ALL, (action[1] - 1) % len(lst))
+        GLib.idle_add(lambda: self.check_timers() and False)
+        GLib.idle_add(self.maybe_quit)
+        Gtk.main()
+        sock.close()
+        try:
+            os.unlink(CONTROL)
+        except OSError:
+            pass
+        for rec in self.recordings():
+            self.stop_recording(rec)
+        if self._tuner:
+            self._tuner.close()
+        if self.fe:
+            self.fe.close()
+        self.save_signals()
+        return 0
+
+
+# ---- the window -------------------------------------------------------------------------------------
+
+def later(action):
+    """action() once the event that asked for it is over: a dialog run from a button's or menu
+    item's handler would find the pointer still grabbed by that button, and get no clicks"""
+    from gi.repository import GLib
+    GLib.idle_add(lambda: action() and False)
+
+
+def day_name(t):
+    today = time.localtime(time.time())
+    d = time.localtime(t)
+    delta = (time.mktime(d[:3] + (0, 0, 0, 0, 0, -1)) - time.mktime(today[:3] + (0, 0, 0, 0, 0, -1))) / 86400
+    name = {0: 'Today', 1: 'Tomorrow', -1: 'Yesterday'}.get(round(delta), time.strftime('%A', d))
+    return '%s, %s' % (name, time.strftime('%d.%m', d))
+
+
+class TvWindow:
+    """The TV window: a list on the left (channels of a group, recordings or timers), the selected
+    channel's schedule on the right, and the settings"""
+
+    def __init__(self, app):
+        from gi.repository import Gtk, Pango
+        self.Gtk, self.Pango = Gtk, Pango
+        self.app = app
+        self.typed, self.typed_at = '', 0   # a channel number from the remote's digits
+        self.group = app.settings.get('group', ALL)
+        self.win = Gtk.Window(title='TV')
+        self.win.set_default_size(1280, 720)
+        self.win.connect('destroy', lambda w: app.window_closed())
+        self.win.connect('key-press-event', self.on_key)
+
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        header = Gtk.Box(spacing=12)
+        header.get_style_context().add_class('header')
+        header.pack_start(self.label('', 'logo'), False, False, 0)
+        header.pack_start(self.label('TV', 'heading'), False, False, 0)
+        self.status = self.label('', 'status', ellipsize=Pango.EllipsizeMode.END)
+        header.pack_start(self.status, True, True, 0)
+        for text, action in (('Update guide', self.update_guide), ('Scan channels', self.scan_dialog),
+                             ('Settings', self.settings_dialog)):
+            b = Gtk.Button(label=text)
+            b.connect('clicked', lambda w, a=action: later(a))
+            header.pack_start(b, False, False, 0)
+        # bspwm draws no title bars, so the window closes here (or with Esc, the panel's ✕)
+        close = Gtk.Button(label='', tooltip_text='Close')
+        close.get_style_context().add_class('close')
+        close.connect('clicked', lambda w: self.win.destroy())
+        header.pack_start(close, False, False, 0)
+        top.pack_start(header, False, False, 0)
+
+        body = Gtk.Box()
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        left.set_size_request(470, -1)
+        left.get_style_context().add_class('channels')
+        gbox = Gtk.Box(spacing=8)
+        gbox.get_style_context().add_class('groups')
+        self.groups = Gtk.ComboBoxText()
+        self.groups.connect('changed', self.on_group)
+        gbox.pack_start(self.groups, True, True, 0)
+        left.pack_start(gbox, False, False, 0)
+        scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        # a click shows the channel's schedule, a double click (or Enter) watches it
+        self.list = Gtk.ListBox(activate_on_single_click=False)
+        self.list.connect('row-selected', self.on_row)
+        self.list.connect('row-activated', lambda lb, row: self.activate(row))
+        self.list.connect('button-press-event', self.on_list_click)
+        scroll.add(self.list)
+        left.pack_start(scroll, True, True, 0)
+        body.pack_start(left, False, False, 0)
+        self.right = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.sched = Gtk.ListBox(activate_on_single_click=False)
+        self.sched.connect('row-selected', self.on_event)
+        self.sched.connect('row-activated', lambda lb, row: self.event_menu(row))
+        self.right.add(self.sched)
+        body.pack_start(self.right, True, True, 0)
+        top.pack_start(body, True, True, 0)
+        hint = self.label('Enter: watch   →: the guide   Menu or F2: the channel\'s menu   Tab: next list   '
+                          'Esc: close', 'hint')
+        hint.set_margin_start(16)
+        hint.set_margin_bottom(6)
+        top.pack_start(hint, False, False, 0)
+        self.win.add(top)
+
+        self.rows = []
+        self.fill_groups()
+        self.win.show_all()
+        self.reload(select_key=app.watched)
+        from gi.repository import GLib
+        GLib.timeout_add_seconds(30, self.tick)
+
+    def label(self, text='', cls=None, **kw):
         kw.setdefault('xalign', 0)
-        w = Gtk.Label(label=text, **kw)
+        w = self.Gtk.Label(label=text, **kw)
         if cls:
             w.get_style_context().add_class(cls)
         return w
 
-    def day_name(t):
-        today = time.localtime(time.time())
-        d = time.localtime(t)
-        delta = (time.mktime(d[:3] + (0, 0, 0, 0, 0, -1)) - time.mktime(today[:3] + (0, 0, 0, 0, 0, -1))) / 86400
-        name = {0: 'Today', 1: 'Tomorrow', -1: 'Yesterday'}.get(round(delta), time.strftime('%A', d))
-        return '%s, %s' % (name, time.strftime('%d.%m', d))
+    # the lists
 
-    class TvWindow:
-        def __init__(self):
-            # GTK's CSS parser loses the first number of the first stylesheet to a stale errno (see yt)
-            try:
-                Gtk.CssProvider().load_from_data(b'* { padding: 0px; }')
-            except GLib.Error:
-                pass
-            style = Gtk.CssProvider()
-            style.load_from_data(TV_CSS)
-            Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), style,
-                                                     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-            self.guide = Guide()
-            self.busy = False
-            self.cancel, self.waiting, self.after = None, False, None   # see watch()
-            self.typed, self.typed_at = '', 0   # a channel number from the remote's digits
-            self.win = Gtk.Window(title='TV')
-            self.win.set_default_size(1280, 720)
-            self.win.connect('destroy', Gtk.main_quit)
-            self.win.connect('key-press-event', self.on_key)
+    def fill_groups(self):
+        self.filling = True
+        self.groups.remove_all()
+        names = groups(self.app.settings, self.app.channels) + [RECORDED, TIMERS_VIEW]
+        if self.group not in names:
+            self.group = ALL
+        for n in names:
+            self.groups.append(n, {ALL: 'All channels'}.get(n, n))
+        self.groups.set_active_id(self.group)
+        self.filling = False
 
-            top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            header = Gtk.Box(spacing=12)
-            header.get_style_context().add_class('header')
-            header.pack_start(label('', 'logo'), False, False, 0)
-            header.pack_start(label('TV', 'heading'), False, False, 0)
-            self.status = label('', 'status', ellipsize=Pango.EllipsizeMode.END)
-            header.pack_start(self.status, True, True, 0)
-            for text, action in (('Update guide', self.update_guide), ('Scan channels', self.scan)):
-                b = Gtk.Button(label=text)
-                b.connect('clicked', lambda w, a=action: a())
-                header.pack_start(b, False, False, 0)
-            # bspwm draws no title bars, so the window closes here (or with Esc, the panel's ✕)
-            close = Gtk.Button(label='\uf00d', tooltip_text='Close')
-            close.get_style_context().add_class('close')
-            close.connect('clicked', lambda w: self.win.destroy())
-            header.pack_start(close, False, False, 0)
-            top.pack_start(header, False, False, 0)
+    def on_group(self, combo):
+        if self.filling or not combo.get_active_id():
+            return
+        self.group = combo.get_active_id()
+        if self.group in groups(self.app.settings, self.app.channels):
+            self.app.set_setting('group', self.group)
+        self.reload()
 
-            body = Gtk.Box()
-            left = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
-            left.set_size_request(470, -1)
-            left.get_style_context().add_class('channels')
-            # a click shows the channel's schedule, a double click (or Enter) watches it
-            self.channels = Gtk.ListBox(activate_on_single_click=False)
-            self.channels.connect('row-selected', self.on_channel)
-            self.channels.connect('row-activated', lambda lb, row: self.watch(row.index))
-            left.add(self.channels)
-            body.pack_start(left, False, False, 0)
-            self.right = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
-            self.sched = Gtk.ListBox(activate_on_single_click=False)
-            self.sched.connect('row-selected', self.on_event)
-            self.sched.connect('row-activated', lambda lb, row: self.watch(self.index))
-            self.right.add(self.sched)
-            body.pack_start(self.right, True, True, 0)
-            top.pack_start(body, True, True, 0)
-            self.win.add(top)
+    def next_group(self):
+        names = [self.groups.get_model()[i][1] for i in range(len(self.groups.get_model()))]
+        self.groups.set_active_id(names[(names.index(self.group) + 1) % len(names)])
 
-            self.index = 0
+    def reload(self, select_key=None):
+        """The list again from disk (after watching, a scan, an edit)"""
+        self.app.reload()
+        self.fill_groups()
+        for row in self.list.get_children():
+            row.destroy()
+        self.rows = []
+        if self.group == RECORDED:
+            self.fill_recordings()
+        elif self.group == TIMERS_VIEW:
+            self.fill_timers()
+        else:
             self.fill_channels()
-            self.win.show_all()
-            self.update_now()
-            self.select(WATCHED)
-            GLib.timeout_add_seconds(30, self.tick)
+        self.list.show_all()
+        self.update_now()
+        index = next((i for i, r in enumerate(self.rows) if getattr(r, 'key', None) == select_key), 0)
+        self.select(index)
+        if not self.rows:
+            self.fill_schedule(None)
 
-        # the lists
+    def refresh(self):
+        row = self.list.get_selected_row()
+        self.reload(select_key=getattr(row, 'key', None))
+        return False
 
-        def fill_channels(self):
-            for row in self.channels.get_children():
-                row.destroy()
-            self.list = [c for c in load_channels() if not c['radio']]
-            for i, c in enumerate(self.list):
-                row = Gtk.ListBoxRow()
-                row.index = i
-                box = Gtk.Box(spacing=12)
-                num = label(str(channel_number(c, i)), 'num', width_chars=3, xalign=1)
-                box.pack_start(num, False, False, 0)
-                info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
-                info.pack_start(label(c['name'] + lock_icon(c), 'name', ellipsize=Pango.EllipsizeMode.END), False, False, 0)
-                row.now = label('', 'now', ellipsize=Pango.EllipsizeMode.END)
-                info.pack_start(row.now, False, False, 0)
-                row.prog = Gtk.ProgressBar(no_show_all=True)   # shown only with a programme on
-                info.pack_start(row.prog, False, False, 2)
-                box.pack_start(info, True, True, 0)
-                row.add(box)
-                self.channels.add(row)
-            if not self.list:
-                row = Gtk.ListBoxRow(selectable=False, activatable=False)
-                row.add(label('No channels yet: Scan channels', 'empty', wrap=True))
-                self.channels.add(row)
-            self.channels.show_all()
-            self.update_now()
+    def empty(self, text):
+        row = self.Gtk.ListBoxRow(selectable=False, activatable=False)
+        row.add(self.label(text, 'empty', wrap=True))
+        self.list.add(row)
 
-        def update_now(self):
-            t = self.guide.now()
-            for row in self.channels.get_children():
-                if not hasattr(row, 'index'):
-                    continue
-                now, nxt = self.guide.now_next(self.list[row.index]['sid'])
-                if now:
-                    row.now.set_text('%s–%s  %s' % (hhmm(now[0]), hhmm(now[0] + now[1]), now[2]))
-                    row.prog.set_fraction(min(1, max(0, (t - now[0]) / max(1, now[1]))))
-                    row.prog.show()
-                else:
-                    row.now.set_text('next: %s %s' % (hhmm(nxt[0]), nxt[2]) if nxt else 'no programme information')
-                    row.prog.hide()
+    def fill_channels(self):
+        Gtk, Pango = self.Gtk, self.Pango
+        self.chans = group_list(self.app.channels, self.app.settings, self.group)
+        recording = {r.key for r in self.app.recordings()}
+        signals = self.app.settings['signals']
+        for i, c in enumerate(self.chans):
+            row = Gtk.ListBoxRow()
+            row.index, row.key, row.ch = i, key(c), c
+            if c.get('skip'):
+                row.get_style_context().add_class('skipped')
+            box = Gtk.Box(spacing=12)
+            box.pack_start(self.label(str(channel_number(c, i)), 'num', width_chars=3, xalign=1), False, False, 0)
+            info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            line = Gtk.Box(spacing=8)
+            flags = (' \U0001f512' if c.get('locked') else '') + (' ⏭' if c.get('skip') else '')
+            line.pack_start(self.label(c['name'] + lock_icon(c) + flags, 'name', ellipsize=Pango.EllipsizeMode.END),
+                            True, True, 0)
+            if row.key in recording:
+                line.pack_start(self.label('● REC', 'rec'), False, False, 0)
+            sig = signals.get(str(c['freq_khz']))
+            line.pack_start(self.label('%d%%' % sig[0] if sig else '', 'signal',
+                                       tooltip_text='Signal level when last tuned'), False, False, 0)
+            info.pack_start(line, False, False, 0)
+            row.now = self.label('', 'now', ellipsize=Pango.EllipsizeMode.END)
+            info.pack_start(row.now, False, False, 0)
+            row.prog = Gtk.ProgressBar(no_show_all=True)   # shown only with a programme on
+            info.pack_start(row.prog, False, False, 2)
+            box.pack_start(info, True, True, 0)
+            row.add(box)
+            self.list.add(row)
+            self.rows.append(row)
+        if not self.chans:
+            self.empty('No channels yet: Scan channels' if not self.app.channels else
+                       'No channels in this list. A channel\'s menu (Menu or F2) adds it to a list.')
 
-        def select(self, index):
-            row = self.channels.get_row_at_index(index) if self.list else None
-            if row:
-                self.channels.select_row(row)
-                row.grab_focus()
+    def fill_recordings(self):
+        Gtk, Pango = self.Gtk, self.Pango
+        self.recs = list_recordings(self.app.settings)
+        running = {r.path for r in self.app.recordings()}
+        for m in self.recs:
+            row = Gtk.ListBoxRow()
+            row.rec, row.key = m, m['path']
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            title = m.get('title') or os.path.basename(m['path'])[:-3]
+            box.pack_start(self.label(('● ' if m['path'] in running else '') + title, 'name',
+                                      ellipsize=Pango.EllipsizeMode.END), False, False, 0)
+            box.pack_start(self.label('%s · %s · %d min · %.0f MB' % (
+                m.get('channel', ''), time.strftime('%d.%m %H:%M', time.localtime(m.get('start', 0))),
+                (m.get('duration') or 0) // 60, m['size'] / 1e6), 'now'), False, False, 0)
+            row.add(box)
+            self.list.add(row)
+            self.rows.append(row)
+        if not self.recs:
+            self.empty('No recordings. The record key in the player records what\'s on; Enter on a '
+                       'programme in the guide sets a timer.')
 
-        def on_channel(self, lb, row):
-            if row is None or not hasattr(row, 'index'):
-                return
-            self.index = row.index
-            self.fill_schedule(self.list[row.index])
+    def fill_timers(self):
+        Gtk, Pango = self.Gtk, self.Pango
+        timers = sorted(load_timers(), key=lambda t: t['start'])
+        for t in timers:
+            row = Gtk.ListBoxRow()
+            row.timer, row.key = t, t['id']
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            what = {'record': 'Record', 'watch': 'Switch to'}[t['action']]
+            box.pack_start(self.label('%s: %s' % (what, t['title']), 'name', ellipsize=Pango.EllipsizeMode.END),
+                           False, False, 0)
+            box.pack_start(self.label('%s · %s %s–%s%s%s' % (
+                t['channel'], time.strftime('%a %d.%m', time.localtime(t['start'])), hhmm(t['start']),
+                hhmm(t['end']), ' · ' + t['repeat'] if t.get('repeat') else '',
+                ' · ' + t['state'] if t.get('state') else ''), 'now'), False, False, 0)
+            row.add(box)
+            self.list.add(row)
+            self.rows.append(row)
+        if not timers:
+            self.empty('No timers. Enter on a programme in the guide records it or switches to it.')
 
-        def fill_schedule(self, ch):
-            for row in self.sched.get_children():
-                row.destroy()
-            t = self.guide.now()
-            events = [e for e in self.guide.schedule(ch['sid']) if e[0] + e[1] > t]
-            current = None
-            day = None
-            for e in events:
-                if day_name(e[0]) != day:
-                    day = day_name(e[0])
-                    head = Gtk.ListBoxRow(selectable=False, activatable=False)
-                    head.add(label(day, 'day'))
-                    self.sched.add(head)
-                row = Gtk.ListBoxRow()
-                box = Gtk.Box(spacing=14)
-                box.pack_start(label(hhmm(e[0]), 'time', valign=Gtk.Align.START), False, False, 0)
-                info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
-                line = Gtk.Box(spacing=8)
-                line.pack_start(label(e[2], 'title', wrap=True), False, False, 0)
-                if e[0] <= t:
-                    line.pack_start(label('NOW', 'badge', valign=Gtk.Align.CENTER), False, False, 0)
-                    row.get_style_context().add_class('current')
-                    current = row
-                info.pack_start(line, False, False, 0)
-                row.desc = None
-                if e[3] and e[3].strip() != e[2].strip():   # Zeonbud often repeats the title as the text
-                    row.desc = label(e[3], 'desc', wrap=True, lines=2, ellipsize=Pango.EllipsizeMode.END,
-                                     max_width_chars=1)
-                    info.pack_start(row.desc, False, False, 0)
-                box.pack_start(info, True, True, 0)
-                row.add(box)
-                self.sched.add(row)
-            if not events:
-                row = Gtk.ListBoxRow(selectable=False, activatable=False)
-                row.add(label('No programme information yet. Watching a channel fills it in, or Update guide.',
-                              'empty', wrap=True))
-                self.sched.add(row)
-            self.sched.show_all()
-            self.right.get_vadjustment().set_value(0)
-
-        def on_event(self, lb, row):
-            # the selected programme's whole description
-            for r in lb.get_children():
-                if getattr(r, 'desc', None):
-                    full = r is row
-                    r.desc.set_lines(-1 if full else 2)
-                    r.desc.set_ellipsize(Pango.EllipsizeMode.NONE if full else Pango.EllipsizeMode.END)
-
-        def tick(self):
-            self.update_now()
-            return True
-
-        # actions
-
-        def run(self, what, job):
-            """job() in a thread, then everything reloaded"""
-            if self.busy:
-                return
-            self.busy = True
-            def done():
-                self.busy = False
-                self.guide = Guide()
-                self.fill_channels()
-                self.select(WATCHED if what == 'watch' else self.index)
-                self.win.show()
-                self.win.present()
-                if what == 'watch':
-                    self.status.set_text('')
-                    self.waiting = False
-                    if self.after is not None:   # chosen while waiting for a signal
-                        index, self.after = self.after, None
-                        self.watch(index)
-            def thread():
-                try:
-                    job()
-                except Exception as e:
-                    LOG.write('tv', traceback.format_exc())
-                    GLib.idle_add(self.status.set_text, 'Error: %s' % e)
-                finally:
-                    GLib.idle_add(done)
-            threading.Thread(target=thread, daemon=True).start()
-
-        def watch(self, index):
-            """The window stays while the tuner looks for the signal (on_waiting says so) and goes
-            when the player starts; another channel chosen meanwhile replaces this one"""
-            if not self.list:
-                return
-            if self.busy:
-                if self.waiting:
-                    self.after = index
-                    self.cancel.set()
-                    self.status.set_text('Switching…')
-                return
-            LOG.write('tv', 'window: watch channel %d' % (index + 1))
-            self.cancel, self.waiting = threading.Event(), False
-            self.status.set_text('Tuning…')
-            waiting = lambda text: GLib.idle_add(self.on_waiting, text)
-            self.run('watch', lambda: watch(index, test, waiting, self.cancel))
-
-        def on_waiting(self, text):
-            """watch() has no signal yet (text), or the player starts (None)"""
-            self.waiting = text is not None
-            if text:
-                self.status.set_text(text + '   Esc: stop')
-                self.win.show()
-                self.win.present()
+    def update_now(self):
+        t = self.app.guide.now()
+        for row in self.rows:
+            if not hasattr(row, 'ch'):
+                continue
+            now, nxt = self.app.guide.now_next(row.ch['sid'])
+            if now:
+                row.now.set_text('%s–%s  %s' % (hhmm(now[0]), hhmm(now[0] + now[1]), now[2]))
+                row.prog.set_fraction(min(1, max(0, (t - now[0]) / max(1, now[1]))))
+                row.prog.show()
             else:
-                self.win.hide()
+                row.now.set_text('next: %s %s' % (hhmm(nxt[0]), nxt[2]) if nxt else 'no programme information')
+                row.prog.hide()
 
-        def scan(self):
+    def select(self, index):
+        if 0 <= index < len(self.rows):
+            self.list.select_row(self.rows[index])
+            self.rows[index].grab_focus()
+
+    def on_row(self, lb, row):
+        if row is None:
+            return
+        self.fill_schedule(getattr(row, 'ch', None))
+
+    def fill_schedule(self, ch):
+        Gtk, Pango = self.Gtk, self.Pango
+        for row in self.sched.get_children():
+            row.destroy()
+        self.sched_ch = ch
+        if not ch:
+            self.sched.show_all()
+            return
+        t = self.app.guide.now()
+        timers = load_timers()
+        events = [e for e in self.app.guide.schedule(ch['sid']) if e[0] + e[1] > t]
+        day = None
+        for e in events:
+            if day_name(e[0]) != day:
+                day = day_name(e[0])
+                head = Gtk.ListBoxRow(selectable=False, activatable=False)
+                head.add(self.label(day, 'day'))
+                self.sched.add(head)
+            row = Gtk.ListBoxRow()
+            row.event = e
+            box = Gtk.Box(spacing=14)
+            box.pack_start(self.label(hhmm(e[0]), 'time', valign=Gtk.Align.START), False, False, 0)
+            info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            line = Gtk.Box(spacing=8)
+            line.pack_start(self.label(e[2], 'title', wrap=True), False, False, 0)
+            if e[4]:
+                line.pack_start(self.label('%d+' % e[4], 'hint', valign=Gtk.Align.CENTER), False, False, 0)
+            if e[0] <= t:
+                line.pack_start(self.label('NOW', 'badge', valign=Gtk.Align.CENTER), False, False, 0)
+                row.get_style_context().add_class('current')
+            timer = timer_for(timers, ch, e)
+            if timer:
+                badge = self.label('REC' if timer['action'] == 'record' else 'ALARM', 'badge', valign=Gtk.Align.CENTER)
+                badge.get_style_context().add_class('timer')
+                line.pack_start(badge, False, False, 0)
+            info.pack_start(line, False, False, 0)
+            row.desc = None
+            if e[3] and e[3].strip() != e[2].strip():   # Zeonbud often repeats the title as the text
+                row.desc = self.label(e[3], 'desc', wrap=True, lines=2, ellipsize=Pango.EllipsizeMode.END,
+                                      max_width_chars=1)
+                info.pack_start(row.desc, False, False, 0)
+            box.pack_start(info, True, True, 0)
+            row.add(box)
+            self.sched.add(row)
+        if not events:
+            row = Gtk.ListBoxRow(selectable=False, activatable=False)
+            row.add(self.label('No programme information yet. Watching a channel fills it in, or Update guide.',
+                               'empty', wrap=True))
+            self.sched.add(row)
+        self.sched.show_all()
+        self.right.get_vadjustment().set_value(0)
+
+    def on_event(self, lb, row):
+        # the selected programme's whole description
+        for r in lb.get_children():
+            if getattr(r, 'desc', None):
+                full = r is row
+                r.desc.set_lines(-1 if full else 2)
+                r.desc.set_ellipsize(self.Pango.EllipsizeMode.NONE if full else self.Pango.EllipsizeMode.END)
+
+    def tick(self):
+        self.update_now()
+        return True
+
+    # actions
+
+    def set_status(self, text):
+        self.status.set_text(text)
+
+    def activate(self, row):
+        if hasattr(row, 'ch'):
+            self.app.watch(self.group, row.index)
+        elif hasattr(row, 'rec'):
+            self.play_recording(row.rec)
+        elif hasattr(row, 'timer'):
+            self.timer_menu(row)
+
+    def play_recording(self, m):
+        """In amplay, as a file (the decoder is the one thing it shares with live TV)"""
+        if self.app.watching:
+            self.set_status('Stop watching TV first')
+            return
+        from gi.repository import GLib
+        self.win.hide()
+        cmd = ['amplay', '-v', '--title', m.get('title') or os.path.basename(m['path']), m['path']]
+        if m.get('sid'):
+            cmd[1:1] = ['--program', str(m['sid'])]
+        LOG.write('tv', 'playing %s' % ' '.join(cmd))
+
+        def thread():
+            p = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, errors='replace')
+            pipe_to_log(p.stderr, 'amplay')
+            status = p.wait()
+            LOG.write('tv', 'amplay exit status %d' % status)
+            subprocess.call(['amplay', '--reset'])
+            GLib.idle_add(lambda: (self.win.show(), self.win.present()) and False)
+        threading.Thread(target=thread, daemon=True).start()
+
+    def run_job(self, what, job):
+        """job(progress) in a thread with the frontend to itself, then everything reloaded"""
+        app = self.app
+        if app.tuner_busy():
+            self.set_status('Busy: %s' % (app.job or 'watching or recording'))
+            return
+        app.job = what
+        from gi.repository import GLib
+        progress = lambda text: GLib.idle_add(self.set_status, text)
+
+        def done():
+            app.job = None
+            app.save_signals()
+            self.reload()
+            app.maybe_quit()
+
+        def thread():
+            try:
+                job(app.frontend(), progress)
+            except Exception as e:
+                LOG.write('tv', traceback.format_exc())
+                GLib.idle_add(self.set_status, 'Error: %s' % e)
+            finally:
+                GLib.idle_add(done)
+        threading.Thread(target=thread, daemon=True).start()
+
+    def update_guide(self):
+        LOG.write('tv', 'window: update the guide')
+        self.run_job('updating the guide', lambda fe, progress: update_guide(fe, progress))
+
+    def menu_allowed(self):
+        """The PIN, once, if the menu is locked"""
+        s = self.app.settings
+        if not s.get('lock_menu') or self.app.menu_unlocked:
+            return True
+        pin = self.ask('Locked', 'Enter the PIN', password=True)
+        if pin is not None and pin_ok(s, pin):
+            self.app.menu_unlocked = True
+            return True
+        if pin is not None:
+            self.set_status('Wrong PIN')
+        return False
+
+    def ask(self, title, prompt, text='', password=False):
+        """A line of text from the viewer, or None"""
+        Gtk = self.Gtk
+        d = Gtk.Dialog(title=title, transient_for=self.win, modal=True)
+        d.add_buttons('Cancel', Gtk.ResponseType.CANCEL, 'OK', Gtk.ResponseType.OK)
+        d.set_default_response(Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        box.add(self.label(prompt))
+        e = Gtk.Entry(text=text, activates_default=True, visibility=not password)
+        box.add(e)
+        d.show_all()
+        r = d.run()
+        value = e.get_text()
+        d.destroy()
+        return value if r == Gtk.ResponseType.OK else None
+
+    def confirm(self, text):
+        Gtk = self.Gtk
+        d = Gtk.MessageDialog(transient_for=self.win, modal=True, message_type=Gtk.MessageType.QUESTION,
+                              buttons=Gtk.ButtonsType.OK_CANCEL, text=text)
+        r = d.run()
+        d.destroy()
+        return r == Gtk.ResponseType.OK
+
+    def popup(self, items, widget=None):
+        """A menu of (label, action) pairs (None: a separator; a list as the action: a submenu)"""
+        Gtk = self.Gtk
+        def build(items):
+            m = Gtk.Menu()
+            for item in items:
+                if item is None:
+                    m.append(Gtk.SeparatorMenuItem())
+                    continue
+                text, action = item
+                mi = Gtk.MenuItem(label=text)
+                if isinstance(action, list):
+                    mi.set_submenu(build(action))
+                elif action:
+                    mi.connect('activate', lambda w, a=action: later(a))
+                else:
+                    mi.set_sensitive(False)
+                m.append(mi)
+            m.show_all()
+            return m
+        from gi.repository import Gdk
+        self.menu = build(items)   # kept, or it goes before it shows
+        self.menu.attach_to_widget(self.win)
+        if widget:
+            self.menu.popup_at_widget(widget, Gdk.Gravity.SOUTH_WEST, Gdk.Gravity.NORTH_WEST, None)
+        else:
+            self.menu.popup_at_pointer(None)
+        self.menu.select_first(False)
+
+    # the channel's menu: editing, lists, info
+
+    def channel_menu(self, row):
+        if not hasattr(row, 'ch'):
+            return self.activate(row) if hasattr(row, 'rec') or hasattr(row, 'timer') else None
+        ch = row.ch
+        s = self.app.settings
+        in_groups = [(('✓ ' if key(ch) in keys else '   ') + name, lambda n=name: self.toggle_group(ch, n))
+                     for name, keys in s['groups'].items()]
+        in_groups += [None, ('New list…', lambda: self.new_group(ch))]
+        if self.group in s['groups']:
+            in_groups += [('Delete the list "%s"' % self.group, lambda: self.delete_group(self.group))]
+        items = [
+            ('Watch', lambda: self.activate(row)),
+            ('Channel info and PIDs…', lambda: self.info_dialog(ch)),
+            None,
+            ('Lists', in_groups),
+            ('Rename…', lambda: self.edit(lambda: self.rename(ch))),
+            ('Move up', lambda: self.edit(lambda: self.move(ch, -1))),
+            ('Move down', lambda: self.edit(lambda: self.move(ch, 1))),
+            ('Skip when switching: %s' % ('on' if ch.get('skip') else 'off'),
+             lambda: self.edit(lambda: self.flag(ch, 'skip'))),
+            ('Locked (PIN): %s' % ('on' if ch.get('locked') else 'off'),
+             lambda: self.edit(lambda: self.flag(ch, 'locked'))),
+            ('Delete', lambda: self.edit(lambda: self.delete(ch))),
+            None,
+            ('Sort the list', [('By number (LCN)', lambda: self.edit(lambda: self.sort('lcn'))),
+                               ('A–Z', lambda: self.edit(lambda: self.sort('name')))]),
+        ]
+        self.popup(items, row)
+
+    def edit(self, change):
+        if self.menu_allowed():
+            change()
+            self.refresh()
+
+    def rename(self, ch):
+        name = self.ask('Rename', 'The name of %s:' % ch['name'], ch['name'])
+        if name and name.strip():
+            update_channel(ch, name=name.strip(), renamed=True)
+
+    def move(self, ch, step):
+        """In the favourites list shown, or in the whole list (a step over the channels of the list
+        shown, which may leave out radio)"""
+        s = self.app.settings
+        if self.group in s['groups']:
+            keys = s['groups'][self.group]
+            i = keys.index(key(ch))
+            j = i + step
+            if 0 <= j < len(keys):
+                keys[i], keys[j] = keys[j], keys[i]
+                save_settings(s)
+            return
+        channels = load_channels()
+        shown = [i for i, c in enumerate(channels) if c['radio'] == ch['radio']]
+        pos = next(n for n, i in enumerate(shown) if key(channels[i]) == key(ch))
+        if 0 <= pos + step < len(shown):
+            a, b = shown[pos], shown[pos + step]
+            channels[a], channels[b] = channels[b], channels[a]
+            save_channels(channels)
+
+    def flag(self, ch, name):
+        if name == 'locked' and not ch.get('locked') and not self.app.settings.get('pin'):
+            self.set_status('The PIN is 0000 until you set one in Settings')
+        update_channel(ch, **{name: not ch.get(name)})
+
+    def delete(self, ch):
+        if not self.confirm('Delete %s from the list? A scan finds it again.' % ch['name']):
+            return
+        save_channels([c for c in load_channels() if key(c) != key(ch)])
+        s = self.app.settings
+        for keys in s['groups'].values():
+            if key(ch) in keys:
+                keys.remove(key(ch))
+        save_settings(s)
+
+    def sort(self, by):
+        channels = load_channels()
+        save_channels(sort_channels([c for c in channels if not c['radio']], by) +
+                      sort_channels([c for c in channels if c['radio']], by))
+
+    def toggle_group(self, ch, name):
+        s = self.app.settings
+        keys = s['groups'][name]
+        if key(ch) in keys:
+            keys.remove(key(ch))
+        else:
+            keys.append(key(ch))
+        save_settings(s)
+        self.set_status('%s %s %s' % (ch['name'], 'is in' if key(ch) in keys else 'is no longer in', name))
+        self.refresh()
+
+    def new_group(self, ch):
+        name = self.ask('New list', 'The name of the new list of channels:')
+        s = self.app.settings
+        if not name or not name.strip() or name.strip() in s['groups'] or name.strip() in (ALL, RADIO, RECORDED, TIMERS_VIEW):
+            return
+        s['groups'][name.strip()] = [key(ch)]
+        save_settings(s)
+        self.refresh()
+
+    def delete_group(self, name):
+        if self.confirm('Delete the list "%s"? The channels stay in All channels.' % name):
+            s = self.app.settings
+            del s['groups'][name]
+            s['group'] = ALL
+            save_settings(s)
+            self.group = ALL
+            self.refresh()
+
+    def info_dialog(self, ch):
+        """What the channel is, and its PIDs, which can be edited by hand"""
+        Gtk = self.Gtk
+        d = Gtk.Dialog(title='Channel info', transient_for=self.win, modal=True)
+        d.add_buttons('Close', Gtk.ResponseType.CANCEL, 'Save the PIDs', Gtk.ResponseType.OK)
+        d.set_default_size(620, -1)
+        box = d.get_content_area()
+        box.set_spacing(6)
+        box.set_border_width(16)
+        sig = self.app.settings['signals'].get(str(ch['freq_khz']))
+        uhf_ch = uhf_channel(ch['freq_khz'])
+        kinds = {0x01: 'TV (MPEG-2 SD)', 0x02: 'radio', 0x11: 'TV (MPEG-2 HD)', 0x16: 'TV (H.264 SD)',
+                 0x19: 'TV (H.264 HD)', 0x1f: 'TV (HEVC)', 0x0a: 'radio (advanced codec)'}
+        for text in (
+                ch['name'] + ('  (renamed)' if ch.get('renamed') else ''),
+                'Provider: %s' % (ch.get('provider') or '-'),
+                'Service: %d, type %s, LCN %s' % (ch['sid'], kinds.get(ch.get('type'), ch.get('type') or '?'),
+                                                 ch.get('lcn') or '-'),
+                'Multiplex: %d MHz%s, %d MHz wide, PLP %d' % (ch['freq_khz'] // 1000, ' (UHF %d)' % uhf_ch if uhf_ch else '',
+                                                            ch['bandwidth'], ch['plp']),
+                'Signal when last tuned: %s' % ('level %d%%, quality %d%%, %s' % (sig[0], sig[1], time.strftime(
+                    '%d.%m %H:%M', time.localtime(sig[2]))) if sig else 'not known'),
+                'Encrypted: %s' % {True: 'yes', False: 'no', None: 'not checked yet'}[ch.get('encrypted')],
+                'Subtitles: %s' % (', '.join('%s (%s PID %d%s)' % (t['lang'] or '-', 'teletext' if t['type'] == 't' else 'DVB',
+                                                                   t['pid'], ', page %x' % t['page'] if t['type'] == 't' else '')
+                                             for t in ch.get('subtitles', [])) or 'none'),
+                'Teletext: %s' % ('PID %d' % ch['teletext'] if ch.get('teletext') else 'none')):
+            box.add(self.label(text, wrap=True))
+        box.add(self.label('PIDs', 'section'))
+        grid = Gtk.Grid(column_spacing=12, row_spacing=6)
+        v = ch.get('video') or {}
+        entries = {}
+        rows = [('Video PID', 'vpid', str(v.get('pid', ''))), ('Video codec', 'vcodec', v.get('codec', 'h264')),
+                ('Audio PIDs (pid:codec:lang, …)', 'audio',
+                 ', '.join('%d:%s:%s' % (a['pid'], a['codec'], a['lang']) for a in ch['audio'])),
+                ('PCR PID', 'pcr', str(ch['pcr_pid'])), ('PMT PID', 'pmt', str(ch['pmt_pid']))]
+        for n, (text, name, value) in enumerate(rows):
+            grid.attach(self.label(text), 0, n, 1, 1)
+            e = Gtk.Entry(text=value, hexpand=True)
+            grid.attach(e, 1, n, 1, 1)
+            entries[name] = e
+        box.add(grid)
+        box.add(self.label('Changed PIDs stay through scans. Empty video PID: radio.', 'hint'))
+        d.show_all()
+        if d.run() == Gtk.ResponseType.OK and self.menu_allowed():
+            try:
+                vpid = entries['vpid'].get_text().strip()
+                audio = []
+                for part in entries['audio'].get_text().split(','):
+                    f = part.strip().split(':')
+                    if f[0]:
+                        audio.append({'pid': int(f[0]), 'codec': f[1] if len(f) > 1 else 'mp2',
+                                      'lang': f[2] if len(f) > 2 else ''})
+                fields = {'video': {'pid': int(vpid), 'codec': entries['vcodec'].get_text().strip() or 'h264'}
+                          if vpid else None,
+                          'audio': audio, 'pcr_pid': int(entries['pcr'].get_text()),
+                          'pmt_pid': int(entries['pmt'].get_text()), 'pids_edited': True}
+                fields['radio'] = fields['video'] is None
+                update_channel(ch, **fields)
+                self.set_status('PIDs of %s saved' % ch['name'])
+            except ValueError:
+                self.set_status('The PIDs must be numbers')
+        d.destroy()
+        self.refresh()
+
+    # the guide's programmes: timers
+
+    def event_menu(self, row):
+        ch, e = self.sched_ch, getattr(row, 'event', None)
+        if not ch or not e:
+            return
+        t = self.app.guide.now()
+        timer = timer_for(load_timers(), ch, e)
+        index = next((r.index for r in self.rows if getattr(r, 'key', None) == key(ch)), 0)
+        items = [('Watch %s' % ch['name'], lambda: self.app.watch(self.group, index))]
+        if timer:
+            items.append(('Cancel the timer', lambda: self.cancel_timer(timer['id'])))
+        else:
+            s = self.app.settings
+            start = max(e[0] - s['margin_before'] * 60, t) if e[0] <= t else e[0] - s['margin_before'] * 60
+            end = e[0] + e[1] + s['margin_after'] * 60
+            items += [('Record', lambda: self.set_timer(ch, start, end, 'record', e[2], '')),
+                      ('Record every day', lambda: self.set_timer(ch, start, end, 'record', e[2], 'daily')),
+                      ('Record every week', lambda: self.set_timer(ch, start, end, 'record', e[2], 'weekly'))]
+            if e[0] > t:
+                items.append(('Switch to it when it starts', lambda: self.set_timer(ch, e[0], e[0] + e[1], 'watch',
+                                                                                    e[2], '')))
+        self.popup(items, row)
+
+    def set_timer(self, ch, start, end, action, title, repeat):
+        timer, other = add_timer(ch, start, end, action, title, repeat)
+        if other:
+            self.set_status('Conflicts with "%s" on %s, %s–%s: one tuner, one multiplex at a time' % (
+                other['title'], other['channel'], hhmm(other['start']), hhmm(other['end'])))
+        else:
+            self.set_status('Timer set: %s %s, %s' % (hhmm(start), title, ch['name']))
+            self.app.check_timers()
+        self.fill_schedule(self.sched_ch)
+
+    def cancel_timer(self, tid):
+        timers = load_timers()
+        t = next((t for t in timers if t['id'] == tid), None)
+        if t and t.get('state') == 'running':
+            rec = next((r for r in self.app.recordings() if r.timer == tid), None)
+            if rec:
+                self.app.stop_recording(rec)
+            timers = load_timers()
+        save_timers([t for t in timers if t['id'] != tid])
+        self.set_status('Timer cancelled')
+        self.refresh()
+        if self.sched_ch:
+            self.fill_schedule(self.sched_ch)
+
+    def timer_menu(self, row):
+        t = row.timer
+        self.popup([('Cancel the timer' if t.get('state', '') in ('', 'running') else 'Remove',
+                     lambda: self.cancel_timer(t['id']))], row)
+
+    def recording_menu(self, row):
+        m = row.rec
+        running = next((r for r in self.app.recordings() if r.path == m['path']), None)
+        items = [('Play', lambda: self.play_recording(m))]
+        if running:
+            items.append(('Stop recording', lambda: (self.app.stop_recording(running), self.refresh())))
+        items.append(('Delete', lambda: self.delete_recording(m)))
+        self.popup(items, row)
+
+    def delete_recording(self, m):
+        if any(r.path == m['path'] for r in self.app.recordings()):
+            self.set_status('It is being recorded: stop it first')
+            return
+        if not self.confirm('Delete the recording "%s"?' % (m.get('title') or os.path.basename(m['path']))):
+            return
+        for p in (m['path'], m['path'][:-3] + '.json'):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        self.refresh()
+
+    # scans
+
+    def scan_dialog(self):
+        if not self.menu_allowed():
+            return
+        Gtk = self.Gtk
+        d = Gtk.Dialog(title='Scan channels', transient_for=self.win, modal=True)
+        d.add_buttons('Cancel', Gtk.ResponseType.CANCEL, 'Scan', Gtk.ResponseType.OK)
+        d.set_default_response(Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(16)
+        full = Gtk.RadioButton(label='The whole band: UHF 21–60 (474–786 MHz), about 3 min')
+        one = Gtk.RadioButton(label='One frequency', group=full)
+        nit = Gtk.RadioButton(label='Network search (the frequencies the network lists, from this one)', group=full)
+        for w in (full, one, nit):
+            box.add(w)
+        grid = Gtk.Grid(column_spacing=12, row_spacing=6, margin_start=24)
+        freq = Gtk.Entry(text='', placeholder_text='UHF channel (21–69) or MHz, e.g. 27 or 522')
+        bw = Gtk.ComboBoxText()
+        for b in ('8', '7', '6'):
+            bw.append(b, b + ' MHz')
+        bw.set_active_id('8')
+        plp = Gtk.SpinButton.new_with_range(0, 255, 1)
+        for n, (text, w) in enumerate((('Frequency', freq), ('Bandwidth', bw), ('PLP (DVB-T2)', plp))):
+            grid.attach(self.label(text), 0, n, 1, 1)
+            grid.attach(w, 1, n, 1, 1)
+        box.add(grid)
+        box.add(self.label('A scan keeps the order, names and lists of the channels it finds again.', 'hint'))
+        d.show_all()
+        r = d.run()
+        mode = 'full' if full.get_active() else 'one' if one.get_active() else 'nit'
+        text, width, plp_id = freq.get_text().strip(), int(bw.get_active_id()), plp.get_value_as_int()
+        d.destroy()
+        if r != Gtk.ResponseType.OK:
+            return
+        test = self.app.test
+        sigs = self.app.settings['signals']
+        if mode == 'full':
             LOG.write('tv', 'window: scan')
-            progress = lambda text: GLib.idle_add(self.status.set_text, text)
-            self.run('scan', lambda: scan(uhf(21, 60) if not test else [(0, 8)], test, progress))
+            self.run_job('a channel scan is running', lambda fe, p: scan(fe, uhf(21, 60) if not test else [(0, 8, 0)],
+                                                                         test, p, sigs))
+            return
+        try:
+            n = float(text.replace(',', '.'))
+        except ValueError:
+            self.set_status('The frequency: a UHF channel number or MHz')
+            return
+        khz = 306000 + 8000 * int(n) if n < 100 else int(n * 1000)
+        if test:
+            khz = 0
+        LOG.write('tv', 'window: scan %s %d kHz' % (mode, khz))
+        if mode == 'one':
+            self.run_job('a channel scan is running', lambda fe, p: scan(fe, [(khz, width, plp_id)], test, p, sigs))
+        else:
+            self.run_job('a network search is running', lambda fe, p: nit_search(fe, khz, width, test, p, sigs))
 
-        def update_guide(self):
-            LOG.write('tv', 'window: update the guide')
-            progress = lambda text: GLib.idle_add(self.status.set_text, text)
-            self.run('guide', lambda: update_guide(test, progress))
+    # settings
 
-        def on_key(self, w, ev):
-            k = Gdk.keyval_name(ev.keyval)
-            name = (k or '').replace('KP_', '')
-            digit = name if len(name) == 1 and name.isdigit() else None
-            if digit and not self.busy:
-                # digits typed within 1.5 s make one number: that channel is selected (OK watches)
-                now = time.monotonic()
-                self.typed = (self.typed if now - self.typed_at < 1.5 else '')[-2:] + digit
-                self.typed_at = now
-                if 1 <= int(self.typed) <= len(self.list):
-                    self.select(int(self.typed) - 1)
-                return True
-            if k == 'Escape' and self.busy and self.waiting:
-                self.cancel.set()
-                self.status.set_text('Stopping…')
-                return True
-            if k == 'Escape' and not self.busy:
-                Gtk.main_quit()
-                return True
-            focus = self.win.get_focus()
-            if k == 'Right' and focus and focus.get_parent() is self.channels:
-                rows = [r for r in self.sched.get_children() if r.get_selectable()]
-                cur = [r for r in rows if r.get_style_context().has_class('current')]
-                if rows:
-                    (cur or rows)[0].grab_focus()
-                    self.sched.select_row((cur or rows)[0])
-                return True
-            if k == 'Left' and focus and focus.get_parent() is self.sched:
-                self.select(self.index)
-                return True
-            return False
+    def settings_dialog(self):
+        if not self.menu_allowed():
+            return
+        Gtk = self.Gtk
+        s = self.app.settings
+        d = Gtk.Dialog(title='TV settings', transient_for=self.win, modal=True)
+        d.add_buttons('Close', Gtk.ResponseType.CLOSE)
+        d.set_default_size(720, 520)
+        book = Gtk.Notebook()
+        d.get_content_area().pack_start(book, True, True, 0)
 
-    GLib.set_prgname('ozone-tv')
-    TvWindow()
-    Gtk.main()
-    return 0
+        def page(name):
+            g = Gtk.Grid(column_spacing=16, row_spacing=10, border_width=16)
+            g.row = 0
+            book.append_page(g, Gtk.Label(label=name))
+            return g
+
+        def add(g, text, w, hint=None):
+            g.attach(self.label(text), 0, g.row, 1, 1)
+            g.attach(w, 1, g.row, 1, 1)
+            g.row += 1
+            if hint:
+                g.attach(self.label(hint, 'hint', wrap=True, max_width_chars=60), 0, g.row, 2, 1)
+                g.row += 1
+
+        def combo(options, value, on):
+            c = Gtk.ComboBoxText()
+            for v, text in options:
+                c.append(str(v), text)
+            c.set_active_id(str(value))
+            c.connect('changed', lambda w: on(w.get_active_id()))
+            return c
+
+        def switch(name, on=None):
+            w = Gtk.Switch(active=bool(s.get(name)), halign=Gtk.Align.START)
+            def changed(w, _p):
+                s[name] = w.get_active()
+                save_settings(s)
+                if on:
+                    on(w.get_active())
+            w.connect('notify::active', changed)
+            return w
+
+        def spin(name, lo, hi, step=1):
+            w = Gtk.SpinButton.new_with_range(lo, hi, step)
+            w.set_value(s[name])
+            def changed(w):
+                s[name] = w.get_value_as_int()
+                save_settings(s)
+            w.connect('value-changed', changed)
+            return w
+
+        def setter(name, conv=int):
+            def on(v):
+                s[name] = conv(v)
+                save_settings(s)
+            return on
+
+        def langs(name):
+            e = Gtk.Entry(text=', '.join(s[name]), placeholder_text='ukr, eng')
+            def changed(w):
+                s[name] = [x.strip().lower() for x in w.get_text().split(',') if x.strip()]
+                save_settings(s)
+            e.connect('changed', changed)
+            return e
+
+        g = page('Picture and sound')
+        add(g, 'Player bars stay up for (s)', spin('banner', 1, 30), 'After the last key; then only the picture.')
+        add(g, 'Picture shape', combo([(0, 'As broadcast'), (1, 'Full screen (stretched)'), (2, '4:3'), (3, '16:9')],
+                                      s['aspect'], setter('aspect')), 'The blue key changes it while watching.')
+        add(g, 'Audio languages, in order', langs('audio_langs'), 'ISO 639 codes. The yellow key changes the track '
+            'and stereo / left / right while watching; the choice is kept per channel.')
+        add(g, 'Audio', combo([(0, 'Stereo'), (1, 'Left channel on both'), (2, 'Right channel on both')],
+                              s['audio_mode'], setter('audio_mode')))
+        add(g, 'Subtitles on by default', switch('subtitles'))
+        add(g, 'Subtitle languages, in order', langs('subtitle_langs'), 'The green key turns them on and off.')
+        add(g, 'Teletext characters', combo([(0, 'Latin (Western Europe)'), (32, 'Cyrillic (Ukrainian, Russian)')],
+                                            s['teletext_region'], setter('teletext_region')),
+            'For pages that don\'t name their character set. The text key opens teletext.')
+
+        g = page('Antenna')
+
+        def antenna(on):
+            fe = self.app.fe
+            try:
+                if fe:
+                    fe.antenna(on)
+                self.set_status('Antenna power %s' % ('on: 5 V' if on else 'off'))
+            except RuntimeError as e:
+                self.set_status('Antenna power: %s' % e)
+        add(g, '5 V antenna power', switch('antenna_power', antenna),
+            'For an active antenna (with an amplifier) powered through its cable. Leave it off for a passive '
+            'antenna, or one with its own power supply.')
+        sigs = s['signals']
+        if sigs:
+            g.attach(self.label('Signal when last tuned', 'section'), 0, g.row, 2, 1)
+            g.row += 1
+            for khz in sorted(sigs, key=int):
+                lv, q, at = sigs[khz]
+                g.attach(self.label('%d MHz: level %d%%, quality %d%%  (%s)' % (int(khz) // 1000, lv, q, time.strftime(
+                    '%d.%m %H:%M', time.localtime(at)))), 0, g.row, 2, 1)
+                g.row += 1
+
+        g = page('Recording')
+        options = [('auto', 'The first USB drive (else the internal memory)')] + [(p, l) for p, l in drives()] + \
+                  [(NAND, 'Internal memory')]
+        add(g, 'Record to', combo(options, s['drive'] or 'auto', setter('drive', lambda v: '' if v == 'auto' else v)),
+            'In a "%s" folder there. Now: %s' % (RECORDINGS, recording_drive(s) or 'nowhere'))
+        add(g, 'The record key records', combo([('programme', 'Until the programme ends'), ('30', '30 min'),
+                                                ('60', '1 hour'), ('120', '2 hours'), ('240', '4 hours'),
+                                                ('0', 'Until stopped')],
+                                               s['instant'], setter('instant', lambda v: v if v == 'programme' else int(v))))
+        add(g, 'Timers start early by (min)', spin('margin_before', 0, 30))
+        add(g, 'and end late by (min)', spin('margin_after', 0, 60))
+        add(g, 'Pause live TV: buffer in memory (MB)', spin('timeshift_mb', 16, 128, 8),
+            'About 2 minutes per 64 MB of an SD channel.')
+        add(g, 'Or on the recording drive', switch('timeshift_drive'))
+        add(g, 'Buffer on the drive (MB)', spin('timeshift_drive_mb', 256, 16384, 256),
+            'From the next time you watch.')
+
+        g = page('Parental control')
+
+        def change_pin():
+            old = self.ask('PIN', 'The PIN now (0000 if never set):', password=True)
+            if old is None:
+                return
+            if not pin_ok(s, old):
+                self.set_status('Wrong PIN')
+                return
+            new = self.ask('PIN', 'The new PIN, four digits:', password=True)
+            if new and re.fullmatch(r'\d{4}', new) and self.ask('PIN', 'Once more:', password=True) == new:
+                s['pin'] = pin_hash(new)
+                save_settings(s)
+                self.set_status('PIN changed')
+            else:
+                self.set_status('PIN not changed: four digits, the same twice')
+        b = Gtk.Button(label='Change the PIN…', halign=Gtk.Align.START)
+        b.connect('clicked', lambda w: later(change_pin))
+        add(g, 'PIN', b, 'It is 0000 until changed. Locked channels (the channel\'s menu) need it each time the '
+            'player starts.')
+        add(g, 'Programmes rated', combo([(0, 'Any age'), (6, '6+ and over need the PIN'), (12, '12+ and over…'),
+                                          (16, '16+ and over…'), (18, '18+ only…')], s['age'], setter('age')),
+            'From the age rating the broadcast gives (Zeonbud gives none for most programmes).')
+        add(g, 'Lock the TV menu', switch('lock_menu'), 'Settings, scans and editing the list need the PIN.')
+
+        g = page('Channels')
+
+        def backup():
+            usb = drives()
+            if not usb:
+                self.set_status('No USB drive')
+                return
+            dest = os.path.join(usb[0][0], 'ozone-tv-backup-%s' % time.strftime('%Y%m%d-%H%M'))
+            os.makedirs(dest, exist_ok=True)
+            for f, name in ((CHANNELS, 'channels.json'), (SETTINGS, 'settings.json'), (TIMERS, 'timers.json'),
+                            (EPG, 'epg.json')):
+                if os.path.exists(f):
+                    shutil.copy(f, os.path.join(dest, name))
+            self.set_status('Saved to %s' % dest)
+
+        def restore():
+            found = sorted((os.path.join(p, n) for p, _l in drives() for n in os.listdir(p)
+                            if n.startswith('ozone-tv-backup-') and os.path.isdir(os.path.join(p, n))), reverse=True)
+            if not found:
+                self.set_status('No ozone-tv-backup-* folder on the USB drives')
+                return
+            if not self.confirm('Replace the channel list, settings and timers with the backup %s?' % found[0]):
+                return
+            for n, f in (('channels.json', CHANNELS), ('settings.json', SETTINGS), ('timers.json', TIMERS),
+                         ('epg.json', EPG)):
+                if os.path.exists(os.path.join(found[0], n)):
+                    shutil.copy(os.path.join(found[0], n), f)
+            self.app.settings.clear()
+            self.app.settings.update(load_settings())
+            self.set_status('Restored from %s' % found[0])
+            d.response(Gtk.ResponseType.CLOSE)
+
+        def reset():
+            if not self.confirm('Delete the channel list, the guide, the timers and the settings? Recordings stay.'):
+                return
+            for f in (CHANNELS, SETTINGS, TIMERS, EPG):
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass
+            self.app.settings.clear()
+            self.app.settings.update(load_settings())
+            self.set_status('TV data reset: scan for channels')
+            d.response(Gtk.ResponseType.CLOSE)
+
+        for text, action, hint in (
+                ('Scan channels…', lambda: (d.response(Gtk.ResponseType.CLOSE), self.scan_dialog()),
+                 'The whole band, one frequency, or a network search.'),
+                ('Sort by number (LCN)', lambda: self.sort('lcn') or self.set_status('Sorted by number'), None),
+                ('Sort A–Z', lambda: self.sort('name') or self.set_status('Sorted by name'), None),
+                ('Back up to USB', backup, 'The channel list, lists, settings, timers and guide, into an '
+                 'ozone-tv-backup-<date> folder on the first USB drive.'),
+                ('Restore from USB…', restore, 'From the newest backup folder on the USB drives.'),
+                ('Reset TV data…', reset, 'Everything but the recordings: then scan again.')):
+            b = Gtk.Button(label=text, halign=Gtk.Align.START)
+            b.connect('clicked', lambda w, a=action: later(a))
+            g.attach(b, 0, g.row, 1, 1)
+            if hint:
+                g.attach(self.label(hint, 'hint', wrap=True, max_width_chars=50), 1, g.row, 1, 1)
+            g.row += 1
+
+        d.show_all()
+        d.run()
+        d.destroy()
+        self.app.settings.update(load_settings())
+        self.refresh()
+
+    # keys
+
+    def on_list_click(self, w, ev):
+        if ev.button == 3:
+            row = self.list.get_row_at_y(int(ev.y))
+            if row:
+                self.list.select_row(row)
+                self.row_menu(row)
+            return True
+        return False
+
+    def row_menu(self, row):
+        if hasattr(row, 'rec'):
+            self.recording_menu(row)
+        elif hasattr(row, 'timer'):
+            self.timer_menu(row)
+        else:
+            self.channel_menu(row)
+
+    def on_key(self, w, ev):
+        from gi.repository import Gdk
+        k = Gdk.keyval_name(ev.keyval)
+        name = (k or '').replace('KP_', '')
+        digit = name if len(name) == 1 and name.isdigit() else None
+        focus = self.win.get_focus()
+        in_list = focus and focus.get_parent() is self.list
+        if digit and self.group not in (RECORDED, TIMERS_VIEW) and not isinstance(focus, self.Gtk.Entry):
+            # digits typed within 1.5 s make one number: that channel is selected (OK watches)
+            now = time.monotonic()
+            self.typed = (self.typed if now - self.typed_at < 1.5 else '')[-2:] + digit
+            self.typed_at = now
+            if 1 <= int(self.typed) <= len(self.rows):
+                self.select(int(self.typed) - 1)
+            return True
+        if k == 'Escape':
+            self.win.destroy()
+            return True
+        if k in ('Menu', 'F2', 'Launch4'):   # the remote's blue key
+            row = self.list.get_selected_row()
+            if focus and focus.get_parent() is self.sched:
+                self.event_menu(focus)
+            elif row:
+                self.row_menu(row)
+            return True
+        if k in ('Tab', 'Launch2') and not isinstance(focus, self.Gtk.Entry):   # green: the next list
+            self.next_group()
+            return True
+        if k == 'Right' and in_list:
+            rows = [r for r in self.sched.get_children() if r.get_selectable()]
+            cur = [r for r in rows if r.get_style_context().has_class('current')]
+            if rows:
+                (cur or rows)[0].grab_focus()
+                self.sched.select_row((cur or rows)[0])
+            return True
+        if k == 'Left' and focus and focus.get_parent() is self.sched:
+            row = self.list.get_selected_row()
+            if row:
+                row.grab_focus()
+            return True
+        return False
 
 
-def uhf(first, last):
-    """UHF channel numbers to (centre kHz, 8 MHz): channel 21 is 474 MHz"""
-    return [(306000 + 8000 * ch, 8) for ch in range(first, last + 1)]
-
+# ---- logs and the command line --------------------------------------------------------------------
 
 def logger_entry(buf):
     """One Android logger v1 entry: (sec, pid, priority, tag, message), or None"""
@@ -1404,16 +3475,37 @@ def show_logs():
 
 
 def main(argv):
+    global BUSY, CHANNELS
     args = argv[1:]
+    test = None
     if '--test' in args:
         i = args.index('--test')
+        test = args[i + 1]
         del args[i:i + 2]
+        CHANNELS = os.path.join(DATA, 'channels-test.json')   # the real list stays as it is
     cmd = args[0] if args else 'menu'
     if cmd in ('log', 'logs'):
         return show_log() if cmd == 'log' else show_logs()
+    if cmd == 'timers':
+        return timer_service()
+    if cmd == 'now':
+        guide = Guide()
+        for i, c in enumerate(group_list(load_channels(), load_settings(), ALL)):
+            print('%4d  %-24s %s' % (channel_number(c, i), c['name'], on_now(guide, c)))
+        return 0
+    if cmd == 'antenna' and len(args) > 1:
+        s = load_settings()
+        s['antenna_power'] = args[1] == 'on'
+        save_settings(s)
+    # the window, a channel and timers go to the process that runs, if one does
+    if cmd in ('menu', 'play', 'timer') and not test:
+        reply = control({'menu': 'show', 'timer': 'timers'}.get(cmd, ' '.join(args)))
+        if reply is not None:
+            if reply != 'ok':
+                print(reply)
+            return 0
     # one at a time: a second run would start a second dtvfe on the same tuner
     os.makedirs(DATA, exist_ok=True)
-    global BUSY
     lock = open(LOCK, 'a+')
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1422,10 +3514,10 @@ def main(argv):
         notify('TV is busy: %s' % (lock.read().strip() or 'another ozone-tv is running'))
         return 1
     BUSY = lock
-    busy('the TV window is open' if cmd == 'menu' else 'ozone-tv ' + cmd)
-    LOG.start(cmd + ('-test' if '--test' in argv else ''))
+    busy({'menu': 'the TV window is open', 'play': 'watching TV', 'timer': 'a timer'}.get(cmd, 'ozone-tv ' + cmd))
+    LOG.start(cmd + ('-test' if test else ''))
     try:
-        return run(argv)
+        return run(cmd, args, test)
     except SystemExit as e:
         LOG.write('tv', 'exit %s' % e.code)
         raise
@@ -1440,51 +3532,49 @@ def main(argv):
         LOG.close()
 
 
-def run(argv):
-    global CHANNELS
-    test = None
-    if '--test' in argv:
-        i = argv.index('--test')
-        test = argv[i + 1]
-        del argv[i:i + 2]
-        CHANNELS = os.path.join(DATA, 'channels-test.json')   # the real list stays as it is
-    cmd = argv[1] if len(argv) > 1 else 'menu'
-    if cmd == 'menu':
-        return window(test)
-    if cmd == 'guide':
-        return update_guide(test) or 0
-    if cmd == 'now':
-        guide = Guide()
-        for i, c in enumerate(c for c in load_channels() if not c['radio']):
-            print('%4d  %-24s %s' % (channel_number(c, i), c['name'], on_now(guide, c)))
-        return 0
-    if cmd == 'scan':
-        if test:
-            freqs = [(0, 8)]
-        elif len(argv) > 2 and argv[2] == '--freq':
-            freqs = [(int(argv[3]), int(argv[4]) if len(argv) > 4 else 8)]
-        else:
-            first, last = (int(argv[2]), int(argv[3])) if len(argv) > 3 else (21, 60)
-            freqs = uhf(first, last)
-        for c in scan(freqs, test):
-            print('%4s  %-28s %4d MHz  sid %-5d %s %s' % (c['lcn'] or '', c['name'], c['freq_khz'] // 1000, c['sid'],
-                  'radio' if c['radio'] else c['video']['codec'],
-                  ' '.join('%s/%s' % (a['codec'], a['lang'] or '-') for a in c['audio'])))
-        return 0
-    if cmd == 'play' and len(argv) > 2:
-        return watch(int(argv[2]) - 1, test)
-    if cmd == 'status' and len(argv) > 2:
+def run(cmd, args, test):
+    if cmd in ('menu', 'play', 'timer'):
+        app = TvApp(test)
+        if cmd == 'play' and len(args) > 1:
+            return app.run(('play', int(args[1])))
+        return app.run(('menu',) if cmd == 'menu' else ('timer',))
+    if cmd in ('guide', 'scan', 'status', 'antenna'):
         fe = open_frontend(test)
         try:
-            print(fe.tune(int(argv[2]), int(argv[3]) if len(argv) > 3 else 8))
-            while True:
-                time.sleep(1)
-                locked, strength, quality = fe.status()
-                print('locked' if locked else 'no lock', 'level %d%%' % strength, 'quality %d%%' % quality, flush=True)
+            if cmd == 'guide':
+                update_guide(fe)
+            elif cmd == 'antenna':
+                print('antenna power', 'on' if fe.antenna(len(args) > 1 and args[1] == 'on') else 'off')
+            elif cmd == 'status' and len(args) > 1:
+                print(fe.tune(int(args[1]), int(args[2]) if len(args) > 2 else 8))
+                while True:
+                    time.sleep(1)
+                    locked, strength, quality = fe.status()
+                    print('locked' if locked else 'no lock', 'level %d%%' % strength, 'quality %d%%' % quality, flush=True)
+            elif cmd == 'scan':
+                if test:
+                    channels = scan(fe, [(0, 8, 0)], test)[0]
+                elif len(args) > 2 and args[1] == '--nit':
+                    channels = nit_search(fe, int(args[2]), int(args[3]) if len(args) > 3 else 8) or []
+                elif len(args) > 2 and args[1] == '--freq':
+                    channels = scan(fe, [(int(args[2]), int(args[3]) if len(args) > 3 else 8,
+                                          int(args[4]) if len(args) > 4 else 0)])[0]
+                else:
+                    first, last = (int(args[1]), int(args[2])) if len(args) > 2 else (21, 60)
+                    channels = scan(fe, uhf(first, last))[0]
+                for c in channels:
+                    print('%4s  %-28s %4d MHz  sid %-5d %s %s%s' % (
+                        c['lcn'] or '', c['name'], c['freq_khz'] // 1000, c['sid'],
+                        'radio' if c['radio'] else c['video']['codec'],
+                        ' '.join('%s/%s' % (a['codec'], a['lang'] or '-') for a in c['audio']),
+                        ' subs ' + ','.join(t['lang'] for t in c.get('subtitles', [])) if c.get('subtitles') else ''))
+            else:
+                sys.exit(__doc__)
         except KeyboardInterrupt:
-            return 0
+            pass
         finally:
             fe.close()
+        return 0
     sys.exit(__doc__)
 
 

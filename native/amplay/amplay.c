@@ -13,18 +13,38 @@
  * it; without X (DISPLAY unset) fb0 is blanked and keys come from the keyboards directly (evdev,
  * grabbed).
  *
- *   amplay [--audio URL] [--start SECONDS] [--title TEXT] URL     URL: a file or anything FFmpeg opens
- *   amplay --live [--program N] [--title TEXT] [--channels FILE --channel N] URL
- *                                                  broadcast TS, e.g. pipe:0 from ozone-tv
+ *   amplay [--audio URL] [--start SECONDS] [--title TEXT] [--program N] URL
+ *                                                  URL: a file or anything FFmpeg opens; N: the
+ *                                                  service of a broadcast TS (a recording)
+ *   amplay --tv [--banner SECONDS]                 the TV player, see "TV" below
  *   amplay --reset                                 put the desktop back after a crash
  *
  * Keys: Space/P pause, Left/Right -/+10 s, PgDn/PgUp -/+60 s, Up/Down volume, M mute, Q/Esc quit.
  * Mouse (under X): click the progress bar to seek, the picture to pause, the wheel for volume.
- * Live: Left/Right and PgDn/PgUp (and the remote's channel keys) ask for the previous/next channel:
- * amplay exits with status 11/10 and the caller retunes. With --channels FILE (lines of
- * "number<TAB>name<TAB>now on") Enter opens a channel list on the left; choosing one prints
- * "channel N" (N its line, from 0) to stdout and exits with status 12.
  * Exit status 3 means the video codec has no hardware decoder (the caller can fall back to mpv).
+ *
+ * TV. amplay --tv stays up while ozone-tv switches channels, so a switch is the time to the next
+ * keyframe, not a new player: no window, decoder or ALSA set up again, and no stream probing (2 MB
+ * of the broadcast, 3 s). ozone-tv writes the tuned service's TS into a run of segment files
+ * (SRC000000.ts, SRC000001.ts... SEG_BYTES each, the oldest deleted), and amplay reads them at
+ * an offset, waiting at the end for more: the same files make the timeshift buffer, so live TV
+ * can be paused and wound back. Before the data, amplay reads the service's PAT and PMT (given by
+ * ozone-tv), so the streams are known at once; video starts at a keyframe.
+ * Commands on stdin, one per line, fields separated by tabs:
+ *   play  key=value...   a channel: src= off= (the segments and where the channel starts in them),
+ *                        psi= (PAT and PMT sections in hex, comma between), pmt= (its PID),
+ *                        v= (video PID, 0 for radio), a= (audio pid:lang,...), asel=, amode= (0
+ *                        stereo, 1 left, 2 right), s= (subtitles pid:d|t:lang:page,...), ssel=
+ *                        (-1 off), ttx= (teletext PID), ttxregion= (its default character
+ *                        sets, see ttx.h), title=, now= (radio: what's on)
+ *   stop TITLE           stop playing (a switch is on its way), show TITLE
+ *   title TEXT | info TEXT (\n for new lines) | signal LOCKED STRENGTH QUALITY | rec 0|1
+ *   message SECONDS TEXT (0: until replaced, empty text clears) | pin PROMPT (empty closes it)
+ *   channels FILE INDEX  the list ("number\tname\tnow on\tflags" lines) | current INDEX
+ *   buffer OFFSET        the oldest data still in the segments | aspect MODE | quit
+ * What the viewer does goes to stdout: "channel N" (a switch, N from 0 in the list), "quit",
+ * "audio PID MODE", "subs PID PAGE" (0 0: off), "aspect MODE", "pin NNNN", "record", "group",
+ * "tvradio". Its keys are in osd.c.
  */
 #define _GNU_SOURCE
 #include <alsa/asoundlib.h>
@@ -55,6 +75,7 @@
 #include <libswresample/swresample.h>
 
 #include "osd.h"
+#include "ttx.h"
 
 /* amstream ioctls, from Amlogic's include/linux/amlogic/amports/amstream.h (3.10 kernels) */
 #define AMSTREAM_IOC_VFORMAT          _IOW('S', 0x04, int)
@@ -93,6 +114,13 @@ struct dec_sysinfo {
 #define SEEK_SHORT      10
 #define SEEK_LONG       60
 #define SYS             "/sys/class/"
+/* TV */
+#define SEG_BYTES       (8 << 20)       /* the segment files of the live buffer */
+#define AUDIO_CUSHION   (PTS_HZ * 3 / 10) /* broadcast audio queued before the clock starts */
+#define NO_AUDIO_WAIT   1500000         /* us: audio that hasn't come by then is done without */
+#define IDX_MAX         16384           /* timeshift: keyframes remembered, about 4 hours */
+#define LIVE_SLACK      (5 * PTS_HZ / 2) /* nearer the broadcast than this counts as live */
+#define MAX_TRACKS      8
 
 struct codec_map {
     enum AVCodecID id;
@@ -106,9 +134,14 @@ struct codec_map {
     { AV_CODEC_ID_MPEG1VIDEO, 0, 0, "/dev/amstream_vbuf", "null" },
 };
 
+/* the video layer's aspect modes the TV key goes through, and their names */
+static const struct { int mode; const char *name; } ASPECTS[] = {
+    { 0, "Original" }, { 1, "Full screen" }, { 2, "4:3" }, { 3, "16:9" },
+};
+
 /* ---- packet queue -------------------------------------------------------------------------- */
 
-struct pkt { AVPacket *p; struct pkt *next; };
+struct pkt { AVPacket *p; int pid, codec; struct pkt *next; };
 struct pq {
     pthread_mutex_t m;
     pthread_cond_t c;
@@ -125,7 +158,8 @@ static void pq_init(struct pq *q, size_t max)
     q->max = max;
 }
 
-static int pq_put(struct pq *q, AVPacket *p)
+/* pid and codec: what TV audio packets came from, for the decoder to follow a track change */
+static int pq_put(struct pq *q, AVPacket *p, int pid, int codec)
 {
     pthread_mutex_lock(&q->m);
     while (q->bytes >= q->max && !q->abort)
@@ -137,6 +171,8 @@ static int pq_put(struct pq *q, AVPacket *p)
     }
     struct pkt *n = malloc(sizeof *n);
     n->p = p;
+    n->pid = pid;
+    n->codec = codec;
     n->next = NULL;
     if (q->tail)
         q->tail->next = n;
@@ -150,7 +186,7 @@ static int pq_put(struct pq *q, AVPacket *p)
 }
 
 /* 1: got a packet, 0: end of stream, -1: aborted */
-static int pq_get(struct pq *q, AVPacket **p)
+static int pq_get(struct pq *q, AVPacket **p, int *pid, int *codec)
 {
     pthread_mutex_lock(&q->m);
     while (!q->head && !q->eof && !q->abort)
@@ -163,6 +199,10 @@ static int pq_get(struct pq *q, AVPacket **p)
             q->tail = NULL;
         q->bytes -= n->p->size + sizeof *n;
         *p = n->p;
+        if (pid)
+            *pid = n->pid;
+        if (codec)
+            *codec = n->codec;
         free(n);
         pthread_cond_broadcast(&q->c);
     }
@@ -209,16 +249,33 @@ struct input {
     pthread_t th;
 };
 
+/* TV: the live segments read from an offset, after the service's PAT and PMT (see the top) */
+struct tsin {
+    char src[400];
+    int64_t base;             /* the offset this session started at */
+    int64_t pos;              /* the next byte to read */
+    int fd;
+    int64_t seg;              /* the segment open on fd */
+    int psi_at;               /* bytes of P.svc.psi read so far */
+    int64_t edge_at;          /* us: when a read last had to wait for the writer */
+};
+
+struct track { int pid; char type; char lang[8]; int page; };
+
+/* a decoded DVB subtitle, waiting for its time */
+struct sub { int64_t start, end; uint8_t *rgba; int x, y, w, h, dispw, disph; };
+
 static struct {
     struct input in[2];
     int nin;
     AVStream *vst, *ast;
+    AVRational vtb, atb;      /* the video and audio timestamps' units */
     const struct codec_map *codec;
     AVBSFContext *bsf;
     AVCodecContext *actx;
     SwrContext *swr;
     snd_pcm_t *pcm;
-    int can_pause;
+    int can_pause, has_audio;
 
     struct pq vq, aq;
     pthread_t vth, ath;
@@ -243,15 +300,52 @@ static struct {
     double duration;          /* seconds, 0 if unknown */
     double last_pos;
     const char *title;
-    int live, program;        /* --live, --program (-1: any) */
-    const char *channels;     /* --channels: the list for the OSD, and --channel, the one playing */
-    int channel;
+    int program;              /* --program (-1: any) */
     int exit_status;
     int x11;                  /* controls drawn under X, or evdev without */
 
+    /* --tv */
+    int tv, running;          /* a channel is playing (or starting) */
+    struct {
+        char src[400];
+        int64_t off;
+        int vpid, pmt;
+        struct track a[MAX_TRACKS], s[MAX_TRACKS];
+        int na, ns, asel, amode, ssel, ttx;
+        uint8_t psi[188 * 24];
+        int npsi;
+        char title[512], now[256];
+        volatile int apid;    /* the audio PID routed to the decoder */
+    } svc;
+    struct tsin tsin;
+    pthread_t dth;
+    int vgate;                /* the first keyframe came: from then on the session's packets go through */
+    volatile int novideo;     /* the channel's video can't be decoded */
+    int64_t gate_pts;
+    int64_t first_apts, last_apts;   /* queued audio of the session (under clk_m) */
+    int frame_out;            /* the kernel has the first frame */
+    int64_t last_dpts;        /* the main stream's last timestamp read, for jumps in the timeline */
+    volatile int restart;     /* the timeline jumped: start again at restart_off */
+    int64_t restart_off;
+    int64_t play_at, audio_wait_since;
+    struct { int64_t pts, off; } idx[IDX_MAX];   /* timeshift: keyframes and where they are */
+    int nidx;
+    int64_t live_pts, live_at;   /* the newest timestamp read at the live edge, and when (us) */
+    volatile int64_t low_off;    /* the oldest offset still in the segments */
+    int signal, recording, aspect;
+    char audio_label[32], subs_label[32];
+    AVCodecContext *sctx;     /* DVB subtitles */
+    int spid_now;
+    struct sub subq[8];
+    int nsub, sub_shown;
+    int64_t sub_end;
+    pthread_mutex_t sub_m;
+    int ttx_on, ttx_mode, ttx_pageno, ttx_drawn, ttx_links[4];
+
     volatile sig_atomic_t quit;
     int verbose;
-} P = { .vfd = -1, .cntl = -1, .clk_m = PTHREAD_MUTEX_INITIALIZER, .gate = PTHREAD_COND_INITIALIZER };
+} P = { .vfd = -1, .cntl = -1, .clk_m = PTHREAD_MUTEX_INITIALIZER, .gate = PTHREAD_COND_INITIALIZER,
+        .sub_m = PTHREAD_MUTEX_INITIALIZER };
 
 static void logmsg(const char *fmt, ...)
 {
@@ -260,6 +354,17 @@ static void logmsg(const char *fmt, ...)
     fputs("amplay: ", stderr);
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
+    va_end(ap);
+}
+
+/* TV: what the viewer did, for ozone-tv */
+static void event(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    putchar('\n');
+    fflush(stdout);
     va_end(ap);
 }
 
@@ -281,6 +386,18 @@ static int sysfs_write(const char *path, const char *value)
     return 0;
 }
 
+static int sysfs_int(const char *path)
+{
+    int v = -1;
+    FILE *f = fopen(path, "r");
+    if (f) {
+        if (fscanf(f, "%d", &v) != 1)
+            v = -1;
+        fclose(f);
+    }
+    return v;
+}
+
 static int64_t to_pts90(int64_t ts, AVRational tb)
 {
     return av_rescale_q(ts, tb, (AVRational){ 1, PTS_HZ });
@@ -298,6 +415,13 @@ static int fr_auto_off(void)
         fclose(f);
     }
     return v[0] == '0' || (sysfs_write(SYS "tv/policy_fr_auto", "0") == 0);
+}
+
+static void set_aspect(int mode)
+{
+    char v[8];
+    snprintf(v, sizeof v, "%d", mode);
+    sysfs_write(SYS "video/screen_mode", v);
 }
 
 static void display_on(void)
@@ -329,7 +453,10 @@ static void display_on(void)
     }
 
     sysfs_write(SYS "video/axis", axis);
-    sysfs_write(SYS "video/screen_mode", "0");    /* keep the aspect ratio */
+    set_aspect(P.aspect);
+    /* TV: a channel's first picture on the screen as soon as it is decoded, not when the clock
+       starts (the audio in hand, AUDIO_CUSHION), as the stock TV app does */
+    sysfs_write(SYS "video/show_first_frame_nosync", P.tv ? "1" : "0");
     sysfs_write(SYS "tsync/enable", "1");
     if (P.x11) {
         /* the player window's color becomes transparent and the video layer shows through */
@@ -345,6 +472,8 @@ static void display_on(void)
 static void display_off(void)
 {
     sysfs_write(SYS "video/disable_video", "1");
+    sysfs_write(SYS "video/screen_mode", "0");
+    sysfs_write(SYS "video/show_first_frame_nosync", "0");
     sysfs_write(SYS "tsync/enable", "0");
     sysfs_write(SYS "graphics/fb0/enable_key", "0");
     sysfs_write(SYS "graphics/fb0/blank", "0");
@@ -456,12 +585,86 @@ static void kbd_close(void)
     nkbd = 0;
 }
 
+/* ---- TV input: the live segments --------------------------------------------------------- */
+
+static int tsin_read(void *opaque, uint8_t *buf, int len)
+{
+    struct tsin *t = opaque;
+    if (t->psi_at < P.svc.npsi) {   /* the service's PAT and PMT first */
+        int n = FFMIN(len, P.svc.npsi - t->psi_at);
+        memcpy(buf, P.svc.psi + t->psi_at, n);
+        t->psi_at += n;
+        return n;
+    }
+    while (!P.stop && !P.quit) {
+        int64_t seg = t->pos / SEG_BYTES;
+        if (t->fd < 0 || t->seg != seg) {
+            if (t->fd >= 0)
+                close(t->fd);
+            char path[440];
+            snprintf(path, sizeof path, "%s%06" PRId64 ".ts", t->src, seg);
+            t->fd = open(path, O_RDONLY | O_CLOEXEC);
+            t->seg = seg;
+            if (t->fd < 0) {
+                if (t->pos < P.low_off) {   /* paused for longer than the buffer holds */
+                    logmsg("timeshift: %.1f MB behind the buffer, on from its start", (P.low_off - t->pos) / 1e6);
+                    t->pos = P.low_off;
+                    continue;
+                }
+                t->edge_at = now_us();   /* not written yet */
+                usleep(20000);
+                continue;
+            }
+        }
+        int64_t in = t->pos % SEG_BYTES;
+        ssize_t n = pread(t->fd, buf, FFMIN(len, SEG_BYTES - in), in);
+        if (n > 0) {
+            t->pos += n;
+            return n;
+        }
+        t->edge_at = now_us();   /* the newest data: wait for more */
+        usleep(20000);
+    }
+    return AVERROR_EXIT;
+}
+
+/* A PSI section (bytes, hex) as TS packets on pid, appended to P.svc.psi */
+static void psi_add(int pid, const char *hex)
+{
+    uint8_t sec[1024];
+    int len = 0;
+    for (; hex[0] && hex[1] && hex[0] != ',' && len < (int)sizeof sec; hex += 2) {
+        unsigned b;
+        if (sscanf(hex, "%2x", &b) != 1)
+            break;
+        sec[len++] = b;
+    }
+    int cc = 0, first = 1, at = 0;
+    while ((at < len || first) && P.svc.npsi + 188 <= (int)sizeof P.svc.psi) {
+        uint8_t *p = P.svc.psi + P.svc.npsi;
+        p[0] = 0x47;
+        p[1] = (first ? 0x40 : 0) | (pid >> 8 & 0x1f);
+        p[2] = pid & 0xff;
+        p[3] = 0x10 | (cc++ & 15);
+        int h = 4;
+        if (first)
+            p[h++] = 0;   /* pointer_field */
+        int k = FFMIN(len - at, 188 - h);
+        memcpy(p + h, sec + at, k);
+        memset(p + h + k, 0xff, 188 - h - k);
+        at += k;
+        P.svc.npsi += 188;
+        first = 0;
+    }
+}
+
 /* ---- demux, video and audio threads -------------------------------------------------------- */
 
 static int interrupt_cb(void *arg)
 {
     (void)arg;
-    return P.quit;   /* not on seek: an interrupted read leaves the AVIOContext in an error state */
+    /* not on seek: an interrupted read leaves the AVIOContext in an error state (TV closes it) */
+    return P.quit || (P.tv && P.stop);
 }
 
 static void *demux_thread(void *arg)
@@ -480,13 +683,13 @@ static void *demux_thread(void *arg)
         struct pq *q = pkt->stream_index == in->vidx ? &P.vq : pkt->stream_index == in->aidx ? &P.aq : NULL;
         int64_t ts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
         if (q == &P.vq && ts != AV_NOPTS_VALUE) {
-            int64_t pts = to_pts90(ts, P.vst->time_base);
+            int64_t pts = to_pts90(ts, P.vtb);
             pthread_mutex_lock(&P.clk_m);
             if (pts > P.demux_vpts)
                 P.demux_vpts = pts;
             pthread_mutex_unlock(&P.clk_m);
         }
-        if (q && pq_put(q, av_packet_clone(pkt)) < 0)
+        if (q && pq_put(q, av_packet_clone(pkt), 0, 0) < 0)
             break;
         av_packet_unref(pkt);
     }
@@ -504,7 +707,7 @@ static int feed(AVPacket *pkt)
     if (P.first_vpts < 0 && ts == AV_NOPTS_VALUE)
         P.no_pts = 1;
     if (ts != AV_NOPTS_VALUE || P.no_pts) {
-        int64_t pts = P.no_pts ? (P.last_vpts < 0 ? 0 : P.last_vpts + P.frame_dur) : to_pts90(ts, P.vst->time_base);
+        int64_t pts = P.no_pts ? (P.last_vpts < 0 ? 0 : P.last_vpts + P.frame_dur) : to_pts90(ts, P.vtb);
         if (P.first_vpts < 0)
             P.first_vpts = pts;
         P.last_vpts = pts;
@@ -529,7 +732,14 @@ static void *video_thread(void *arg)
     (void)arg;
     AVPacket *pkt, *out = av_packet_alloc();
     int r;
-    while ((r = pq_get(&P.vq, &pkt)) > 0) {
+    while ((r = pq_get(&P.vq, &pkt, NULL, NULL)) > 0) {
+        if (P.tv) {   /* a broadcast's video is Annex B already */
+            int bad = P.vfd < 0 || feed(pkt);
+            av_packet_free(&pkt);
+            if (bad)
+                break;
+            continue;
+        }
         av_bsf_send_packet(P.bsf, pkt);
         av_packet_free(&pkt);
         while (av_bsf_receive_packet(P.bsf, out) == 0) {
@@ -570,7 +780,7 @@ static int64_t audio_clock_now(void)
    since the start */
 static int64_t master_clock(void)
 {
-    int64_t a = P.ast && !P.audio_done ? audio_clock_now() : -1;
+    int64_t a = P.has_audio && !P.audio_done ? audio_clock_now() : -1;
     if (a >= 0) {
         P.wclock = a;
         P.wclock_at = now_us();
@@ -600,6 +810,54 @@ static void audio_pause_wait(void)
         snd_pcm_prepare(P.pcm);
 }
 
+static int open_pcm(void)
+{
+    /* Plain blocking writes, like aplay. Never ALSA's silence filling: with it the Amlogic HDMI
+       audio driver hangs the kernel (the reason mpv uses ao=sdl here). */
+    int r = snd_pcm_open(&P.pcm, "default", SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
+    if (r >= 0)
+        r = snd_pcm_set_params(P.pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, AUDIO_RATE, 1, 200000);
+    if (r < 0) {
+        logmsg("audio device: %s", snd_strerror(r));
+        return -1;
+    }
+    snd_pcm_hw_params_t *hw;
+    snd_pcm_hw_params_alloca(&hw);
+    P.can_pause = snd_pcm_hw_params_current(P.pcm, hw) == 0 && snd_pcm_hw_params_can_pause(hw);
+    return 0;
+}
+
+/* The decoder for a codec, and the resampler to 48 kHz stereo once its first frame says what it
+   gives (TV: a track's sample rate is only known from its frames) */
+static int audio_decoder(enum AVCodecID id, const AVCodecParameters *par)
+{
+    avcodec_free_context(&P.actx);
+    swr_free(&P.swr);
+    const AVCodec *dec = avcodec_find_decoder(id);
+    P.actx = avcodec_alloc_context3(dec);
+    if (!dec || (par && avcodec_parameters_to_context(P.actx, par) < 0) || avcodec_open2(P.actx, dec, NULL) < 0) {
+        logmsg("no audio decoder for %s", avcodec_get_name(id));
+        avcodec_free_context(&P.actx);
+        return -1;
+    }
+    return 0;
+}
+
+static int resampler(const AVFrame *f)
+{
+    swr_free(&P.swr);
+    AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO, in = f->ch_layout;
+    if (!in.nb_channels)
+        av_channel_layout_default(&in, 2);
+    if (swr_alloc_set_opts2(&P.swr, &stereo, AV_SAMPLE_FMT_S16, AUDIO_RATE, &in, f->format, f->sample_rate,
+                            0, NULL) < 0 || swr_init(P.swr) < 0) {
+        logmsg("audio resampler setup failed");
+        swr_free(&P.swr);
+        return -1;
+    }
+    return 0;
+}
+
 static void *audio_thread(void *arg)
 {
     (void)arg;
@@ -608,6 +866,8 @@ static void *audio_thread(void *arg)
     uint8_t *buf = NULL;
     int bufsamples = 0;
     int carry = 0;   /* frames at the start of buf left over from the last write, < I2S_BLOCK */
+    int in_rate = 0, in_format = -1, in_channels = 0;
+    int pid, codec, dec_pid = -1;
 
     /* hold back until the video decoder has a head start, so both begin together */
     pthread_mutex_lock(&P.clk_m);
@@ -615,13 +875,39 @@ static void *audio_thread(void *arg)
         pthread_cond_wait(&P.gate, &P.clk_m);
     pthread_mutex_unlock(&P.clk_m);
 
-    while (!P.stop && pq_get(&P.aq, &pkt) > 0) {
-        if (avcodec_send_packet(P.actx, pkt) < 0)
+    while (!P.stop && pq_get(&P.aq, &pkt, &pid, &codec) > 0) {
+        if (P.tv) {
+            if (pid != P.svc.apid) {   /* the track it was on before a change */
+                av_packet_free(&pkt);
+                continue;
+            }
+            if (pid != dec_pid) {
+                dec_pid = pid;
+                in_rate = 0;
+                if (audio_decoder(codec, NULL) < 0)
+                    dec_pid = -1;
+            }
+            if (!P.actx) {
+                av_packet_free(&pkt);
+                continue;
+            }
+        }
+        if (avcodec_send_packet(P.actx, pkt) < 0 && P.verbose)
             logmsg("audio decode error");
         av_packet_free(&pkt);
         while (!P.stop && avcodec_receive_frame(P.actx, frame) == 0) {
+            if (!P.swr || frame->sample_rate != in_rate || frame->format != in_format ||
+                frame->ch_layout.nb_channels != in_channels) {
+                in_rate = frame->sample_rate;
+                in_format = frame->format;
+                in_channels = frame->ch_layout.nb_channels;
+                if (!in_rate || resampler(frame) < 0) {
+                    av_frame_unref(frame);
+                    continue;
+                }
+            }
             int64_t ts = frame->best_effort_timestamp;
-            int64_t pts = ts != AV_NOPTS_VALUE ? to_pts90(ts, P.ast->time_base) : P.aclock;
+            int64_t pts = ts != AV_NOPTS_VALUE ? to_pts90(ts, P.atb) : P.aclock;
             int max = swr_get_out_samples(P.swr, frame->nb_samples);
             if (carry + max > bufsamples) {
                 uint8_t *nbuf = NULL;
@@ -633,7 +919,13 @@ static void *audio_thread(void *arg)
                 bufsamples = carry + max;
             }
             uint8_t *out = buf + carry * 4;
-            int n = carry + swr_convert(P.swr, &out, max, (const uint8_t **)frame->extended_data, frame->nb_samples);
+            int got = swr_convert(P.swr, &out, max, (const uint8_t **)frame->extended_data, frame->nb_samples);
+            if (got > 0 && P.tv && P.svc.amode) {   /* one side on both: dual-mono broadcasts */
+                int16_t *s = (int16_t *)out;
+                for (int i = 0; i < got; i++)
+                    s[2 * i + (P.svc.amode == 1)] = s[2 * i + (P.svc.amode == 2)];
+            }
+            int n = carry + (got > 0 ? got : 0);
             int64_t end = pts + (int64_t)frame->nb_samples * PTS_HZ / frame->sample_rate;
             /* The Amlogic I2S driver keeps the buffer in blocks of 16 frames (16 left samples, then
                16 right) and converts each write in place: one that doesn't start and end on a block
@@ -684,31 +976,23 @@ static void *audio_thread(void *arg)
 
 /* ---- session: one continuous run of the decoder, restarted on every seek ------------------- */
 
-static int session_start(void)
+static int decoder_open(const struct codec_map *c, int width, int height, AVRational fr)
 {
-    const struct codec_map *c = P.codec;
-    AVCodecParameters *par = P.vst->codecpar;
-    AVRational fr = av_guess_frame_rate(P.in[0].fmt, P.vst, NULL);
-
-    P.stop = P.started = P.paused = P.user_paused = P.buffering = P.video_done = 0;
-    P.audio_done = !P.ast;
-    P.first_vpts = P.last_vpts = P.demux_vpts = -1;
-    P.aclock = P.wclock = -1;
-    P.ready_at = 0;
-    sysfs_write(SYS "video/disable_video", "2");  /* off until the first new frame */
-    pq_reset(&P.vq);
-    pq_reset(&P.aq);
-
     P.vfd = open(c->dev, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
     P.cntl = open("/dev/amvideo", O_RDWR | O_CLOEXEC);
     if (P.vfd < 0 || P.cntl < 0) {
         logmsg("%s: %s", P.vfd < 0 ? c->dev : "/dev/amvideo", strerror(errno));
+        if (P.vfd >= 0)
+            close(P.vfd);
+        if (P.cntl >= 0)
+            close(P.cntl);
+        P.vfd = P.cntl = -1;
         return -1;
     }
     struct dec_sysinfo si = {
         .format = c->dec_format,
-        .width = par->width,
-        .height = par->height,
+        .width = width,
+        .height = height,
         /* frame duration in 1/96000 s */
         .rate = fr.num ? (unsigned)av_rescale(96000, fr.den, fr.num) : 0,
     };
@@ -717,6 +1001,9 @@ static int session_start(void)
     if (ioctl(P.vfd, AMSTREAM_IOC_VFORMAT, c->vformat) || ioctl(P.vfd, AMSTREAM_IOC_VID, 1) ||
         ioctl(P.vfd, AMSTREAM_IOC_SYSINFO, (unsigned long)&si) || ioctl(P.vfd, AMSTREAM_IOC_PORT_INIT, 0)) {
         logmsg("decoder init: %s", strerror(errno));
+        close(P.vfd);
+        close(P.cntl);
+        P.vfd = P.cntl = -1;
         return -1;
     }
     /* Port init puts tsync in audio master mode (writing tsync/mode doesn't stick), and the
@@ -729,7 +1016,27 @@ static int session_start(void)
     ioctl(P.cntl, AMSTREAM_IOC_TRICKMODE, 0);
     ioctl(P.cntl, AMSTREAM_IOC_AVTHRESH, 15 * PTS_HZ);
     ioctl(P.cntl, AMSTREAM_IOC_SYNCTHRESH, 1);
+    return 0;
+}
 
+static void session_reset(void)
+{
+    P.stop = P.started = P.paused = P.user_paused = P.buffering = P.video_done = 0;
+    P.audio_done = !P.has_audio;
+    P.first_vpts = P.last_vpts = P.demux_vpts = -1;
+    P.aclock = P.wclock = -1;
+    P.ready_at = 0;
+    sysfs_write(SYS "video/disable_video", "2");  /* off until the first new frame */
+    pq_reset(&P.vq);
+    pq_reset(&P.aq);
+}
+
+static int session_start(void)
+{
+    AVCodecParameters *par = P.vst->codecpar;
+    session_reset();
+    if (decoder_open(P.codec, par->width, par->height, av_guess_frame_rate(P.in[0].fmt, P.vst, NULL)) < 0)
+        return -1;
     for (int i = 0; i < P.nin; i++)
         pthread_create(&P.in[i].th, NULL, demux_thread, &P.in[i]);
     pthread_create(&P.vth, NULL, video_thread, NULL);
@@ -743,10 +1050,9 @@ static void on_wake(int sig)
     (void)sig;   /* nothing: it only cuts a waiting read() short (see join_demuxer) */
 }
 
-/* Live TV without a signal: the demuxer waits in read() on the pipe for data that may not come,
-   and FFmpeg looks at the interrupt callback only between reads, so quitting would wait for the
-   signal to come back. SIGUSR1 (no SA_RESTART) ends the read with EINTR, then the callback
-   (P.quit) ends the demuxer. */
+/* A demuxer waiting in read() for data that may not come (a pipe): FFmpeg looks at the interrupt
+   callback only between reads, so stopping would wait for the data. SIGUSR1 (no SA_RESTART) ends
+   the read with EINTR, then the callback ends the demuxer. */
 static void join_demuxer(pthread_t th)
 {
     for (;;) {
@@ -772,16 +1078,24 @@ static void session_stop(void)
     pthread_mutex_unlock(&P.clk_m);
     pq_set(&P.vq, &P.vq.abort, 1);
     pq_set(&P.aq, &P.aq.abort, 1);
-    for (int i = 0; i < P.nin; i++)
-        join_demuxer(P.in[i].th);
-    pthread_join(P.vth, NULL);
-    if (P.ast) {
+    if (P.tv) {
+        join_demuxer(P.dth);
+        if (P.svc.vpid)
+            pthread_join(P.vth, NULL);
+    } else {
+        for (int i = 0; i < P.nin; i++)
+            join_demuxer(P.in[i].th);
+        pthread_join(P.vth, NULL);
+    }
+    if (P.has_audio) {
         pthread_join(P.ath, NULL);
         snd_pcm_drop(P.pcm);
         snd_pcm_prepare(P.pcm);
-        avcodec_flush_buffers(P.actx);
+        if (P.actx)
+            avcodec_flush_buffers(P.actx);
     }
-    av_bsf_flush(P.bsf);
+    if (P.bsf)
+        av_bsf_flush(P.bsf);
     if (P.vfd >= 0)
         close(P.vfd);
     if (P.cntl >= 0) {
@@ -794,7 +1108,7 @@ static void session_stop(void)
 static int vbuf_level(void)
 {
     struct am_io_param p = { 0 };
-    if (ioctl(P.vfd, AMSTREAM_IOC_VB_STATUS, (unsigned long)&p))
+    if (P.vfd < 0 || ioctl(P.vfd, AMSTREAM_IOC_VB_STATUS, (unsigned long)&p))
         return -1;
     return p.status.data_len;
 }
@@ -805,37 +1119,87 @@ static int64_t position(void)
     return c < 0 ? P.first_vpts : c;
 }
 
+/* The kernel has shown the first frame: it then sets pcrscr 3 s behind it (its audio-master
+   start-up hold). Starting the clock before that makes the first frames late, and they get
+   dropped. Given up on 2 s after the decoder had enough. */
+static int first_frame_out(void)
+{
+    if (!P.ready_at)
+        P.ready_at = now_us();
+    unsigned long pcr = 0;
+    ioctl(P.vfd, AMSTREAM_IOC_PCRSCR, (unsigned long)&pcr);
+    int32_t d = (int32_t)((uint32_t)pcr - (uint32_t)P.first_vpts);
+    if (d < -2 * PTS_HZ && d > -4 * PTS_HZ)
+        return 1;
+    if (now_us() - P.ready_at < 2000000)
+        return 0;
+    if (P.verbose)
+        logmsg("no sign of the first frame in 2 s (pcrscr %+.3f s from it)", d / (double)PTS_HZ);
+    return 1;
+}
+
+static void clock_start(int64_t at)
+{
+    if (P.vfd >= 0)
+        ioctl(P.vfd, AMSTREAM_IOC_SET_PCRSCR, (unsigned long)(uint32_t)at);
+    P.wclock = at;
+    P.wclock_at = P.started_at = now_us();
+    pthread_mutex_lock(&P.clk_m);
+    P.started = 1;
+    pthread_cond_broadcast(&P.gate);
+    pthread_mutex_unlock(&P.clk_m);
+    if (P.verbose)
+        logmsg(P.tv ? "start at %.3f s, %.2f s after the switch" : "start at %.3f s", at / (double)PTS_HZ,
+               (now_us() - P.play_at) / 1e6);
+}
+
+/* TV: the clock starts once the keyframe is on the screen and AUDIO_CUSHION of audio is queued
+   (broadcast audio arrives in real time: without some in hand the device would run dry) */
+static void tv_start(void)
+{
+    if (P.svc.vpid && !P.novideo) {
+        if (P.vfd < 0 || P.first_vpts < 0)
+            return;   /* no decoder or no keyframe yet */
+        if (!P.frame_out && !(P.frame_out = first_frame_out()))
+            return;
+        if (P.verbose && !P.audio_wait_since)
+            logmsg("first frame out after %.2f s", (now_us() - P.play_at) / 1e6);
+    }
+    int64_t fa = -1, la = -1;
+    if (P.has_audio) {
+        pthread_mutex_lock(&P.clk_m);
+        fa = P.first_apts;
+        la = P.last_apts;
+        pthread_mutex_unlock(&P.clk_m);
+        if (!P.audio_wait_since)
+            P.audio_wait_since = now_us();
+        if (fa < 0 || la - fa < AUDIO_CUSHION) {
+            if (now_us() - P.audio_wait_since < NO_AUDIO_WAIT)
+                return;
+            if (fa < 0)
+                logmsg("no audio after %.1f s", NO_AUDIO_WAIT / 1e6);
+        }
+    }
+    clock_start(fa >= 0 ? fa : P.first_vpts >= 0 ? P.first_vpts : 0);
+}
+
 /* Called every 20-100 ms from the main loop */
 static void sync_clock(void)
 {
     if (!P.started) {
+        if (P.tv) {
+            tv_start();
+            return;
+        }
         int ready = P.video_done || vbuf_level() >= PREROLL_BYTES || P.last_vpts - P.first_vpts >= PREROLL_PTS;
-        if (!ready || P.first_vpts < 0)
+        if (!ready || P.first_vpts < 0 || !first_frame_out())
             return;
-        /* Wait for the first frame to reach the video layer: the kernel then sets pcrscr 3 s
-           behind it (its audio-master start-up hold). Starting the clock earlier makes the first
-           frames late, and they get dropped. */
-        if (!P.ready_at)
-            P.ready_at = now_us();
-        unsigned long pcr = 0;
-        ioctl(P.vfd, AMSTREAM_IOC_PCRSCR, (unsigned long)&pcr);
-        int32_t d = (int32_t)((uint32_t)pcr - (uint32_t)P.first_vpts);
-        if (!(d < -2 * PTS_HZ && d > -4 * PTS_HZ) && now_us() - P.ready_at < 2000000)
-            return;
-        ioctl(P.vfd, AMSTREAM_IOC_SET_PCRSCR, (unsigned long)(uint32_t)P.first_vpts);
-        P.wclock = P.first_vpts;
-        P.wclock_at = P.started_at = now_us();
-        pthread_mutex_lock(&P.clk_m);
-        P.started = 1;
-        pthread_cond_broadcast(&P.gate);
-        pthread_mutex_unlock(&P.clk_m);
-        if (P.verbose)
-            logmsg("start at %.3f s", P.first_vpts / (double)PTS_HZ);
+        clock_start(P.first_vpts);
         return;
     }
     /* the kernel advances pcrscr every vsync; correct the drift against the audio clock */
     int64_t a = master_clock();
-    if (a < 0 || P.paused)
+    if (a < 0 || P.paused || P.vfd < 0)
         return;
     unsigned long pcr = 0;
     ioctl(P.vfd, AMSTREAM_IOC_PCRSCR, (unsigned long)&pcr);
@@ -907,9 +1271,10 @@ static void set_paused(int paused)
     P.paused = paused;
     pthread_cond_broadcast(&P.gate);
     pthread_mutex_unlock(&P.clk_m);
-    ioctl(P.cntl, AMSTREAM_IOC_VPAUSE, P.paused);
+    if (P.cntl >= 0)
+        ioctl(P.cntl, AMSTREAM_IOC_VPAUSE, P.paused);
     int64_t a = master_clock();
-    if (!P.paused && a >= 0)
+    if (!P.paused && a >= 0 && P.vfd >= 0)
         ioctl(P.vfd, AMSTREAM_IOC_SET_PCRSCR, (unsigned long)(uint32_t)a);
     /* a moment later the kernel moves pcrscr on by the time spent paused; sync_clock takes it
        back, and should do so before many frames go by */
@@ -926,12 +1291,12 @@ static void toggle_pause(void)
 /* A network stream can fall behind the clock: YouTube sends video and audio over separate
    connections, and the video needs several Mbit/s of a WiFi link that does ~6. Frames that reach
    the decoder after their time are all dropped and the picture never comes back, so instead the
-   clock is held until a few seconds are downloaded, as other players do. Not for live input,
-   which arrives in real time. */
+   clock is held until a few seconds are downloaded, as other players do. Not for TV, which
+   arrives in real time. */
 static void check_buffer(void)
 {
     int on = P.buffering;
-    if (!P.started || P.live || P.vq.eof) {
+    if (!P.started || P.tv || P.vq.eof) {
         on = 0;
     } else {
         int64_t c = master_clock();
@@ -953,27 +1318,12 @@ static void do_action(const struct osd_event *e)
 {
     switch (e->action) {
     case OSD_PAUSE: toggle_pause(); break;
-    case OSD_SEEK_REL:
-        if (P.live) {   /* no timeline to move along: change the channel */
-            P.exit_status = e->value > 0 ? 10 : 11;
-            P.quit = 1;
-        } else {
-            seek((int)e->value);
-        }
-        break;
-    case OSD_SEEK_ABS:
-        if (!P.live)
-            seek_to(e->value, e->value < play_time());
-        break;
+    case OSD_SEEK_REL: seek((int)e->value); break;
+    case OSD_SEEK_ABS: seek_to(e->value, e->value < play_time()); break;
     case OSD_VOLUME: volume_change((int)e->value); break;
     case OSD_MUTE: mute_toggle(); break;
     case OSD_QUIT: P.quit = 1; break;
-    case OSD_CHANNEL:   /* the caller retunes */
-        printf("channel %d\n", (int)e->value);
-        fflush(stdout);
-        P.exit_status = 12;
-        P.quit = 1;
-        break;
+    default: break;
     }
 }
 
@@ -988,8 +1338,6 @@ static void handle_key(int code, int repeat)
     case KEY_RIGHT: case KEY_FASTFORWARD: e = (struct osd_event){ OSD_SEEK_REL, SEEK_SHORT }; break;
     case KEY_PAGEDOWN: case KEY_PREVIOUSSONG: e = (struct osd_event){ OSD_SEEK_REL, -SEEK_LONG }; break;
     case KEY_PAGEUP: case KEY_NEXTSONG: e = (struct osd_event){ OSD_SEEK_REL, SEEK_LONG }; break;
-    case KEY_CHANNELUP: e = (struct osd_event){ OSD_SEEK_REL, SEEK_LONG }; break;
-    case KEY_CHANNELDOWN: e = (struct osd_event){ OSD_SEEK_REL, -SEEK_LONG }; break;
     case KEY_UP: case KEY_VOLUMEUP: e = (struct osd_event){ OSD_VOLUME, 5 }; break;
     case KEY_DOWN: case KEY_VOLUMEDOWN: e = (struct osd_event){ OSD_VOLUME, -5 }; break;
     case KEY_M: case KEY_MUTE: e = (struct osd_event){ OSD_MUTE, 0 }; break;
@@ -1114,16 +1462,12 @@ static int open_input(struct input *in, const char *url)
     in->fmt->interrupt_callback = (AVIOInterruptCB){ interrupt_cb, NULL };
     AVDictionary *opts = NULL;
     int r = 0;
-    if (!P.live && (!strncmp(url, "http://", 7) || !strncmp(url, "https://", 8)))
+    if (!strncmp(url, "http://", 7) || !strncmp(url, "https://", 8))
         r = chunked_open(in->fmt, url);
     else {
         av_dict_set(&opts, "reconnect", "1", 0);
         av_dict_set(&opts, "reconnect_streamed", "1", 0);
         av_dict_set(&opts, "reconnect_delay_max", "5", 0);
-    }
-    if (P.live) {   /* zapping: two seconds of broadcast are enough to find the streams */
-        av_dict_set(&opts, "analyzeduration", "2000000", 0);
-        av_dict_set(&opts, "probesize", "2000000", 0);
     }
     if (r >= 0)
         r = avformat_open_input(&in->fmt, url, NULL, &opts);
@@ -1138,33 +1482,11 @@ static int open_input(struct input *in, const char *url)
 
 static int open_audio(void)
 {
-    const AVCodec *dec = avcodec_find_decoder(P.ast->codecpar->codec_id);
-    P.actx = avcodec_alloc_context3(dec);
-    if (!dec || avcodec_parameters_to_context(P.actx, P.ast->codecpar) < 0 || avcodec_open2(P.actx, dec, NULL) < 0) {
-        logmsg("no audio decoder for %s", avcodec_get_name(P.ast->codecpar->codec_id));
+    if (audio_decoder(P.ast->codecpar->codec_id, P.ast->codecpar) < 0)
         return -1;
-    }
-    AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
     if (!P.actx->ch_layout.nb_channels)
         av_channel_layout_default(&P.actx->ch_layout, 2);
-    if (swr_alloc_set_opts2(&P.swr, &stereo, AV_SAMPLE_FMT_S16, AUDIO_RATE, &P.actx->ch_layout,
-                            P.actx->sample_fmt, P.actx->sample_rate, 0, NULL) < 0 || swr_init(P.swr) < 0) {
-        logmsg("audio resampler setup failed");
-        return -1;
-    }
-    /* Plain blocking writes, like aplay. Never ALSA's silence filling: with it the Amlogic HDMI
-       audio driver hangs the kernel (the reason mpv uses ao=sdl here). */
-    int r = snd_pcm_open(&P.pcm, "default", SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
-    if (r >= 0)
-        r = snd_pcm_set_params(P.pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, AUDIO_RATE, 1, 200000);
-    if (r < 0) {
-        logmsg("audio device: %s", snd_strerror(r));
-        return -1;
-    }
-    snd_pcm_hw_params_t *hw;
-    snd_pcm_hw_params_alloca(&hw);
-    P.can_pause = snd_pcm_hw_params_current(P.pcm, hw) == 0 && snd_pcm_hw_params_can_pause(hw);
-    return 0;
+    return open_pcm();
 }
 
 static void on_signal(int sig)
@@ -1173,7 +1495,695 @@ static void on_signal(int sig)
     P.quit = 1;
 }
 
-/* --channels: for the OSD's list */
+/* ---- TV ------------------------------------------------------------------------------------ */
+
+static AVStream *stream_by_pid(AVFormatContext *f, int pid)
+{
+    for (unsigned i = 0; i < f->nb_streams; i++)
+        if (f->streams[i]->id == pid)
+            return f->streams[i];
+    return NULL;
+}
+
+/* timeshift: a keyframe and where its PES starts, for winding back to it */
+static void idx_add(int64_t pts, int64_t off)
+{
+    pthread_mutex_lock(&P.clk_m);
+    if (P.nidx && pts <= P.idx[P.nidx - 1].pts) {
+        /* winding back plays known ground again; anything else is a new timeline */
+        if (pts >= P.idx[0].pts) {
+            pthread_mutex_unlock(&P.clk_m);
+            return;
+        }
+        P.nidx = 0;
+    }
+    if (P.nidx == IDX_MAX) {
+        memmove(P.idx, P.idx + IDX_MAX / 4, sizeof P.idx[0] * (IDX_MAX - IDX_MAX / 4));
+        P.nidx -= IDX_MAX / 4;
+    }
+    P.idx[P.nidx].pts = pts;
+    P.idx[P.nidx].off = off;
+    P.nidx++;
+    pthread_mutex_unlock(&P.clk_m);
+}
+
+/* The broadcast's time now: the newest timestamp read at the live edge, moved on by the wall clock */
+static int64_t live_now(void)
+{
+    pthread_mutex_lock(&P.clk_m);
+    int64_t t = P.live_pts < 0 ? -1 : P.live_pts + (now_us() - P.live_at) * PTS_HZ / 1000000;
+    pthread_mutex_unlock(&P.clk_m);
+    return t;
+}
+
+/* Seconds behind the broadcast, 0 when live (always a little behind: the audio in hand, the
+   decoder, the buffers) */
+static double tv_shift(void)
+{
+    int64_t l = live_now(), p = P.started ? position() : -1;
+    if (l < 0 || p < 0 || l - p < LIVE_SLACK)
+        return 0;
+    return (l - p) / (double)PTS_HZ;
+}
+
+static void sub_queue_clear(void)
+{
+    pthread_mutex_lock(&P.sub_m);
+    for (int i = 0; i < P.nsub; i++)
+        av_free(P.subq[i].rgba);
+    P.nsub = 0;
+    pthread_mutex_unlock(&P.sub_m);
+}
+
+/* A DVB subtitle packet: decoded here in the demuxer's thread, shown by the main loop on time */
+static void sub_decode(AVStream *st, AVPacket *pkt)
+{
+    if (!P.sctx || P.spid_now != st->id) {
+        avcodec_free_context(&P.sctx);
+        const AVCodec *dec = avcodec_find_decoder(st->codecpar->codec_id);
+        P.sctx = dec ? avcodec_alloc_context3(dec) : NULL;
+        if (!P.sctx || avcodec_parameters_to_context(P.sctx, st->codecpar) < 0 ||
+            avcodec_open2(P.sctx, dec, NULL) < 0) {
+            logmsg("no subtitle decoder for %s", avcodec_get_name(st->codecpar->codec_id));
+            avcodec_free_context(&P.sctx);
+            P.spid_now = st->id;
+            return;
+        }
+        P.sctx->pkt_timebase = st->time_base;
+        P.spid_now = st->id;
+    }
+    if (!P.sctx)
+        return;
+    AVSubtitle s;
+    int got = 0;
+    int r = avcodec_decode_subtitle2(P.sctx, &s, &got, pkt);
+    if (r < 0 || !got) {
+        if (P.verbose && r < 0)
+            logmsg("subtitle decoding: %s", av_err2str(r));
+        return;
+    }
+    int64_t base = s.pts != AV_NOPTS_VALUE ? av_rescale(s.pts, PTS_HZ, AV_TIME_BASE)
+                                           : to_pts90(pkt->pts, st->time_base);
+    struct sub n = { .start = base + s.start_display_time * 90LL,
+                     .end = s.end_display_time ? base + s.end_display_time * 90LL : -1,
+                     .dispw = P.sctx->width > 0 ? P.sctx->width : 720,
+                     .disph = P.sctx->height > 0 ? P.sctx->height : 576 };
+    /* all regions in one picture over their bounding box */
+    int x0 = INT32_MAX, y0 = INT32_MAX, x1 = 0, y1 = 0;
+    for (unsigned i = 0; i < s.num_rects; i++) {
+        AVSubtitleRect *r = s.rects[i];
+        if (r->type != SUBTITLE_BITMAP || r->w <= 0 || r->h <= 0)
+            continue;
+        x0 = FFMIN(x0, r->x);
+        y0 = FFMIN(y0, r->y);
+        x1 = FFMAX(x1, r->x + r->w);
+        y1 = FFMAX(y1, r->y + r->h);
+    }
+    if (x1 > x0 && y1 > y0) {
+        n.x = x0;
+        n.y = y0;
+        n.w = x1 - x0;
+        n.h = y1 - y0;
+        n.rgba = av_mallocz((size_t)n.w * n.h * 4);
+        for (unsigned i = 0; n.rgba && i < s.num_rects; i++) {
+            AVSubtitleRect *r = s.rects[i];
+            if (r->type != SUBTITLE_BITMAP)
+                continue;
+            const uint32_t *pal = (const uint32_t *)r->data[1];
+            for (int y = 0; y < r->h; y++)
+                for (int x = 0; x < r->w; x++) {
+                    uint32_t c = pal[r->data[0][y * r->linesize[0] + x]];   /* ARGB */
+                    uint8_t *o = n.rgba + ((size_t)(r->y - y0 + y) * n.w + (r->x - x0 + x)) * 4;
+                    o[0] = c >> 16;
+                    o[1] = c >> 8;
+                    o[2] = c;
+                    o[3] = c >> 24;
+                }
+        }
+    }
+    if (P.verbose)
+        logmsg("subtitle: %u region(s), %dx%d, at %.3f s for %.1f s", s.num_rects, n.w, n.h, n.start / (double)PTS_HZ,
+               n.end >= 0 ? (n.end - n.start) / (double)PTS_HZ : -1.0);
+    avsubtitle_free(&s);
+    pthread_mutex_lock(&P.sub_m);
+    if (P.nsub == 8) {   /* not shown in time: the oldest goes */
+        av_free(P.subq[0].rgba);
+        memmove(P.subq, P.subq + 1, sizeof P.subq[0] * 7);
+        P.nsub--;
+    }
+    P.subq[P.nsub++] = n;
+    pthread_mutex_unlock(&P.sub_m);
+}
+
+/* The DVB subtitle due now, or the last one off when its time is over */
+static void subs_update(void)
+{
+    int64_t c = P.started ? position() : -1;
+    if (c < 0)
+        return;
+    struct sub cur = { .start = -1 };
+    pthread_mutex_lock(&P.sub_m);
+    while (P.nsub && P.subq[0].start <= c) {
+        av_free(cur.rgba);
+        cur = P.subq[0];
+        memmove(P.subq, P.subq + 1, sizeof P.subq[0] * (P.nsub - 1));
+        P.nsub--;
+    }
+    pthread_mutex_unlock(&P.sub_m);
+    if (cur.start >= 0) {
+        if (cur.rgba) {
+            int W = osd_width(), H = osd_height();
+            osd_image(0, cur.rgba, cur.w, cur.h, cur.x * W / cur.dispw, cur.y * H / cur.disph, cur.w * W / cur.dispw,
+                      cur.h * H / cur.disph);
+            P.sub_shown = 1;
+            P.sub_end = cur.end;
+            av_free(cur.rgba);
+        } else {
+            osd_image_clear(0);
+            P.sub_shown = 0;
+        }
+    } else if (P.sub_shown && P.sub_end >= 0 && c >= P.sub_end) {
+        osd_image_clear(0);
+        P.sub_shown = 0;
+    }
+}
+
+static const struct track *sub_track(void)
+{
+    return P.svc.ssel >= 0 && P.svc.ssel < P.svc.ns ? &P.svc.s[P.svc.ssel] : NULL;
+}
+
+static void *tv_demux_thread(void *arg)
+{
+    (void)arg;
+    AVFormatContext *fmt = avformat_alloc_context();
+    int bufsize = 64 * 1024;
+    AVIOContext *pb = avio_alloc_context(av_malloc(bufsize), bufsize, 0, &P.tsin, tsin_read, NULL, NULL);
+    fmt->pb = pb;
+    fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
+    fmt->interrupt_callback = (AVIOInterruptCB){ interrupt_cb, NULL };
+    /* the PSI read first is all the probing needed (see psi_add) */
+    AVDictionary *o = NULL;
+    av_dict_set(&o, "probesize", "1504", 0);
+    int r = avformat_open_input(&fmt, NULL, av_find_input_format("mpegts"), &o);
+    av_dict_free(&o);
+    if (r < 0) {
+        if (!P.stop)
+            logmsg("live input: %s", av_err2str(r));
+        av_freep(&pb->buffer);   /* the context itself went with the failure */
+        avio_context_free(&pb);
+        P.in[0].fmt = NULL;
+        P.novideo = 1;
+        goto out;
+    }
+    P.in[0].fmt = fmt;
+    if (P.svc.vpid) {
+        AVStream *v = stream_by_pid(fmt, P.svc.vpid);
+        const struct codec_map *c = NULL;
+        for (size_t i = 0; v && i < sizeof CODECS / sizeof *CODECS; i++)
+            if (CODECS[i].id == v->codecpar->codec_id)
+                c = &CODECS[i];
+        /* without a picture the channel plays as radio */
+        if (!c) {
+            logmsg("no hardware decoder for video PID %d (%s)", P.svc.vpid,
+                   v ? avcodec_get_name(v->codecpar->codec_id) : "not in the PMT");
+            P.novideo = 1;
+            event("error video");
+        } else if (decoder_open(c, 0, 0, (AVRational){ 25, 1 }) < 0) {
+            P.novideo = 1;
+            event("error decoder");
+        }
+    }
+
+    AVPacket *pkt = av_packet_alloc();
+    static char seen[8192];
+    memset(seen, 0, sizeof seen);
+    while (!P.stop) {
+        r = av_read_frame(fmt, pkt);
+        if (r == AVERROR(EAGAIN))
+            continue;
+        if (r < 0) {
+            if (r != AVERROR_EOF && !P.stop)
+                logmsg("read error: %s", av_err2str(r));
+            break;
+        }
+        AVStream *st = fmt->streams[pkt->stream_index];
+        int pid = st->id;
+        if (P.verbose && pid < 8192 && !seen[pid]) {
+            seen[pid] = 1;
+            logmsg("PID %d: %s, first at %.2f s", pid, avcodec_get_name(st->codecpar->codec_id),
+                   (now_us() - P.play_at) / 1e6);
+        }
+        int64_t ts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
+        int64_t pts = ts != AV_NOPTS_VALUE ? to_pts90(ts, st->time_base) : -1;
+        int64_t off = pkt->pos >= 0 ? P.tsin.base + pkt->pos - P.svc.npsi : -1;
+        int at_edge = now_us() - P.tsin.edge_at < 1000000;
+        /* A broadcaster's encoder restarted (or a test file looped): the clocks can't follow a
+           jump in the timeline, so the session starts again from there, as after a switch */
+        int main_stream = P.svc.vpid && !P.novideo ? pid == P.svc.vpid : pid == P.svc.apid;
+        if (main_stream && pts >= 0 && off >= 0) {
+            if (P.last_dpts >= 0 && llabs(pts - P.last_dpts) > 10 * PTS_HZ) {
+                logmsg("the timestamps jump %+.1f s: starting again there", (pts - P.last_dpts) / (double)PTS_HZ);
+                P.restart_off = off;
+                P.restart = 1;
+                av_packet_unref(pkt);
+                break;
+            }
+            P.last_dpts = pts;
+        }
+        if (pid == P.svc.vpid && P.vfd >= 0) {
+            int key = pkt->flags & AV_PKT_FLAG_KEY;
+            if (!P.vgate) {   /* from a keyframe on: the decoder can do nothing before one */
+                if (!key || pts < 0) {
+                    av_packet_unref(pkt);
+                    continue;
+                }
+                P.vgate = 1;
+                P.gate_pts = pts;
+                if (P.verbose)
+                    logmsg("keyframe after %.2f s", (now_us() - P.play_at) / 1e6);
+            }
+            if (key && pts >= 0 && off >= 0)
+                idx_add(pts, off);
+            if (pts >= 0) {
+                pthread_mutex_lock(&P.clk_m);
+                if (pts > P.demux_vpts)
+                    P.demux_vpts = pts;
+                if (at_edge) {
+                    P.live_pts = pts;
+                    P.live_at = now_us();
+                }
+                pthread_mutex_unlock(&P.clk_m);
+            }
+            if (pq_put(&P.vq, av_packet_clone(pkt), pid, 0) < 0)
+                break;
+        } else if (pid == P.svc.apid && P.has_audio) {
+            if (P.svc.vpid && P.vfd >= 0 && (!P.vgate || pts < P.gate_pts)) {   /* before the picture */
+                av_packet_unref(pkt);
+                continue;
+            }
+            if (pts >= 0) {
+                pthread_mutex_lock(&P.clk_m);
+                if (P.first_apts < 0)
+                    P.first_apts = pts;
+                if (pts > P.last_apts)
+                    P.last_apts = pts;
+                if (!P.svc.vpid && at_edge) {   /* radio: the audio is the timeline */
+                    P.live_pts = pts;
+                    P.live_at = now_us();
+                }
+                pthread_mutex_unlock(&P.clk_m);
+                if (!P.svc.vpid && off >= 0 && (!P.nidx || pts - P.idx[P.nidx - 1].pts >= PTS_HZ))
+                    idx_add(pts, off);
+            }
+            if (pq_put(&P.aq, av_packet_clone(pkt), pid, st->codecpar->codec_id) < 0)
+                break;
+        } else if (pid == P.svc.ttx && pid) {
+            ttx_feed(pkt->data, pkt->size);
+        } else if (sub_track() && pid == sub_track()->pid && sub_track()->type == 'd') {
+            sub_decode(st, pkt);
+        }
+        av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+out:
+    pq_set(&P.vq, &P.vq.eof, 1);
+    pq_set(&P.aq, &P.aq.eof, 1);
+    return NULL;
+}
+
+static void tv_session_start(int64_t off)
+{
+    session_reset();
+    P.vgate = 0;
+    P.gate_pts = -1;
+    P.first_apts = P.last_apts = -1;
+    P.frame_out = P.novideo = 0;
+    P.audio_wait_since = 0;
+    P.last_dpts = -1;
+    P.restart = 0;
+    P.play_at = now_us();
+    P.tsin.base = P.tsin.pos = off;
+    P.tsin.fd = -1;
+    P.tsin.psi_at = 0;
+    P.tsin.edge_at = 0;
+    snprintf(P.tsin.src, sizeof P.tsin.src, "%s", P.svc.src);
+    sub_queue_clear();
+    pthread_create(&P.dth, NULL, tv_demux_thread, NULL);
+    if (P.svc.vpid)
+        pthread_create(&P.vth, NULL, video_thread, NULL);
+    if (P.has_audio)
+        pthread_create(&P.ath, NULL, audio_thread, NULL);
+    P.running = 1;
+}
+
+static void tv_session_stop(void)
+{
+    if (!P.running)
+        return;
+    session_stop();
+    if (P.tsin.fd >= 0)
+        close(P.tsin.fd);
+    P.tsin.fd = -1;
+    if (P.in[0].fmt) {
+        AVIOContext *pb = P.in[0].fmt->pb;
+        avformat_close_input(&P.in[0].fmt);
+        if (pb)
+            av_freep(&pb->buffer);
+        avio_context_free(&pb);
+    }
+    avcodec_free_context(&P.sctx);
+    P.spid_now = 0;
+    P.running = 0;
+    if (P.user_paused)
+        P.user_paused = 0;
+}
+
+static void tv_labels(void)
+{
+    static const char *modes[] = { "", " L", " R" };
+    P.audio_label[0] = P.subs_label[0] = 0;
+    if (P.svc.na)
+        snprintf(P.audio_label, sizeof P.audio_label, "%s%s", P.svc.a[P.svc.asel].lang[0] ? P.svc.a[P.svc.asel].lang : "1",
+                 modes[P.svc.amode]);
+    const struct track *s = sub_track();
+    if (s)
+        snprintf(P.subs_label, sizeof P.subs_label, "%s", s->lang[0] ? s->lang : "on");
+}
+
+static void ttx_off(void)
+{
+    if (!P.ttx_on)
+        return;
+    P.ttx_on = 0;
+    osd_image_clear(1);
+    osd_teletext(0, 0);
+    osd_message(NULL, 0);   /* "page ... not in the cycle yet" */
+}
+
+static void tv_stop(void)
+{
+    tv_session_stop();
+    ttx_off();
+    osd_image_clear(0);
+    P.sub_shown = 0;
+    sysfs_write(SYS "video/disable_video", "1");
+}
+
+/* "pid:lang,..." or "pid:type:lang:page,..." */
+static int parse_tracks(char *v, struct track *t, int subs)
+{
+    int n = 0;
+    for (char *save = NULL, *e = strtok_r(v, ",", &save); e && n < MAX_TRACKS; e = strtok_r(NULL, ",", &save)) {
+        char *f[4] = { e, NULL, NULL, NULL };
+        for (int k = 1; k < 4 && f[k - 1]; k++)
+            if ((f[k] = strchr(f[k - 1], ':')))
+                *f[k]++ = 0;
+        memset(&t[n], 0, sizeof t[n]);
+        t[n].pid = atoi(f[0]);
+        if (subs) {
+            t[n].type = f[1] ? f[1][0] : 'd';
+            snprintf(t[n].lang, sizeof t[n].lang, "%s", f[2] ? f[2] : "");
+            t[n].page = f[3] ? (int)strtol(f[3], NULL, 16) : 0;
+        } else {
+            snprintf(t[n].lang, sizeof t[n].lang, "%s", f[1] ? f[1] : "");
+        }
+        if (t[n].pid > 0)
+            n++;
+    }
+    return n;
+}
+
+static void tv_play(char **f, int nf)
+{
+    tv_stop();
+    memset(&P.svc, 0, sizeof P.svc);
+    P.svc.ssel = -1;
+    char *psi = NULL;
+    for (int i = 0; i < nf; i++) {
+        char *v = strchr(f[i], '=');
+        if (!v)
+            continue;
+        *v++ = 0;
+        const char *k = f[i];
+        if (!strcmp(k, "src")) snprintf(P.svc.src, sizeof P.svc.src, "%s", v);
+        else if (!strcmp(k, "off")) P.svc.off = atoll(v);
+        else if (!strcmp(k, "v")) P.svc.vpid = atoi(v);
+        else if (!strcmp(k, "pmt")) P.svc.pmt = atoi(v);
+        else if (!strcmp(k, "a")) P.svc.na = parse_tracks(v, P.svc.a, 0);
+        else if (!strcmp(k, "asel")) P.svc.asel = atoi(v);
+        else if (!strcmp(k, "amode")) P.svc.amode = atoi(v);
+        else if (!strcmp(k, "s")) P.svc.ns = parse_tracks(v, P.svc.s, 1);
+        else if (!strcmp(k, "ssel")) P.svc.ssel = atoi(v);
+        else if (!strcmp(k, "ttx")) P.svc.ttx = atoi(v);
+        else if (!strcmp(k, "ttxregion")) ttx_region(atoi(v));
+        else if (!strcmp(k, "psi")) psi = v;
+        else if (!strcmp(k, "title")) snprintf(P.svc.title, sizeof P.svc.title, "%s", v);
+        else if (!strcmp(k, "now")) snprintf(P.svc.now, sizeof P.svc.now, "%s", v);
+    }
+    if (P.svc.asel < 0 || P.svc.asel >= P.svc.na)
+        P.svc.asel = 0;
+    if (P.svc.amode < 0 || P.svc.amode > 2)
+        P.svc.amode = 0;
+    if (P.svc.ssel >= P.svc.ns)
+        P.svc.ssel = -1;
+    P.svc.apid = P.svc.na ? P.svc.a[P.svc.asel].pid : 0;
+    P.has_audio = P.svc.na > 0 && P.pcm != NULL;
+    if (psi) {
+        char *pmt = strchr(psi, ',');
+        psi_add(0, psi);
+        if (pmt)
+            psi_add(P.svc.pmt, pmt + 1);
+    }
+    /* enough packets for FFmpeg to tell the packet size without waiting for the broadcast */
+    while (P.svc.npsi < 12 * 188) {
+        uint8_t *p = P.svc.psi + P.svc.npsi;
+        memset(p, 0xff, 188);
+        p[0] = 0x47, p[1] = 0x1f, p[2] = 0xff, p[3] = 0x10;
+        P.svc.npsi += 188;
+    }
+    pthread_mutex_lock(&P.clk_m);
+    P.nidx = 0;
+    P.live_pts = -1;
+    pthread_mutex_unlock(&P.clk_m);
+    P.low_off = 0;
+    ttx_reset();
+    osd_radio(P.svc.vpid ? NULL : P.svc.title, P.svc.now);
+    tv_labels();
+    P.ttx_pageno = 0x100;
+    tv_session_start(P.svc.off);
+}
+
+/* Timeshift: to the keyframe at or before `to` (90 kHz), or the live picture */
+static void tv_seek_to(int64_t to)
+{
+    int64_t live = live_now();
+    int64_t off = -1;
+    if (live >= 0 && to < live - LIVE_SLACK) {
+        /* the newest keyframe not after it, or the oldest still in the buffer */
+        pthread_mutex_lock(&P.clk_m);
+        for (int i = P.nidx - 1; i >= 0 && P.idx[i].off >= P.low_off; i--) {
+            off = P.idx[i].off;
+            if (P.idx[i].pts <= to)
+                break;
+        }
+        pthread_mutex_unlock(&P.clk_m);
+    }
+    if (off < 0) {   /* live: from the newest data on */
+        int64_t end = P.tsin.pos;
+        for (int64_t seg = end / SEG_BYTES;; seg++) {
+            char path[440];
+            snprintf(path, sizeof path, "%s%06" PRId64 ".ts", P.svc.src, seg);
+            FILE *f = fopen(path, "rb");
+            if (!f)
+                break;
+            fseek(f, 0, SEEK_END);
+            end = seg * SEG_BYTES + ftell(f);
+            fclose(f);
+        }
+        off = end - end % 188;
+    }
+    if (P.verbose)
+        logmsg("timeshift to offset %" PRId64, off);
+    tv_session_stop();
+    osd_image_clear(0);
+    P.sub_shown = 0;
+    tv_session_start(off);
+}
+
+static void ttx_show(void)
+{
+    if (!P.ttx_on)
+        return;
+    uint8_t *rgba;
+    int w, h;
+    char t[64];
+    if (!ttx_page(P.ttx_pageno, P.ttx_mode, &rgba, &w, &h, P.ttx_links)) {
+        snprintf(t, sizeof t, "Teletext: page %x %s", P.ttx_pageno, ttx_any() ? "is not in the cycle yet…" : "…");
+        osd_message(t, 0);
+        return;
+    }
+    osd_message(NULL, 0);
+    if (P.verbose && !P.ttx_drawn) {
+        int opaque = 0;
+        for (int i = 0; i < w * h; i++)
+            opaque += rgba[i * 4 + 3] >= 128;
+        logmsg("teletext page %x: %dx%d, %d%% opaque", P.ttx_pageno, w, h, opaque * 100 / (w * h));
+    }
+    int H = osd_height() * 9 / 10, W = H * 4 / 3;
+    osd_image(1, rgba, w, h, (osd_width() - W) / 2, (osd_height() - H) / 2, W, H);
+    free(rgba);
+    P.ttx_drawn = 1;
+}
+
+/* Teletext subtitles: their page whenever it comes in */
+static void ttx_subs_update(void)
+{
+    const struct track *s = sub_track();
+    if (!s || s->type != 't' || P.ttx_on || !ttx_received(s->page))
+        return;
+    uint8_t *rgba;
+    int w, h, links[4];
+    if (ttx_page(s->page, TTX_PAGE_SUBTITLE, &rgba, &w, &h, links)) {
+        osd_image(0, rgba, w, h, 0, 0, osd_width(), osd_height());
+        free(rgba);
+        P.sub_shown = 1;
+        P.sub_end = -1;
+    }
+}
+
+static void tv_action(const struct osd_event *e)
+{
+    char t[128];
+    switch (e->action) {
+    case OSD_CHANNEL: {
+        int i = (int)e->value;
+        const char *name = osd_channel_title(i, t, sizeof t);
+        tv_stop();
+        osd_set_current(i);
+        osd_radio(NULL, NULL);
+        snprintf(P.svc.title, sizeof P.svc.title, "%s", name ? name : "");
+        event("channel %d", i);
+        break;
+    }
+    case OSD_PAUSE:
+        if (P.running)
+            toggle_pause();
+        break;
+    case OSD_SEEK_REL:
+        if (P.running && P.started)
+            tv_seek_to(position() + (int64_t)e->value * PTS_HZ);
+        break;
+    case OSD_LIVE:
+        if (P.running)
+            tv_seek_to(INT64_MAX);
+        break;
+    case OSD_AUDIO: {
+        if (!P.svc.na)
+            break;
+        int k = (P.svc.asel * 3 + P.svc.amode + 1) % (P.svc.na * 3);
+        P.svc.asel = k / 3;
+        P.svc.amode = k % 3;
+        P.svc.apid = P.svc.a[P.svc.asel].pid;
+        tv_labels();
+        static const char *modes[] = { "stereo", "left channel", "right channel" };
+        snprintf(t, sizeof t, "Audio %d/%d: %s, %s", P.svc.asel + 1, P.svc.na,
+                 P.svc.a[P.svc.asel].lang[0] ? P.svc.a[P.svc.asel].lang : "-", modes[P.svc.amode]);
+        osd_message(t, 2);
+        event("audio %d %d", P.svc.apid, P.svc.amode);
+        break;
+    }
+    case OSD_SUBS: {
+        if (!P.svc.ns) {
+            osd_message("No subtitles on this channel", 2);
+            break;
+        }
+        P.svc.ssel = P.svc.ssel + 1 < P.svc.ns ? P.svc.ssel + 1 : -1;
+        osd_image_clear(0);
+        P.sub_shown = 0;
+        sub_queue_clear();
+        tv_labels();
+        const struct track *s = sub_track();
+        if (s) {
+            snprintf(t, sizeof t, "Subtitles: %s%s", s->lang[0] ? s->lang : "on", s->type == 't' ? " (teletext)" : "");
+            if (s->type == 't')
+                ttx_received(s->page);   /* drawn from the next time it comes in */
+        }
+        osd_message(s ? t : "Subtitles off", 2);
+        event("subs %d %x", s ? s->pid : 0, s ? s->page : 0);
+        break;
+    }
+    case OSD_ASPECT: {
+        int n = sizeof ASPECTS / sizeof *ASPECTS, k = 0;
+        for (int i = 0; i < n; i++)
+            if (ASPECTS[i].mode == P.aspect)
+                k = (i + 1) % n;
+        P.aspect = ASPECTS[k].mode;
+        set_aspect(P.aspect);
+        snprintf(t, sizeof t, "Picture: %s", ASPECTS[k].name);
+        osd_message(t, 2);
+        event("aspect %d", P.aspect);
+        break;
+    }
+    case OSD_RECORD: event("record"); break;
+    case OSD_GROUP: event("group"); break;
+    case OSD_RADIO: event("tvradio"); break;
+    case OSD_PIN: event("pin %04d", (int)e->value); break;
+    case OSD_TEXT:
+        if (P.ttx_on) {
+            ttx_off();
+        } else if (!P.svc.ttx) {
+            osd_message("No teletext on this channel", 2);
+        } else {
+            P.ttx_on = 1;
+            P.ttx_mode = TTX_PAGE_FULL;
+            osd_image_clear(0);
+            P.sub_shown = 0;
+            osd_teletext(1, P.ttx_pageno);
+            ttx_show();
+        }
+        break;
+    case OSD_TEXT_PAGE: {
+        int v = (int)e->value;
+        if (v == TTX_NEXT || v == TTX_PREV)
+            P.ttx_pageno = ttx_step(P.ttx_pageno, v == TTX_NEXT ? 1 : -1);
+        else if (v == TTX_MIX)
+            P.ttx_mode = P.ttx_mode == TTX_PAGE_FULL ? TTX_PAGE_MIX : TTX_PAGE_FULL;
+        else if (v <= TTX_LINK && v > TTX_LINK - 4) {
+            int to = P.ttx_links[TTX_LINK - v];
+            if (to >= 0x100 && to <= 0x899)
+                P.ttx_pageno = to;
+        } else if (v >= 0x100 && v <= 0x899)
+            P.ttx_pageno = v;
+        osd_teletext(1, P.ttx_pageno);
+        ttx_show();
+        break;
+    }
+    case OSD_QUIT:
+        P.quit = 1;
+        event("quit");
+        break;
+    default:
+        do_action(e);
+    }
+}
+
+/* "\n" in a command's text is a new line, "\t" a tab */
+static void unescape(char *s)
+{
+    char *o = s;
+    for (; *s; s++) {
+        if (*s == '\\' && (s[1] == 'n' || s[1] == 't' || s[1] == '\\')) {
+            s++;
+            *o++ = *s == 'n' ? '\n' : *s == 't' ? '\t' : '\\';
+        } else {
+            *o++ = *s;
+        }
+    }
+    *o = 0;
+}
+
+/* --channels FILE / "channels FILE INDEX": the list for the OSD */
 static void load_channels(const char *path, int current)
 {
     FILE *f = fopen(path, "r");
@@ -1181,9 +2191,9 @@ static void load_channels(const char *path, int current)
         logmsg("%s: %s", path, strerror(errno));
         return;
     }
-    char *lines[512], buf[512];
+    char *lines[1024], buf[512];
     int n = 0;
-    while (n < 512 && fgets(buf, sizeof buf, f)) {
+    while (n < 1024 && fgets(buf, sizeof buf, f)) {
         buf[strcspn(buf, "\n")] = 0;
         lines[n++] = strdup(buf);
     }
@@ -1193,10 +2203,176 @@ static void load_channels(const char *path, int current)
         free(lines[--n]);
 }
 
+static void tv_command(char *line)
+{
+    char *f[24];
+    int n = 0;
+    for (char *p = line; p && n < 24;) {
+        f[n++] = p;
+        if ((p = strchr(p, '\t')))
+            *p++ = 0;
+    }
+    const char *c = f[0];
+    const char *a1 = n > 1 ? f[1] : "";
+    if (!strcmp(c, "play")) {
+        tv_play(f + 1, n - 1);
+    } else if (!strcmp(c, "stop")) {
+        tv_stop();
+        osd_radio(NULL, NULL);
+        snprintf(P.svc.title, sizeof P.svc.title, "%s", a1);
+    } else if (!strcmp(c, "title")) {
+        snprintf(P.svc.title, sizeof P.svc.title, "%s", a1);
+        if (!P.svc.vpid && P.running && n > 2)
+            osd_radio(P.svc.title, f[2]);
+    } else if (!strcmp(c, "info")) {
+        unescape(f[1]);
+        osd_info(a1);
+    } else if (!strcmp(c, "signal")) {
+        int l = 0, s = 0, q = 0;
+        sscanf(a1, "%d %d %d", &l, &s, &q);
+        P.signal = l ? q : 0;
+    } else if (!strcmp(c, "message") && n > 2) {
+        unescape(f[2]);
+        osd_message(f[2], atoi(a1));
+    } else if (!strcmp(c, "pin")) {
+        osd_pin(a1[0] ? a1 : NULL);
+    } else if (!strcmp(c, "channels") && n > 2) {
+        load_channels(a1, atoi(f[2]));
+    } else if (!strcmp(c, "current")) {
+        osd_set_current(atoi(a1));
+    } else if (!strcmp(c, "rec")) {
+        P.recording = atoi(a1);
+    } else if (!strcmp(c, "buffer")) {
+        P.low_off = atoll(a1);
+    } else if (!strcmp(c, "aspect")) {
+        P.aspect = atoi(a1);
+        set_aspect(P.aspect);
+    } else if (!strcmp(c, "quit")) {
+        P.quit = 1;
+    } else {
+        logmsg("unknown command %s", c);
+    }
+}
+
+/* Lines of its own for the info panel: the picture, the sound, the buffer */
+static void tv_info_extra(void)
+{
+    char t[512];
+    int w = sysfs_int(SYS "video/frame_width"), h = sysfs_int(SYS "video/frame_height");
+    int n = 0;
+    if (P.svc.vpid && w > 0 && h > 0)
+        n += snprintf(t + n, sizeof t - n, "Picture: %dx%d, %s\n", w, h,
+                      ASPECTS[P.aspect >= 0 && P.aspect < 4 ? P.aspect : 0].name);
+    if (P.actx && P.actx->sample_rate)
+        n += snprintf(t + n, sizeof t - n, "Sound: %s, %d Hz, %d ch%s%s\n", avcodec_get_name(P.actx->codec_id),
+                      P.actx->sample_rate, P.actx->ch_layout.nb_channels, P.audio_label[0] ? ", " : "", P.audio_label);
+    n += snprintf(t + n, sizeof t - n, "Signal: %d%%\n", P.signal);
+    double s = tv_shift();
+    if (s > 0)
+        snprintf(t + n, sizeof t - n, "Timeshift: %d:%02d behind the broadcast\n", (int)s / 60, (int)s % 60);
+    osd_info_extra(t);
+}
+
+static int tv_main(void)
+{
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+    signal(SIGHUP, on_signal);
+    signal(SIGPIPE, SIG_IGN);
+    sigaction(SIGUSR1, &(struct sigaction){ .sa_handler = on_wake }, NULL);
+    if (!fr_auto_off()) {
+        logmsg("can't turn off " SYS "tv/policy_fr_auto, refusing to start");
+        return 1;
+    }
+    if (!getenv("DISPLAY") || osd_open(1) < 0) {
+        logmsg("the TV player needs X");
+        return 1;
+    }
+    P.x11 = 1;
+    P.vtb = P.atb = (AVRational){ 1, PTS_HZ };
+    pq_init(&P.vq, 16 << 20);
+    pq_init(&P.aq, 2 << 20);
+    if (open_pcm() < 0)
+        P.pcm = NULL;
+    if (ttx_init() < 0)
+        logmsg("no teletext decoder");
+    mixer_open();
+    display_on();
+    sysfs_write(SYS "video/disable_video", "1");
+    fcntl(0, F_SETFL, O_NONBLOCK);
+    struct pollfd fds[2] = { { .fd = osd_fd(), .events = POLLIN }, { .fd = 0, .events = POLLIN } };
+    static char cmd[32768];
+    size_t ncmd = 0;
+    int64_t info_at = 0;
+    while (!P.quit) {
+        int fast = P.running && (!P.started || now_us() - P.started_at < 2000000 || now_us() - P.resumed_at < 1000000);
+        poll(fds, 2, fast ? 20 : 100);
+        if (fds[1].revents & (POLLIN | POLLHUP)) {
+            ssize_t r = read(0, cmd + ncmd, sizeof cmd - 1 - ncmd);
+            if (r == 0 || (r < 0 && errno != EAGAIN && errno != EINTR)) {
+                P.quit = 1;   /* ozone-tv is gone */
+                break;
+            }
+            if (r > 0) {
+                ncmd += r;
+                cmd[ncmd] = 0;
+                char *nl, *p = cmd;
+                while ((nl = strchr(p, '\n'))) {
+                    *nl = 0;
+                    if (*p)
+                        tv_command(p);
+                    p = nl + 1;
+                }
+                ncmd -= p - cmd;
+                memmove(cmd, p, ncmd);
+                if (ncmd == sizeof cmd - 1)
+                    ncmd = 0;   /* a line too long: dropped */
+            }
+        }
+        struct osd_event ev[8];
+        int n = osd_poll(ev, 8);
+        for (int i = 0; i < n && !P.quit; i++)
+            tv_action(&ev[i]);
+        if (P.running && P.restart) {
+            int64_t off = P.restart_off;
+            tv_session_stop();
+            pthread_mutex_lock(&P.clk_m);
+            P.live_pts = -1;
+            pthread_mutex_unlock(&P.clk_m);
+            osd_image_clear(0);
+            P.sub_shown = 0;
+            tv_session_start(off);
+        }
+        if (P.running) {
+            sync_clock();
+            subs_update();
+            ttx_subs_update();
+            if (P.ttx_on && ttx_received(P.ttx_pageno))
+                ttx_show();
+        }
+        if (osd_info_open() && now_us() - info_at > 1000000) {
+            tv_info_extra();
+            info_at = now_us();
+        }
+        struct osd_state st = {
+            .pos = 0, .dur = 0, .paused = P.user_paused, .loading = P.running && !P.started,
+            .live = 1, .shift = P.running ? tv_shift() : 0, .recording = P.recording,
+            .audio = P.audio_label[0] ? P.audio_label : NULL, .subs = P.subs_label[0] ? P.subs_label : NULL,
+            .signal = P.signal, .volume = saved_volume >= 0 ? saved_volume : volume_get(), .muted = saved_volume >= 0,
+            .title = P.svc.title,
+        };
+        osd_update(&st);
+    }
+    tv_stop();
+    osd_close();
+    display_off();
+    return 0;
+}
+
 static void usage(void)
 {
-    fputs("usage: amplay [-v] [--audio URL] [--start SECONDS] [--title TEXT] URL\n"
-          "       amplay --live [--program N] [--title TEXT] [--channels FILE --channel N] URL\n"
+    fputs("usage: amplay [-v] [--audio URL] [--start SECONDS] [--title TEXT] [--program N] URL\n"
+          "       amplay --tv [--banner SECONDS]\n"
           "       amplay --reset\n", stderr);
     exit(2);
 }
@@ -1208,36 +2384,41 @@ int main(int argc, char **argv)
         { "start", required_argument, NULL, 's' },
         { "reset", no_argument, NULL, 'r' },
         { "title", required_argument, NULL, 't' },
-        { "live", no_argument, NULL, 'l' },
+        { "tv", no_argument, NULL, 'T' },
+        { "banner", required_argument, NULL, 'b' },
         { "program", required_argument, NULL, 'p' },
         { "verbose", no_argument, NULL, 'v' },
-        { "channels", required_argument, NULL, 'C' },
-        { "channel", required_argument, NULL, 'N' },
         { 0 }
     };
     const char *audio_url = NULL;
     double start = 0;
-    int c;
+    int c, banner = 0;
     P.program = -1;
-    while ((c = getopt_long(argc, argv, "a:s:rt:vlp:C:N:", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "a:s:rt:vTb:p:", opts, NULL)) != -1) {
         switch (c) {
         case 'a': audio_url = optarg; break;
         case 's': start = atof(optarg); break;
         case 'r': display_off(); return 0;
         case 't': P.title = optarg; break;
-        case 'l': P.live = 1; break;
+        case 'T': P.tv = 1; break;
+        case 'b': banner = (int)(atof(optarg) * 1000); break;
         case 'p': P.program = atoi(optarg); break;
         case 'v': P.verbose = 1; break;
-        case 'C': P.channels = optarg; break;
-        case 'N': P.channel = atoi(optarg); break;
         default: usage();
         }
     }
+    /* the H.264 parser complains about the cut packets right after a seek, and before the first
+       keyframe of a channel; harmless */
+    av_log_set_level(P.verbose && (!P.tv || getenv("AMPLAY_DEBUG")) ? AV_LOG_WARNING : AV_LOG_FATAL);
+    if (P.tv) {
+        if (optind != argc)
+            usage();
+        if (banner)
+            osd_set_hide_after(banner);
+        return tv_main();
+    }
     if (optind != argc - 1)
         usage();
-
-    /* the H.264 parser complains about the cut packets right after a seek; harmless */
-    av_log_set_level(P.verbose ? AV_LOG_WARNING : AV_LOG_FATAL);
     avformat_network_init();
 
     if (open_input(&P.in[0], argv[optind]) < 0)
@@ -1264,6 +2445,7 @@ int main(int argc, char **argv)
     }
     P.in[0].vidx = v;
     P.vst = P.in[0].fmt->streams[v];
+    P.vtb = P.vst->time_base;
     for (size_t i = 0; i < sizeof CODECS / sizeof *CODECS; i++)
         if (CODECS[i].id == P.vst->codecpar->codec_id)
             P.codec = &CODECS[i];
@@ -1283,11 +2465,13 @@ int main(int argc, char **argv)
     if (a >= 0) {
         ain->aidx = a;
         P.ast = ain->fmt->streams[a];
+        P.atb = P.ast->time_base;
         if (open_audio() < 0) {
             P.ast = NULL;
             ain->aidx = -1;
         }
     }
+    P.has_audio = P.ast != NULL;
 
     const AVBitStreamFilter *bsf = av_bsf_get_by_name(P.codec->bsf);
     if (av_bsf_alloc(bsf, &P.bsf) < 0 || avcodec_parameters_copy(P.bsf->par_in, P.vst->codecpar) < 0) {
@@ -1327,9 +2511,7 @@ int main(int argc, char **argv)
         logmsg("can't turn off " SYS "tv/policy_fr_auto, refusing to start");
         return 1;
     }
-    P.x11 = getenv("DISPLAY") && osd_open() == 0;
-    if (P.x11 && P.live && P.channels)
-        load_channels(P.channels, P.channel);
+    P.x11 = getenv("DISPLAY") && osd_open(0) == 0;
     if (!P.x11)
         kbd_open();
     else
@@ -1352,7 +2534,7 @@ int main(int argc, char **argv)
             struct osd_state st = {
                 .pos = play_time(), .dur = P.duration, .paused = P.user_paused, .loading = !P.started || P.buffering,
                 .volume = saved_volume >= 0 ? saved_volume : volume_get(), .muted = saved_volume >= 0,
-                .title = P.title, .live = P.live,
+                .title = P.title, .signal = -1,
             };
             osd_update(&st);
         } else if (ready) {

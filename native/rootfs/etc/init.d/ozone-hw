@@ -62,8 +62,8 @@ start)
 
     # Hardware video decoder (amplay): the stream ports and the sysfs knobs it drives
     chgrp video /dev/amstream_* /dev/amvideo && chmod g+rw /dev/amstream_* /dev/amvideo
-    for a in video/axis video/screen_mode video/disable_video tsync/enable tsync/startsync_mode \
-             graphics/fb0/blank graphics/fb0/color_key graphics/fb0/enable_key; do
+    for a in video/axis video/screen_mode video/disable_video video/show_first_frame_nosync tsync/enable \
+             tsync/startsync_mode graphics/fb0/blank graphics/fb0/color_key graphics/fb0/enable_key; do
         chgrp video /sys/class/$a && chmod g+w /sys/class/$a
     done
     # Compressed swap in RAM (zram, LZO on this kernel): a browser tab can take 250 MB of the 830

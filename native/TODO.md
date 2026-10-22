@@ -12,35 +12,35 @@ Tick an item off (`[x]`) when it is done and update MANUAL.md with it.
 
 ## 1. Television (DVB-T2)
 
-- [ ] **Easy**: audio track choice (language, first/second preferred language, stereo / left /
+- [x] **Easy**: audio track choice (language, first/second preferred language, stereo / left /
   right mono). Now amplay takes FFmpeg's "best" audio stream; ozone-tv already parses the PMT
   audio PIDs with their languages.
-- [ ] **Easy**: signal level and quality on screen at any time (a key in the player, a column in
+- [x] **Easy**: signal level and quality on screen at any time (a key in the player, a column in
   the TV window). Now only during a scan, in "no signal" and in the logs.
-- [ ] **Easy**: manual scan of one frequency (UHF channel or MHz, bandwidth, PLP), and NIT search.
+- [x] **Easy**: manual scan of one frequency (UHF channel or MHz, bandwidth, PLP), and NIT search.
   Now only the fixed 40-frequency scan.
-- [ ] **Easy**: favourites, in groups.
-- [ ] **Easy**: antenna power (5 V for an active antenna) as a setting in the TV window. The
+- [x] **Easy**: favourites, in groups.
+- [x] **Easy**: antenna power (5 V for an active antenna) as a setting in the TV window. The
   frontend can switch it (it was turned off in a test), there is no switch for it.
-- [ ] **Easy**: backup / restore of the channel list and guide to USB, and "reset TV data".
+- [x] **Easy**: backup / restore of the channel list and guide to USB, and "reset TV data".
   Now only by copying `channels.json` by hand.
-- [ ] **Easy**: banner timeout setting.
-- [ ] **Easy or Medium**: radio. Scans find the radio services, nothing plays them: amplay needs an
+- [x] **Easy**: banner timeout setting.
+- [x] **Easy or Medium**: radio. Scans find the radio services, nothing plays them: amplay needs an
   audio-only mode (and a picture of some sort on screen), ozone-tv a radio list.
-- [ ] **Easy or Medium**: channel list editing: sort (A–Z, LCN), move, rename, delete, skip.
-- [ ] **Medium**: aspect ratio (4:3 / 16:9 / full stretch / letterbox) for the TV picture,
+- [x] **Easy or Medium**: channel list editing: sort (A–Z, LCN), move, rename, delete, skip.
+- [x] **Medium**: aspect ratio (4:3 / 16:9 / full stretch / letterbox) for the TV picture,
   through the video layer's screen mode in sysfs.
-- [ ] **Medium**: parental control: lock channels and the TV menu, age rating from EIT, PIN.
-- [ ] **Medium**: channel info: PIDs, codecs, service type, and editing PIDs by hand.
-- [ ] **Medium**: recording (PVR) to a USB drive, a list of recordings, PVR settings (length,
+- [x] **Medium**: parental control: lock channels and the TV menu, age rating from EIT, PIN.
+- [x] **Medium**: channel info: PIDs, codecs, service type, and editing PIDs by hand.
+- [x] **Medium**: recording (PVR) to a USB drive, a list of recordings, PVR settings (length,
   drive). The TS from `dvr0` can be written to a file; amplay hasn't been tried on MPEG-2 or on TS
   files yet. Needs USB mounting first (section 3).
-- [ ] **Medium**: timeshift: pause live TV and seek back, on top of recording. Now Space only
+- [x] **Medium**: timeshift: pause live TV and seek back, on top of recording. Now Space only
   freezes the picture.
-- [ ] **Medium**: DVB subtitles with a language choice: FFmpeg has the dvbsub decoder, amplay's
+- [x] **Medium**: DVB subtitles with a language choice: FFmpeg has the dvbsub decoder, amplay's
   OSD can draw them.
-- [ ] **Medium or Hard**: teletext (with its language): PES decoding and a page renderer.
-- [ ] **Medium or Hard**: timers from the guide (record or switch at a time, conflict checks).
+- [x] **Medium or Hard**: teletext (with its language): PES decoding and a page renderer.
+- [x] **Medium or Hard**: timers from the guide (record or switch at a time, conflict checks).
   From standby it is a timer in a daemon. From power off it can't be done for now: the RTC wake
   alarm doesn't work (`wakealarm` gives EIO), so only the remote wakes the box.
 - [ ] **Medium or Hard**: the TV interface in Ukrainian (the stock app has uk-UA).

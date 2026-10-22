@@ -247,61 +247,139 @@ keyboard that has them do the same as the keys above.
 
 ## 6. Television (DVB-T2)
 
-Open it with **Super+T** or the screen icon on the panel. An antenna must be connected to the box.
+Open it with **Super+T**, the screen icon on the panel, or **epg**, **dvb** or **TV/radio** on the
+remote. An antenna must be connected to the box.
 The TV window opens:
-- **left:** the channels, with what's on now and a bar showing how far into it they are;
-- **right:** the programme guide of the selected channel, by day. **NOW** marks what's on.
+- **left:** a list of channels, with what's on now and a bar showing how far into it they are, and
+  the signal level when that frequency was last tuned. Above it, which list: **All channels**,
+  your own lists (**Favourites** to begin with), **Radio**, **Recordings** and **Timers**;
+- **right:** the programme guide of the selected channel, by day. **NOW** marks what's on, **16+**
+  an age rating, **REC** or **ALARM** a timer set on it.
 
-**The first time**, click **Scan channels** at the top right. The scan checks 40 frequencies,
-about 3 minutes in all. The top of the window and the panel show the progress, for example
-"Scan 12/40: 570 MHz… (found 6)". "Nothing found" means no signal on any frequency: check the
-antenna and its cable. Scan again if you move the antenna or channels change.
+**The first time**, click **Scan channels** at the top right and choose **The whole band**. The scan
+checks 40 frequencies, about 3 minutes in all. The top of the window and the panel show the
+progress, for example "Scan 12/40: 570 MHz… (found 6)". "Nothing found" means no signal on any
+frequency: check the antenna and its cable (and the antenna power, below). Scan again if you move
+the antenna or channels change: your order, names, lists, skips and locks stay.
 
-**The programme guide** comes from the broadcast itself. It fills in by itself while you watch
-and while the scan runs. **Update guide** visits every multiplex for about 25 s each, a minute or
-so in all, to fill in the rest. Some channels broadcast no guide at all ("no programme
-information").
+**One frequency**: if you know the multiplex (a UHF channel number like 27, or MHz like 522), with
+its bandwidth and, for DVB-T2, its PLP. **Network search** reads the list of frequencies a network
+announces and scans those; Zeonbud announces none, so here it finds only the frequency you give.
+
+**The programme guide** comes from the broadcast itself. It fills in by itself while you watch,
+record or scan. **Update guide** visits every multiplex for about 25 s each, a minute or so in
+all, to fill in the rest. Some channels broadcast no guide at all ("no programme information").
 
 | Keys in the TV window | Action |
 |---|---|
 | **↑ / ↓** or a click | choose a channel: its guide appears on the right |
 | **Enter** or a double click | watch it |
+| **0–9** | the channel with that number |
 | **→** | into the guide (↑ / ↓ or a click there shows each programme's full description) |
+| **Enter** on a programme | watch, record, record every day or week, or switch to it when it starts |
 | **←** | back to the channels |
+| **Menu** or **F2** (remote: **blue**), a right click | the channel's menu, see below |
+| **Tab** (remote: **green**) | the next list |
 | **Esc** | close the window |
 
-**Watching.** At the top: the channel, what's on now (with its times) and what's next. When you
-stop watching, the TV window comes back.
+**The channel's menu**: **Channel info and PIDs** (the frequency, the service, the streams, and the
+PIDs, which you can change by hand for a channel that plays wrongly), **Lists** (add it to a list
+of your own, or make a new one), **Rename**, **Move up / down**, **Skip when switching** (the
+channel stays in the list but next / previous pass it by), **Locked** (it needs the PIN), **Delete**,
+and **Sort the list** by number or A–Z.
 
-| Keys in the player | Action |
-|---|---|
-| **Enter** | the channel list on the left, with what's on every channel |
-| **↑ / ↓**, **PgUp / PgDn** (in the list) | choose |
-| **Enter** or **→** (in the list), or a click | switch to it |
-| **Esc** or **←** (in the list) | close the list |
-| **→** or **PgUp** | next channel |
-| **←** or **PgDn** | previous channel |
-| **↑ / ↓**, **M** | volume, mute |
-| **Space** | pause the picture |
-| **Q** / **Esc** | stop watching |
+### Watching
 
-Clicking **Enter: channels** in the bottom bar also opens the list. It closes by itself after 15 s
-without a key.
+At the top: the channel, what's on now (with its times) and what's next. The bars go after a few
+seconds without a key (**Settings → Picture and sound** sets how many). When you stop watching,
+the TV window comes back.
 
-Only one TV window can run at a time. If you open TV again during a scan, the panel says "TV is
-busy: a channel scan is running".
+Switching channels takes one and a half to two seconds on the same frequency, about three to
+another one: the player stays up, and the picture starts at the channel's next full frame (the
+broadcast sends one every one or two seconds).
+
+| Keys in the player | Remote | Action |
+|---|---|---|
+| **Enter** | **OK** | the channel list on the left, with what's on every channel |
+| **↑ / ↓**, **PgUp / PgDn** (in the list) | | choose |
+| **Enter** or **→** (in the list), or a click | **OK** | switch to it |
+| **Esc** or **←** (in the list) | **exit** | close the list |
+| **→** / **←**, **PgUp** / **PgDn** | **page+ / page−** | next / previous channel |
+| **0–9** | **0–9** | the channel with that number |
+| **↑ / ↓**, **M** | **vol+ / vol−**, **mute** | volume, mute |
+| **Space** | **pause** | pause; again to go on from where it stopped (see below) |
+| **,** / **.** | **<<** | 10 s back / forward |
+| **End** | **stop** | back to the live picture (when behind) |
+| **I** | **info** | the channel's info: the programme, the streams, the signal |
+| **A** | **yellow** | the audio: the next language, or left / right only (for dual-language broadcasts) |
+| **S** | **green** | subtitles: on, the next language, off |
+| **T** | **text** | teletext |
+| **Z** | **blue** | picture shape: as broadcast, full screen, 4:3, 16:9 |
+| **R** | **record** | record what's on / stop recording |
+| **F** | **red** | the next list (All channels, your lists) |
+| **V** | **TV/radio** | radio stations / TV channels |
+| **Q** / **Esc** | **exit**, **stop** | stop watching |
+
+**Paused and behind the broadcast.** Pause (Space) keeps the broadcast coming in: when you go on,
+you are behind it, and the bar shows by how much ("−1:24", in yellow). **←** and **→** then go
+10 s back and forward, **<<** goes back further, **End** (or **stop**) returns to the live picture.
+Even without pausing, **<<** goes back into the last couple of minutes. How far back it reaches:
+**Settings → Recording** (in memory about 2 minutes; on a USB drive as much as you give it).
+
+**Audio and subtitles.** The channel starts in the first of your languages it has (**Settings →
+Picture and sound**). What you choose with **yellow** and **green** is kept for that channel.
+Subtitles can be the broadcast's own (DVB) or teletext subtitle pages. Zeonbud's channels have one
+audio language and no subtitles now.
+
+**Teletext** (where a channel has it): page 100 first; the digits type a page number, **↑ / ↓**
+the next / previous page, the colored keys follow the colored links at the bottom of the page,
+**OK** shows the picture under the page, **text** or **exit** closes it. Zeonbud's channels have
+no teletext now.
+
+**Radio.** Radio stations have a list of their own (**TV/radio**): the screen shows the station and
+what's on.
+
+**Recording.** **record** records the channel until the programme ends (**Settings → Recording**:
+or for a fixed time, or until stopped); **● REC** shows at the top. Recordings go to the first USB
+drive, or the box's own memory without one (about an hour and a half fits there), into a
+**Recordings** folder. While recording, only channels on the same frequency can be watched (the
+box has one tuner); the player says so. The **Recordings** list in the TV window plays them (with
+seeking, like any video); **Menu** or **F2** on one deletes it.
+
+**Timers.** In the guide, **Enter** on a programme: **Record** (once, every day, or every week),
+or **Switch to it when it starts**. A timer starts a minute early and ends five minutes late
+(**Settings → Recording**). Timers work with the TV window closed and while the box sleeps (a
+recording then runs with the screen off). They don't work after **Power off**: only the remote
+turns the box on. Two recordings at the same time on different frequencies conflict: the second
+one isn't set, and the window says which one is in the way. The **Timers** list shows them all;
+**Enter** cancels one.
+
+**Parental control** (**Settings → Parental control**). Locked channels, and programmes rated at or
+above the age you choose (where the broadcast gives a rating), ask for the PIN before they play:
+type it with the digits. The PIN is **0000** until you change it. **Lock the TV menu** asks for it
+before the settings, scans and editing too.
+
+**Antenna power** (**Settings → Antenna**): 5 V through the antenna cable, for an active antenna with
+an amplifier that has no power supply of its own. The same page shows the signal of every
+frequency when it was last tuned.
+
+**Backup** (**Settings → Channels**): **Back up to USB** saves the channel list, your lists, the
+settings, timers and guide into an `ozone-tv-backup-<date>` folder on the first USB drive;
+**Restore from USB** takes the newest one back. **Reset TV data** deletes everything but the
+recordings, to start again with a scan.
+
+Only one TV window can run at a time: opening TV again shows it. If you open TV during a scan, the
+panel says "TV is busy: a channel scan is running".
 
 A channel gets a 🔒 if it turns out to be encrypted when you try to watch it.
 
-**No signal.** If the tuner can't catch a channel's signal, the TV window stays and says "no
-signal, trying again…": it keeps trying, as the stock TV app does, and the picture starts as soon
-as the signal is caught. That can take from a few seconds to a minute or more: here the 1+1, ICTV,
-СТБ, Інтер multiplex (506 MHz) is often hard to catch at night. **Esc** stops trying, and a double
-click on another channel switches to it. If the signal drops while you watch, the picture stands
-still and goes on by itself once it is back. A channel that never comes, day or night, means that
-frequency isn't received: check the antenna.
-
-What isn't available: teletext and subtitles, recording, radio.
+**No signal.** If the tuner can't catch a channel's signal, the player says "no signal, trying
+again…": it keeps trying, as the stock TV app does, and the picture starts as soon as the signal is
+caught. That can take from a few seconds to a minute or more: here the 1+1, ICTV, СТБ, Інтер
+multiplex (506 MHz) is often hard to catch at night. Switch to another channel, or **exit** stops
+it. If the signal drops while you watch, the picture stands still and goes on by itself once it is
+back. A channel that never comes, day or night, means that frequency isn't received: check the
+antenna.
 
 ## 7. The browser
 
@@ -386,19 +464,20 @@ The box's own remote can run everything by itself: point it at the box.
 | **home** | the open windows and all the apps (YouTube, TV, the browser, Power, Screen size, WiFi…) |
 | **browse** | the browser |
 | **usb** | the drives and network folders (section 11) |
-| **info** | the panel, over a full-screen window too (in mouse mode: the right mouse button) |
-| red | YouTube |
-| yellow, green, blue | in YouTube: the next tab, add to a playlist, remove (section 4) |
+| **info** | the panel, over a full-screen window too (in mouse mode: the right mouse button); while watching TV, the channel's info |
+| red | YouTube; while watching TV, the next list of channels |
+| yellow, green, blue | in YouTube: the next tab, add to a playlist, remove (section 4); while watching TV: audio, subtitles, picture shape; in the TV window, green is the next list and blue the channel's menu |
 | **epg**, **dvb**, **TV/radio** | the TV window |
 | **vol+ / vol−**, **mute** | volume |
 | **page+ / page−** | in the player on TV: next / previous channel; in lists, a page up / down |
 | **0–9** | the channel number: in the TV window it selects the channel (OK watches), in the player it switches to it after a moment (or at once with OK) |
 | **pause**, **unpause** | pause / play in the player; in the browser, play the video on the page |
-| **stop** | stop watching |
-| **<<** | back 10 s in the player |
+| **stop** | stop watching (TV, behind the broadcast: back to the live picture) |
+| **<<** | back 10 s in the player (TV too, see section 6) |
 | **delete** | deletes a character when typing |
 | **mouse** | mouse mode, see below |
-| **text** | the on-screen keyboard, see below |
+| **text** | the on-screen keyboard, see below; while watching TV, teletext |
+| **record** | while watching TV, record what's on |
 
 **Mouse mode** (for the browser, or anything made for a mouse). Press **mouse**: the pointer icon
 on the panel lights up green. The arrows now move the pointer, faster the longer you hold them;
@@ -412,9 +491,8 @@ with the arrows and type the key with **OK**; **delete** erases, the digit butto
 What it types goes to the window that was being used, so first choose the search field or the
 address bar. It can be clicked with the mouse too.
 
-Record does nothing yet. The **>>**, **|<<**, **>>|** and **menu**
-buttons send exactly the same signal as **<<** (the remote is made that way), so they all go
-back 10 s.
+The **>>**, **|<<**, **>>|** and **menu** buttons send exactly the same signal as **<<** (the
+remote is made that way), so they all go back 10 s.
 
 **With the mouse alone** everything works too: the panel buttons start YouTube, the browser, TV,
 the app menu and the power menu; a click on the window title in the middle of the panel lists the
@@ -527,18 +605,21 @@ A USB gamepad works too: plug it in before starting RetroArch.
 | Keys | Action |
 |---|---|
 | Space / Enter / P | pause (TV: Enter opens the channel list) |
-| ← / → | −10 s / +10 s (TV: previous / next channel) |
+| ← / → | −10 s / +10 s (TV: previous / next channel; behind the broadcast, −10 s / +10 s) |
 | PgDn / PgUp | −1 min / +1 min (TV: previous / next channel) |
 | ↑ / ↓ | volume |
 | M | mute |
 | Q / Esc / Backspace | quit |
+| TV only: I, A, S, T, Z, R, F, V, End, `,` `.` | info, audio, subtitles, teletext, picture shape, record, next list, radio, live, −10 s / +10 s |
 
 ### TV window
 | Keys | Action |
 |---|---|
 | ↑ / ↓, a click | choose a channel and see its guide |
-| Enter, a double click | watch |
+| Enter, a double click | watch (on a programme: record, timers) |
 | → / ← | into the guide / back to the channels |
+| Menu / F2, a right click | the channel's menu |
+| Tab | the next list |
 | Esc | close |
 
 ### Browser
