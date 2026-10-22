@@ -325,6 +325,8 @@ static struct {
     int64_t first_apts, last_apts;   /* queued audio of the session (under clk_m) */
     int frame_out;            /* the kernel has the first frame */
     int64_t last_dpts;        /* the main stream's last timestamp read, for jumps in the timeline */
+    int64_t jump_pts, jump_off; /* a timestamp far from it, where it was, and how many agree since */
+    int jump_n;
     volatile int restart;     /* the timeline jumped: start again at restart_off */
     int64_t restart_off;
     int64_t play_at, audio_wait_since;
@@ -1738,18 +1740,40 @@ static void *tv_demux_thread(void *arg)
         int64_t pts = ts != AV_NOPTS_VALUE ? to_pts90(ts, st->time_base) : -1;
         int64_t off = pkt->pos >= 0 ? P.tsin.base + pkt->pos - P.svc.npsi : -1;
         int at_edge = now_us() - P.tsin.edge_at < 1000000;
-        /* A broadcaster's encoder restarted (or a test file looped): the clocks can't follow a
-           jump in the timeline, so the session starts again from there, as after a switch */
+        /* A timestamp far off the timeline is either a damaged packet (a weak signal: they come
+           alone, at random) or the timeline itself jumping (a broadcaster's encoder restarting, a
+           test file looping: then every packet after agrees). A damaged one is dropped, or loses
+           its timestamp: the video layer would hold every frame after it until then. A jump the
+           clocks can't follow: the session starts again there, as after a switch. */
         int main_stream = P.svc.vpid && !P.novideo ? pid == P.svc.vpid : pid == P.svc.apid;
-        if (main_stream && pts >= 0 && off >= 0) {
-            if (P.last_dpts >= 0 && llabs(pts - P.last_dpts) > 10 * PTS_HZ) {
-                logmsg("the timestamps jump %+.1f s: starting again there", (pts - P.last_dpts) / (double)PTS_HZ);
-                P.restart_off = off;
-                P.restart = 1;
-                av_packet_unref(pkt);
-                break;
+        if (pts >= 0 && P.last_dpts >= 0 && llabs(pts - P.last_dpts) > 10 * PTS_HZ) {
+            if (main_stream && off >= 0) {
+                if (P.jump_n && llabs(pts - P.jump_pts) < 2 * PTS_HZ) {
+                    P.jump_n++;
+                } else {
+                    P.jump_n = 1;
+                    P.jump_off = off;
+                }
+                P.jump_pts = pts;
+                if (P.jump_n >= 25) {
+                    logmsg("the timestamps jump %+.1f s: starting again there", (pts - P.last_dpts) / (double)PTS_HZ);
+                    P.restart_off = P.jump_off;
+                    P.restart = 1;
+                    av_packet_unref(pkt);
+                    break;
+                }
             }
+            if (P.verbose)
+                logmsg("PID %d: a timestamp %+.1f s off, dropped", pid, (pts - P.last_dpts) / (double)PTS_HZ);
+            if (pid != P.svc.vpid) {
+                av_packet_unref(pkt);
+                continue;
+            }
+            pkt->pts = pkt->dts = AV_NOPTS_VALUE;
+            pts = -1;
+        } else if (main_stream && pts >= 0) {
             P.last_dpts = pts;
+            P.jump_n = 0;
         }
         if (pid == P.svc.vpid && P.vfd >= 0) {
             int key = pkt->flags & AV_PKT_FLAG_KEY;
@@ -1821,6 +1845,7 @@ static void tv_session_start(int64_t off)
     P.frame_out = P.novideo = 0;
     P.audio_wait_since = 0;
     P.last_dpts = -1;
+    P.jump_n = 0;
     P.restart = 0;
     P.play_at = now_us();
     P.tsin.base = P.tsin.pos = off;
