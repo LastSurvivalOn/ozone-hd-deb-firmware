@@ -305,12 +305,17 @@ DuckDuckGo.
 | **Esc** | stop loading / close page search |
 | **Ctrl+F** | find on the page |
 | **Ctrl++** / **Ctrl+−** / **Ctrl+0** | zoom in / zoom out / normal size |
+| **F7** | play the video on this page |
 | **F8** | fast mode for this site |
 | **F9** | reader view |
 | **F11** | full screen |
 
 **The toolbar buttons** are, from left to right: back, forward, reload, home, then the address bar,
 and then:
+- **Play video** (play circle, F7): plays the video on the page in the video player, through the
+  hardware decoder (section 5). It finds a video built into the page, a player from another site
+  (a YouTube video in a news article, say), or asks yt-dlp about the page itself, which knows over
+  a thousand sites. A plain video file starts in about 2 seconds, the others in 10-15.
 - **Fast mode** (lightning, F8): turns off the site's JavaScript. Pages load and scroll many times faster.
   Many sites have it on by default. If a site doesn't work properly (buttons, menus, comments),
   turn fast mode off for it.
@@ -321,7 +326,9 @@ and then:
   for that site.
 
 **Video in the browser isn't played by the browser itself:** a YouTube link opens in the YouTube
-window (section 4) through the hardware decoder.
+window (section 4) through the hardware decoder, and other videos open in the video player with
+the play button (F7). Some sites (Vimeo, for one) only give their videos to signed-in users, and
+those don't play.
 
 ## 8. Sound
 

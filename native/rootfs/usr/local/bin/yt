@@ -63,9 +63,12 @@ def save_settings(s):
 def video_format(height, fps):
     """The decoder takes H.264 (YouTube serves it up to 1080p), as separate video and audio streams
     or one with both. Without a format under the frame rate limit (60 fps videos are 60 fps from 720p
-    up) the best under the height limit."""
+    up) the best under the height limit; without H.264 at all, whatever the site has."""
     v = '[vcodec^=avc1][height<=%d]' % height
-    return '/'.join('bv*%s%s+ba[acodec^=mp4a]/b%s%s' % (v, f, v, f) for f in ('[fps<=%d]' % fps, ''))
+    youtube = '/'.join('bv*%s%s+ba[acodec^=mp4a]/b%s%s' % (v, f, v, f) for f in ('[fps<=%d]' % fps, ''))
+    # Other sites often don't say what codec they use (plain <video> pages say nothing): the best
+    # under the limits, and amplay tells whether its decoder takes it (mpv plays it otherwise)
+    return youtube + '/bv*[height<=?{0}]+ba/b[height<=?{0}]/b'.format(height)
 
 
 def ytdlp():
@@ -80,8 +83,26 @@ def notify(text):
     subprocess.call(['ozone-notify', text])
 
 
+# a media file itself (what ozone-web finds in a page's <video>): nothing for yt-dlp to work out
+MEDIA_FILE = re.compile(r'\.(mp4|m4v|mov|webm|mkv|ts|m3u8)$', re.I)
+
+
+def play_file(url, title=''):
+    """A media file's URL straight to amplay (yt-dlp takes ~10 s to start here), mpv if it fails"""
+    path = urllib.parse.urlsplit(url).path
+    title = title or urllib.parse.unquote(os.path.basename(path)).rsplit('.', 1)[0]
+    if subprocess.call(['amplay', '--title', title, url]) != 0:
+        subprocess.call(['amplay', '--reset'])
+        notify('Hardware playback failed, trying mpv')
+        subprocess.call(['mpv', '--force-window=immediate', url])
+
+
 def play(url, title='', started=None):
     """Blocks until the video is over; started() is called when the picture is about to appear"""
+    if MEDIA_FILE.search(urllib.parse.urlsplit(url).path):
+        if started:
+            started()
+        return play_file(url, title)
     s = load_settings()
     notify('Loading video (up to %dp%s)…' % (s['height'], s['fps'] if s['fps'] > 30 else ''))
     r = subprocess.run(ytdlp() + ['--print', 'title', '--print', '%(height)s %(fps)s', '-g',

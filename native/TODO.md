@@ -107,10 +107,15 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
   one's own (`install-gpu.sh`, `install-games.sh`, [gpu/README.md](gpu/README.md)).
 - [x] **Hard**: the browser on the GPU (`OZONE_WEB_GPU=1`): WebKit composites on the Mali-450
   through shims under it (native/gpu/egl-fix), CSS animations 8 times faster.
-- [ ] **Hard**: the browser's frames straight to the screen. In progress: a WebKit of our own
-  hands frames to X as pixmaps (`install-webkit.sh`): CSS animations 34.6 frames a second instead
-  of 29; X still composites every whole frame ([gpu/README.md](gpu/README.md#a-webkit-of-our-own-in-progress)). Video in web pages: there are no
-  GStreamer H.264 decoders (gstreamer1.0-libav), and decoding would be in software anyway.
+- [x] **Hard**: the browser's frames straight to the screen. A WebKit of our own
+  (`install-webkit.sh`) hands frames to X as pixmaps, and X draws only what changed: wheel
+  scrolling Wikipedia 25 frames a second instead of 12, a small animation with X at 29 % instead
+  of 100 ([gpu/README.md](gpu/README.md#a-webkit-of-our-own-in-progress)).
+- [x] **Medium**: video in web pages, on the hardware decoder: the play button (F7) hands the
+  page's video to `yt` (a `<video>` source, an embedded player, or yt-dlp on the page). WebKit's
+  own media stays off: no GStreamer H.264 decoder here, and software decoding can't keep up.
+- [ ] **Medium**: videos of sites that need signing in (Vimeo, social networks): yt-dlp could get
+  ozone-web's cookies (its cookies.sqlite, converted to a cookies.txt).
 - [ ] **Hard / not planned**: Android apps (Google Play, APKs) in Linux. Rebooting into Android
   is the way.
 

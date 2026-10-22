@@ -25,6 +25,8 @@ What was measured on the box, and what follows from it:
 - No HTML5 media: WebKit's GStreamer path has neither codecs nor CPU for it here, and on YouTube it
   took the web process down. Video goes to the hardware decoder: watch pages, including the
   in-page navigation of YouTube's app, open in `yt` -> amplay; YouTube search goes to `yt` too.
+  Elsewhere the play button (F7) hands the page's video to `yt` (yt-dlp): a <video> source, an
+  embedded player, or the page itself, which yt-dlp knows for a thousand sites.
 - Ads and trackers are blocked by a compiled WebKit content filter (pgl.yoyo.org list), and so are
   all third-party scripts (analytics, tag managers, ad and social widgets) apart from the common
   library CDNs: CNN loaded in 22 s instead of 45, The Verge in 12 instead of 48. The shield button
@@ -131,7 +133,22 @@ YOUTUBE_OTHER = re.compile(r'^https?://((www|m)\.)?youtube\.com/?(results|\?|$|#
 
 # Font Awesome 4, like the panel
 ICON = {'back': '', 'forward': '', 'reload': '', 'stop': '', 'home': '',
-        'new': '', 'close': '', 'fast': '', 'reader': '', 'shield': ''}
+        'new': '', 'close': '', 'fast': '', 'reader': '', 'shield': '',
+        'video': ''}
+
+# What plays on the page (F7): the sources of its <video> and <audio> elements (not blob: ones, which
+# a site's player feeds itself), and embedded players. WebKit's media is off, so these are only
+# found, never loaded.
+VIDEO_JS = r'''(() => {
+  const abs = s => { try { return new URL(s, location.href).href } catch (e) { return '' } };
+  const sources = [];
+  for (const m of document.querySelectorAll('video, audio'))
+    for (const s of [m.getAttribute('src'), ...Array.from(m.querySelectorAll('source'), e => e.getAttribute('src'))])
+      if (s && !/^(blob|data):/.test(s)) sources.push(abs(s));
+  const frames = Array.from(document.querySelectorAll('iframe[src]'), f => abs(f.getAttribute('src')))
+    .filter(u => /youtube(-nocookie)?\.com\/embed|player\.vimeo\.com|dailymotion\.com\/embed|\/embed\/|player\./.test(u));
+  return JSON.stringify({sources, frames});
+})()'''
 
 CSS = b'''
 * { font-family: "JetBrains Mono"; font-size: 13px; }
@@ -340,13 +357,14 @@ class Browser(Gtk.ApplicationWindow):
         self.find.connect('activate', lambda *_: self.tab.view.get_find_controller().search_next())
         self.fast = flat_button('fast', 'Fast mode for this site: JavaScript off (F8)', self.toggle_fast)
         self.reader = flat_button('reader', 'Reader view (F9)', self.toggle_reader)
+        self.video = flat_button('video', 'Play the video on this page (F7)', self.play_page_video)
         self.shield = flat_button('shield', 'Third-party scripts blocked on this site', self.toggle_scripts)
         bar = Gtk.Box(spacing=2)
         bar.get_style_context().add_class('toolbar')
         for w in (self.back, self.forward, self.reload, home):
             bar.pack_start(w, False, False, 0)
         bar.pack_start(self.entry, True, True, 6)
-        for w in (self.find, self.fast, self.reader, self.shield):
+        for w in (self.find, self.video, self.fast, self.reader, self.shield):
             bar.pack_start(w, False, False, 0)
         # bspwm draws no title bars: the window closes here too (as with Super+Q, it stays ready)
         bar.pack_start(flat_button('close', 'Close the browser (Super+Q)', self.close), False, False, 8)
@@ -454,6 +472,33 @@ class Browser(Gtk.ApplicationWindow):
             return   # both the policy decision and the URI change report the same click
         self.playing = (uri, now)
         subprocess.Popen(['yt', uri], start_new_session=True)
+
+    def play_page_video(self):
+        """The page's video on the hardware decoder, through yt (yt-dlp knows a thousand sites and plain
+        <video> pages): a source of its <video>, else an embedded player, else the page itself"""
+        tab = self.tab
+        page = tab.reader_of or tab.view.get_uri() or ''
+        if tab.reader_of:
+            self.play(page)
+            return
+        js_was = tab.view.get_settings().get_enable_javascript()
+
+        def found(view, result):
+            view.get_settings().set_enable_javascript(js_was)
+            try:
+                media = json.loads(view.evaluate_javascript_finish(result).to_string())
+            except (GLib.Error, ValueError):
+                media = {}
+            urls = [u for u in media.get('sources', []) + media.get('frames', []) if u.startswith('http')]
+            if urls or page.startswith('http'):
+                subprocess.Popen(['ozone-notify', 'Opening the video' if urls else 'Looking for a video on this page'])
+                self.play(urls[0] if urls else page)
+            else:
+                subprocess.Popen(['ozone-notify', 'No video on this page'])
+
+        # as for the reader view: on for this one call, even in fast mode
+        tab.view.get_settings().set_enable_javascript(True)
+        tab.view.evaluate_javascript(VIDEO_JS, -1, 'ozone-video', None, None, found)
 
     def on_download(self, _context, download):
         def destination(dl, name):
@@ -687,6 +732,7 @@ class Browser(Gtk.ApplicationWindow):
             (1, 0, 'minus'): lambda: zoom(-0.1),
             (1, 0, '0'): lambda: v.set_zoom_level(1),
             (1, 0, 'f'): lambda: (self.find.show(), self.find.grab_focus()),
+            (0, 0, 'F7'): self.play_page_video,
             (0, 0, 'F8'): self.toggle_fast,
             (0, 0, 'F9'): self.toggle_reader,
             (0, 0, 'F11'): self.toggle_fullscreen,
