@@ -131,7 +131,11 @@ copy (below):
 
 The direct copy: ShadowFB went from back buffer to shadow to framebuffer, two copies of the frame,
 which this memory bus can't afford at 720p60. Now a DRI2 swap goes from the back buffer straight to
-the framebuffer where the window shows, and the shadow is skipped there.
+the framebuffer where the window shows, and the shadow is skipped there. Only for a window that
+swaps often (10 frames a second or more), though: the software cursor puts back what was under it
+from the shadow, so a still picture (a photo in mpv, a paused video) got trails of the old screen
+wherever the pointer went. A window that swaps rarely takes X's way, and the last frame of one that
+stops is copied again through X 150 ms later, cursor and all.
 A 32-bit window is the other case: RetroArch accepts only 8888 configs, and Composite redirects such
 a window on the 16-bit screen. Its frame is converted to RGB565 with NEON on the way, instead of
 pixman compositing it from the window pixmap. For full-screen NES in RetroArch (Nestopia) this went

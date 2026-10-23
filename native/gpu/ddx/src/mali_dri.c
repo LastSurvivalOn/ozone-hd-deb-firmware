@@ -361,7 +361,11 @@ static void platform_wait_for_vsync(ScrnInfoPtr pScrn, int fb_lcd_fd)
  * framebuffer, where the window is visible, instead of into the shadow and from there to the
  * framebuffer: one copy of the frame instead of two, which full-screen games at 60 fps need on this
  * memory bus (two copies of 720p took Xorg 60 % of a core and capped them at 57 fps). The shadow
- * keeps the old content there, which only matters if something reads the window back.
+ * keeps the old content there, and X reads it back: the software cursor puts back what was under
+ * it from the shadow, so moving the pointer over a still picture (a photo in mpv, a paused video)
+ * left trails of what was there before. So only a window that swaps often goes this way (the next
+ * frame covers such trails at once), and its last frame is copied again through X once it stops
+ * (MaliDRI2RedoLater); the first swap after a pause takes X's way.
  * A 32-bit window (an 8888 config, as RetroArch insists on) is redirected by Composite on the
  * 16-bit screen, and X then converts it with pixman from its own pixmap: here the frame goes to
  * the framebuffer converted to RGB565 at once, where it shows (inside the window, outside what
@@ -483,38 +487,109 @@ static Bool MaliDRI2CopyToFramebuffer(DrawablePtr pDraw, RegionPtr pRegion, Pixm
 	return TRUE;
 }
 
+/* X's own way: through the GC, so the software cursor and the shadow's damage follow */
+static void MaliDRI2CopyThroughX(DrawablePtr pDraw, RegionPtr pRegion, PixmapPtr srcPixmap)
+{
+	ScreenPtr pScreen = pDraw->pScreen;
+	GCPtr pGC = GetScratchGC(pDraw->depth, pScreen);
+	RegionPtr copyRegion = REGION_CREATE(pScreen, NULL, 0);
+
+	REGION_COPY(pScreen, copyRegion, pRegion);
+	(*pGC->funcs->ChangeClip)(pGC, CT_REGION, copyRegion, 0);
+	ValidateGC(pDraw, pGC);
+	(*pGC->ops->CopyArea)(&srcPixmap->drawable, pDraw, pGC, 0, 0, pDraw->width, pDraw->height, 0, 0);
+	FreeScratchGC(pGC);
+}
+
+#define MALI_SWAPS_OFTEN_MS 100   /* 10 frames a second or more */
+#define MALI_REDO_AFTER_MS  150
+
+static void MaliDRI2RedoForget(MaliPtr fPtr)
+{
+	if (fPtr->redo_pixmap)
+	{
+		PixmapPtr p = fPtr->redo_pixmap;
+
+		(*p->drawable.pScreen->DestroyPixmap)(p);   /* the reference MaliDRI2RedoLater took */
+		fPtr->redo_pixmap = NULL;
+	}
+}
+
+/* The window's last frame again, through X (see above); its back buffer still holds it, unless the
+ * client is drawing the next one already, which then follows soon */
+static CARD32 MaliDRI2Redo(OsTimerPtr timer, CARD32 now, void *arg)
+{
+	ScrnInfoPtr pScrn = arg;
+	MaliPtr fPtr = MALIPTR(pScrn);
+	PixmapPtr src = fPtr->redo_pixmap;
+	WindowPtr pWin;
+
+	if (src && pScrn->vtSema && dixLookupWindow(&pWin, fPtr->redo_window, serverClient, DixWriteAccess) == Success &&
+	    pWin->viewable && src->drawable.width == pWin->drawable.width && src->drawable.height == pWin->drawable.height)
+	{
+		BoxRec box = { 0, 0, pWin->drawable.width, pWin->drawable.height };
+		RegionRec region;
+
+		RegionInit(&region, &box, 1);
+		MaliDRI2CopyThroughX(&pWin->drawable, &region, src);
+		RegionUninit(&region);
+	}
+
+	MaliDRI2RedoForget(fPtr);
+	return 0;
+}
+
+static void MaliDRI2RedoLater(DrawablePtr pDraw, PixmapPtr srcPixmap)
+{
+	ScrnInfoPtr pScrn = xf86Screens[pDraw->pScreen->myNum];
+	MaliPtr fPtr = MALIPTR(pScrn);
+
+	if (fPtr->redo_pixmap && fPtr->redo_window != pDraw->id)
+	{
+		MaliDRI2Redo(NULL, 0, pScrn);   /* another window's, at once */
+	}
+
+	if (fPtr->redo_pixmap != srcPixmap)
+	{
+		MaliDRI2RedoForget(fPtr);
+		srcPixmap->refcnt++;
+		fPtr->redo_pixmap = srcPixmap;
+	}
+
+	fPtr->redo_window = pDraw->id;
+	fPtr->redo_timer = TimerSet(fPtr->redo_timer, 0, MALI_REDO_AFTER_MS, MaliDRI2Redo, pScrn);
+}
+
 static void MaliDRI2CopyRegion(DrawablePtr pDraw, RegionPtr pRegion, DRI2BufferPtr pDstBuffer, DRI2BufferPtr pSrcBuffer)
 {
-	GCPtr pGC;
-	RegionPtr copyRegion;
 	ScreenPtr pScreen = pDraw->pScreen;
 	ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
 	MaliPtr fPtr = MALIPTR(pScrn);
-	PixmapPtr winPixmap;
-
 	MaliDRI2BufferPrivatePtr srcPrivate = pSrcBuffer->driverPrivate;
-	MaliDRI2BufferPrivatePtr dstPrivate = pDstBuffer->driverPrivate;
-
 	PixmapPtr srcPixmap = srcPrivate->pPixmap;
-	PixmapPtr dstPixmap = dstPrivate->pPixmap;
-
-	DrawablePtr srcDrawable = &srcPrivate->pPixmap->drawable;
-	DrawablePtr dstDrawable = pDraw;
+	CARD32 now = GetTimeInMillis();
+	Bool often = pDraw->id == fPtr->last_swap_window && now - fPtr->last_swap_ms < MALI_SWAPS_OFTEN_MS;
 
 	DEBUG_STR(1, "Blitting!");
 
-	if (DRI2BufferFrontLeft == pDstBuffer->attachment && MaliDRI2CopyToFramebuffer(pDraw, pRegion, srcPixmap))
+	if (DRI2BufferFrontLeft == pDstBuffer->attachment)
 	{
+		fPtr->last_swap_window = pDraw->id;
+		fPtr->last_swap_ms = now;
+	}
+
+	if (DRI2BufferFrontLeft == pDstBuffer->attachment && often && MaliDRI2CopyToFramebuffer(pDraw, pRegion, srcPixmap))
+	{
+		MaliDRI2RedoLater(pDraw, srcPixmap);
 		return;
 	}
 
-	pGC = GetScratchGC(pDraw->depth, pScreen);
-	copyRegion = REGION_CREATE(pScreen, NULL, 0);
-	REGION_COPY(pScreen, copyRegion, pRegion);
-	(*pGC->funcs->ChangeClip)(pGC, CT_REGION, copyRegion, 0);
-	ValidateGC(dstDrawable, pGC);
-	(*pGC->ops->CopyArea)(srcDrawable, dstDrawable, pGC, 0, 0, pDraw->width, pDraw->height, 0, 0);
-	FreeScratchGC(pGC);
+	if (fPtr->redo_pixmap && fPtr->redo_window == pDraw->id)
+	{
+		MaliDRI2RedoForget(fPtr);   /* this copy is a newer frame, through X itself */
+	}
+
+	MaliDRI2CopyThroughX(pDraw, pRegion, srcPixmap);
 }
 
 /*
@@ -745,5 +820,8 @@ void MaliDRI2CloseScreen(ScreenPtr pScreen)
 
 	DRI2CloseScreen(pScreen);
 
+	TimerFree(fPtr->redo_timer);
+	fPtr->redo_timer = NULL;
+	MaliDRI2RedoForget(fPtr);
 	fPtr->dri_render = DRI_NONE;
 }

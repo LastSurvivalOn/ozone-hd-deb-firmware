@@ -83,7 +83,9 @@ Several of these were found by bricking or hanging the box. Don't undo them.
     (`/run/ozone-gpu-failed`) it picks fbdev until a reboot.
   - The Mali X driver keeps the screen in a cached UMP shadow: reading the framebuffer is uncached,
     and a window scroll took 47 ms. DRI2 swaps go from the back buffer straight to the framebuffer
-    (one copy; 32-bit windows converted with NEON).
+    (one copy; 32-bit windows converted with NEON), but only for windows swapping 10+ times a second,
+    and their last frame is redone through X after 150 ms: the software cursor restores from the
+    shadow, and a stale shadow left trails of the old screen on still GL windows.
   - Programs get the GPU through `ozone-gl` (`/usr/local/lib/mali` first in the library path), never
     system-wide: WebKit/GTK keep Mesa. `/usr/local/bin/mpv` and `retroarch` wrap the real ones.
   - Mali's own EGL is 1.4 with bugs that our `libEGL.so.1` covers (NULL version pointers, no

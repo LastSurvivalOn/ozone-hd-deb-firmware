@@ -81,6 +81,13 @@ typedef struct
 	ump_handle shadow_handle;
 	DamagePtr shadow_damage;
 	ScreenBlockHandlerProcPtr BlockHandler;
+	/* swaps that went straight to the framebuffer (mali_dri.c): the last one is copied again
+	 * through X once the window stops swapping, so the shadow has it too */
+	OsTimerPtr redo_timer;
+	XID redo_window;
+	PixmapPtr redo_pixmap;
+	XID last_swap_window;
+	CARD32 last_swap_ms;
 	void			*aml_disp_private;
 	void			*aml_hwcursor_private;
 } MaliRec, *MaliPtr;
