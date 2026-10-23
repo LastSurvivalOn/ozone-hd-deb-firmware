@@ -14,6 +14,9 @@ struct osd_state {
     int signal;               /* TV: signal quality %, -1 if unknown */
     int volume, muted;        /* percent */
     const char *title;
+    const double *marks;      /* files: chapter starts in seconds, ticks on the progress bar */
+    int nmarks;
+    const char *flags;        /* files: what the bottom bar shows on the right ("Repeat one"...) */
 };
 
 enum osd_action {
@@ -25,6 +28,7 @@ enum osd_action {
     OSD_PIN,                  /* value: the four digits typed */
     OSD_TEXT,                 /* teletext on / off */
     OSD_TEXT_PAGE,            /* value: a page (BCD, 0x100-0x899) or one of TTX_* */
+    OSD_REPEAT,               /* files: off, this file, all the files */
 };
 #define TTX_NEXT  (-1)
 #define TTX_PREV  (-2)
@@ -75,5 +79,7 @@ void osd_teletext(int on, int page);
    dh at x, y; pixels with alpha below 128 are transparent (the video shows) */
 void osd_image(int layer, const uint8_t *rgba, int w, int h, int x, int y, int dw, int dh);
 void osd_image_clear(int layer);
+/* A text subtitle at the bottom (lines with \n), on dark boxes; NULL or "" clears it */
+void osd_subtitle(const char *text);
 
 #endif

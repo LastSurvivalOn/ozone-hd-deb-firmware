@@ -100,6 +100,9 @@ static struct {
     int radio;
     int ttx, ttx_page, ttx_typed, ttx_n;
     struct image { XImage *im; int x, y, w, h; } img[2];
+    XftFont *subfont;
+    char subtext[1024];
+    int sub_x, sub_y, sub_w, sub_h;   /* the area the text subtitle covers */
     struct osd_state shown;    /* what the bars show now */
     double dur;
     char sig[512];
@@ -205,7 +208,8 @@ int osd_open(int tv)
     O.big = XftFontOpenName(O.dpy, O.scr, "DejaVu Sans:pixelsize=26");
     O.huge = XftFontOpenName(O.dpy, O.scr, "DejaVu Sans:pixelsize=40:weight=bold");
     O.icons_big = XftFontOpenName(O.dpy, O.scr, "FontAwesome:pixelsize=96");
-    if (!O.font || !O.small || !O.icons || !O.big || !O.huge || !O.icons_big)
+    O.subfont = XftFontOpenName(O.dpy, O.scr, "DejaVu Sans:pixelsize=34:weight=bold");
+    if (!O.font || !O.small || !O.icons || !O.big || !O.huge || !O.icons_big || !O.subfont)
         return -1;
 
     /* override-redirect: above the panel and outside the window manager's tiling */
@@ -619,6 +623,68 @@ void osd_image(int layer, const uint8_t *rgba, int w, int h, int x, int y, int d
     XFlush(O.dpy);
 }
 
+static void draw_subtitle(void)
+{
+    if (!O.subtext[0])
+        return;
+    /* lines broken to fit 90 % of the width, bottom up from above the bar's place */
+    char lines[8][256];
+    int n = 0, max = O.w * 9 / 10 - 2 * PAD;
+    for (const char *t = O.subtext; *t && n < 8;) {
+        size_t len = strcspn(t, "\n");
+        char para[1024];
+        snprintf(para, sizeof para, "%.*s", (int)(len < 1023 ? len : 1023), t);
+        const char *p = para;
+        while (*p && n < 8) {
+            size_t take = strlen(p) < 255 ? strlen(p) : 255;
+            for (;;) {
+                snprintf(lines[n], sizeof lines[n], "%.*s", (int)take, p);
+                if (text_width(O.subfont, lines[n]) <= max || take < 2)
+                    break;
+                size_t sp = take - 1;
+                while (sp > 0 && p[sp] != ' ')
+                    sp--;
+                if (sp == 0) {
+                    do take--; while (take > 1 && ((unsigned char)p[take] & 0xc0) == 0x80);
+                } else {
+                    take = sp;
+                }
+            }
+            n++;
+            p += take;
+            while (*p == ' ')
+                p++;
+        }
+        t += len;
+        if (*t == '\n')
+            t++;
+    }
+    int lh = O.subfont->ascent + O.subfont->descent + 10;
+    int y = O.h - BAR_H - 30 - n * lh;
+    O.sub_x = O.w, O.sub_y = y, O.sub_w = 0, O.sub_h = n * lh;
+    for (int i = 0; i < n; i++, y += lh) {
+        int w = text_width(O.subfont, lines[i]) + 24, x = (O.w - w) / 2;
+        XftDrawRect(O.win_d, &O.col[C_BG], x, y, w, lh - 4);
+        text(O.win_d, O.subfont, C_TEXT, x + 12, y + O.subfont->ascent + 2, lines[i]);
+        if (x < O.sub_x)
+            O.sub_x = x;
+        if (w > O.sub_w)
+            O.sub_w = w;
+    }
+}
+
+void osd_subtitle(const char *t)
+{
+    if (!strcmp(O.subtext, t ? t : ""))
+        return;
+    if (O.subtext[0] && O.sub_w > 0)
+        XClearArea(O.dpy, O.win, O.sub_x, O.sub_y, O.sub_w, O.sub_h, False);
+    snprintf(O.subtext, sizeof O.subtext, "%s", t ? t : "");
+    O.sub_w = 0;
+    draw_subtitle();
+    XFlush(O.dpy);
+}
+
 /* ---- the bars ------------------------------------------------------------------------------ */
 
 static void clock_text(char *buf, size_t n, double t)
@@ -651,6 +717,8 @@ static void draw(const struct osd_state *s)
     else
         snprintf(line, sizeof line, "%s", now);
     snprintf(vol, sizeof vol, "%d%%", s->volume);
+    if (!s->live && s->flags)
+        snprintf(ind, sizeof ind, "%s   ", s->flags);
     if (s->live) {
         if (s->audio)
             snprintf(ind + strlen(ind), sizeof ind - strlen(ind), "Audio %s   ", s->audio);
@@ -671,8 +739,8 @@ static void draw(const struct osd_state *s)
 
     /* redraw only when something visible changed */
     char sig[sizeof O.sig];
-    snprintf(sig, sizeof sig, "%d|%s|%d|%d|%s|%d|%d|%d|%s|%s", fill, line, s->paused, s->muted, vol, O.w, s->live,
-             s->recording, ind, title);
+    snprintf(sig, sizeof sig, "%d|%s|%d|%d|%s|%d|%d|%d|%s|%s|%d", fill, line, s->paused, s->muted, vol, O.w, s->live,
+             s->recording, ind, title, s->nmarks);
     if (!strcmp(sig, O.sig))
         return;
     strcpy(O.sig, sig);
@@ -696,6 +764,8 @@ static void draw(const struct osd_state *s)
         XftDrawRect(O.bar_d, &O.col[C_TRACK], PAD, TRACK_Y, track_w, TRACK_H);
         XftDrawRect(O.bar_d, &O.col[C_FILL], PAD, TRACK_Y, fill, TRACK_H);
     }
+    for (int i = 0; s->dur > 0 && !s->live && i < s->nmarks; i++)
+        XftDrawRect(O.bar_d, &O.col[C_BG], PAD + (int)(track_w * (s->marks[i] / s->dur)) - 1, TRACK_Y, 3, TRACK_H);
     if (s->dur > 0 && !s->live)
         XftDrawRect(O.bar_d, &O.col[C_TEXT], PAD + fill - 2, TRACK_Y - 5, 4, TRACK_H + 10);
 
@@ -899,9 +969,22 @@ static int key_action(KeySym k, int repeat, struct osd_event *e)
         can_repeat = 0;
         break;
     case XK_q: case XK_Escape: case XK_BackSpace: case XF86XK_Back: case XF86XK_AudioStop:
+        if (O.info_on) {   /* exit closes the info panel first */
+            info_hide();
+            return 0;
+        }
         *e = (struct osd_event){ OSD_QUIT, 0 };
         can_repeat = 0;
         break;
+    /* files: the info panel, and the colored keys (the remote's) */
+    case XK_i: case XF86XK_Tools:
+        if (!repeat)
+            O.info_on ? info_hide() : info_show();
+        return 0;
+    case XK_a: case XF86XK_Launch3: *e = (struct osd_event){ OSD_AUDIO, 0 }; can_repeat = 0; break;
+    case XK_s: case XF86XK_Launch2: *e = (struct osd_event){ OSD_SUBS, 0 }; can_repeat = 0; break;
+    case XK_z: case XF86XK_Launch4: *e = (struct osd_event){ OSD_ASPECT, 0 }; can_repeat = 0; break;
+    case XK_r: case XF86XK_Launch1: *e = (struct osd_event){ OSD_REPEAT, 0 }; can_repeat = 0; break;
     default:
         return 0;
     }
@@ -1092,6 +1175,7 @@ int osd_poll(struct osd_event *ev, int max)
             if (x.xexpose.window == O.win) {
                 if (x.xexpose.count == 0) {
                     draw_radio();
+                    draw_subtitle();
                     for (int i = 0; i < 2; i++)
                         if (O.img[i].im)
                             XPutImage(O.dpy, O.win, O.gc, O.img[i].im, 0, 0, O.img[i].x, O.img[i].y,

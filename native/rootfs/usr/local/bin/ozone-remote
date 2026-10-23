@@ -13,7 +13,7 @@ which kbd-merge merges into X's keyboard like any other. On the way it adds:
   exit     back: closes menus, the on-screen keyboard, the channel list, stops the player and
            closes the TV window (Esc); any other window it closes.
   info     the panel, over a fullscreen window too (ozone-panel); in mouse mode the right button.
-           In the TV player: the channel's info and the signal.
+           In the player: the video's info (TV: the channel's, and the signal).
   Power    sleep (ozone-standby) when let go; any button wakes the box (ozone-standby can't see
            the remote, which is held here, so this wakes it). Held for 2 s: power off (the box's
            deep sleep, red LED; Power turns it on again).
@@ -476,7 +476,7 @@ class Remote:
                 self.back()
             return
         # here, not in sxhkd: the player grabs X's keyboard
-        if code == INFO_KEY and not self.tv_player():
+        if code == INFO_KEY and not self.running('amplay'):
             if press:
                 subprocess.Popen(['ozone-panel', 'peek'])
             return
