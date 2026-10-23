@@ -16,6 +16,7 @@ pictures) except the parts below, which keep the licenses of the code they come 
 | [native/gpu/ddx](native/gpu/ddx) | MIT, see its [COPYING](native/gpu/ddx/COPYING) | ARM's Mali X driver (and Dave Airlie's `compat-api.h`); our changes to it are under the same terms |
 | [native/gpu/kernel](native/gpu/kernel) | GPL-2.0-only, see its [COPYING](native/gpu/kernel/COPYING) | a Linux kernel module (`fbump`) and patches to ARM's GPLv2 Mali and UMP drivers |
 | [native/webkit/patches](native/webkit/patches) | BSD-2-Clause, see its [COPYING](native/webkit/patches/COPYING) | changes to WebKit files under that license (Igalia's), so they can go back to WebKit |
+| [native/miracast/patches](native/miracast/patches) | BSD-3-Clause, see its [COPYING](native/miracast/patches/COPYING) | changes to wpa_supplicant (hostap), under its license |
 
 ## Proprietary parts the programs work with
 

@@ -1,0 +1,193 @@
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -1524,8 +1524,15 @@
+ 	 * operations.
+ 	 */
+ 	eloop_cancel_timeout(ap_sta_delayed_1x_auth_fail_cb, hapd, sta);
+-	eloop_register_timeout(0, 10000, ap_sta_delayed_1x_auth_fail_cb,
+-			       hapd, sta);
++	/*
++	 * A WPS enrollee leaves by itself after the EAP-Failure, to come back with the credential:
++	 * time for that first. Realtek's 8189ES deauthenticates a station it is told to remove with
++	 * reason 3 ("leaving") whatever the reason given (kernel 3.10's DEL_STATION has none), and a
++	 * P2P client takes that for the end of the group: the phone left the group it had just
++	 * joined. When the enrollee goes, the station is freed and this timeout with it.
++	 */
++	eloop_register_timeout(0, (sta->flags & WLAN_STA_WPS) ? 500000 : 10000,
++			       ap_sta_delayed_1x_auth_fail_cb, hapd, sta);
+ }
+ 
+ 
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -14,6 +14,8 @@
+ #include <sys/types.h>
+ #include <fcntl.h>
+ #include <net/if.h>
++#include <sys/ioctl.h>
++#include <linux/sockios.h>
+ #include <netlink/genl/genl.h>
+ #include <netlink/genl/ctrl.h>
+ #ifdef CONFIG_LIBNL3_ROUTE
+@@ -156,6 +158,7 @@
+ static void nl80211_check_global(struct nl80211_global *global);
+ 
+ static void wpa_driver_nl80211_deinit(struct i802_bss *bss);
++static void nl80211_remain_on_channel_over(void *eloop_ctx, void *timeout_ctx);
+ static int wpa_driver_nl80211_set_mode_ibss(struct i802_bss *bss,
+ 					    struct hostapd_freq_params *freq);
+ 
+@@ -3007,6 +3010,7 @@
+ 	netlink_send_oper_ifla(drv->global->netlink, drv->ifindex, 0,
+ 			       IF_OPER_UP);
+ 	eloop_cancel_timeout(wpa_driver_nl80211_send_rfkill, drv, drv->ctx);
++	eloop_cancel_timeout(nl80211_remain_on_channel_over, drv, NULL);
+ 	rfkill_deinit(drv->rfkill);
+ 
+ 	eloop_cancel_timeout(wpa_driver_nl80211_scan_timeout, drv, drv->ctx);
+@@ -8296,6 +8300,28 @@
+ }
+ 
+ 
++/*
++ * Some vendor drivers (Realtek's 8189ES, for one) report the start of a remain-on-channel but
++ * never its end, neither when it expires nor when it is cancelled, and P2P then waits for it for
++ * ever after its first listen. The end is made up here: when the time asked for is over, or at
++ * once after a cancel. A real end event that does come later finds nothing pending and is dropped.
++ */
++static void nl80211_remain_on_channel_over(void *eloop_ctx, void *timeout_ctx)
++{
++	struct wpa_driver_nl80211_data *drv = eloop_ctx;
++	union wpa_event_data data;
++
++	if (!drv->pending_remain_on_chan)
++		return;
++	wpa_printf(MSG_DEBUG, "nl80211: Remain-on-channel over (no event from the driver)");
++	drv->pending_remain_on_chan = 0;
++	os_memset(&data, 0, sizeof(data));
++	data.remain_on_channel.freq = drv->remain_on_chan_freq;
++	data.remain_on_channel.duration = drv->remain_on_chan_duration;
++	wpa_supplicant_event(drv->ctx, EVENT_CANCEL_REMAIN_ON_CHANNEL, &data);
++}
++
++
+ static int wpa_driver_nl80211_remain_on_channel(void *priv, unsigned int freq,
+ 						unsigned int duration)
+ {
+@@ -8320,6 +8346,11 @@
+ 			   (long long unsigned int) cookie, freq, duration);
+ 		drv->remain_on_chan_cookie = cookie;
+ 		drv->pending_remain_on_chan = 1;
++		drv->remain_on_chan_freq = freq;
++		drv->remain_on_chan_duration = duration;
++		eloop_cancel_timeout(nl80211_remain_on_channel_over, drv, NULL);
++		eloop_register_timeout(duration / 1000, (duration % 1000) * 1000 + 20000,
++				       nl80211_remain_on_channel_over, drv, NULL);
+ 		return 0;
+ 	}
+ 	wpa_printf(MSG_DEBUG, "nl80211: Failed to request remain-on-channel "
+@@ -8354,6 +8385,9 @@
+ 	}
+ 
+ 	ret = send_and_recv_msgs(drv, msg, NULL, NULL, NULL, NULL);
++	/* its end, from the event loop (see nl80211_remain_on_channel_over) */
++	eloop_cancel_timeout(nl80211_remain_on_channel_over, drv, NULL);
++	eloop_register_timeout(0, 0, nl80211_remain_on_channel_over, drv, NULL);
+ 	if (ret == 0)
+ 		return 0;
+ 	wpa_printf(MSG_DEBUG, "nl80211: Failed to cancel remain-on-channel: "
+@@ -8362,6 +8396,62 @@
+ }
+ 
+ 
++#ifndef ANDROID_P2P
++/*
++ * Realtek's vendor drivers (8189ES) answer probe requests in the P2P listen state themselves and
++ * never pass them up, and as a group owner they build their beacons, probe responses and
++ * association responses with only the WPS and P2P IEs given by the Android private command
++ * SET_AP_WPS_P2P_IE (type 1, 2 and 4): without them no phone finds this device, nor joins its
++ * group. The command's IE length is the buffer's length past "SET_AP_WPS_P2P_IE N ".
++ */
++static int nl80211_rtw_p2p_ie(struct i802_bss *bss, int type, const struct wpabuf *ie)
++{
++	static const char cmd[] = "SET_AP_WPS_P2P_IE";
++	struct wpa_driver_nl80211_data *drv = bss->drv;
++	struct {
++		char *buf;
++		int used_len;
++		int total_len;
++	} priv_cmd;
++	struct ifreq ifr;
++	size_t head = sizeof(cmd) + 2, len = ie ? wpabuf_len(ie) : 0;
++	char *buf = os_zalloc(head + len + 1);
++	int ret;
++
++	if (!buf)
++		return -1;
++	os_snprintf(buf, head + 1, "%s %d ", cmd, type);
++	if (len)
++		os_memcpy(buf + head, wpabuf_head(ie), len);
++	os_memset(&ifr, 0, sizeof(ifr));
++	os_strlcpy(ifr.ifr_name, bss->ifname, IFNAMSIZ);
++	priv_cmd.buf = buf;
++	priv_cmd.used_len = head + len;
++	priv_cmd.total_len = head + len;
++	ifr.ifr_data = (void *) &priv_cmd;
++	ret = ioctl(drv->global->ioctl_sock, SIOCDEVPRIVATE + 1, &ifr);
++	wpa_printf(MSG_DEBUG, "nl80211: %s %d with %zu bytes: %d", cmd, type, len, ret);
++	os_free(buf);
++	return ret;
++}
++
++
++static int nl80211_rtw_set_p2p_ie(void *priv, const struct wpabuf *beacon,
++				  const struct wpabuf *proberesp,
++				  const struct wpabuf *assocresp)
++{
++	struct i802_bss *bss = priv;
++
++	if (is_ap_interface(bss->drv->nlmode)) {
++		nl80211_rtw_p2p_ie(bss, 1, beacon);
++		nl80211_rtw_p2p_ie(bss, 4, assocresp);
++	}
++	nl80211_rtw_p2p_ie(bss, 2, proberesp);
++	return 0;
++}
++#endif /* !ANDROID_P2P */
++
++
+ static int wpa_driver_nl80211_probe_req_report(struct i802_bss *bss, int report)
+ {
+ 	struct wpa_driver_nl80211_data *drv = bss->drv;
+@@ -12200,6 +12290,9 @@
+ 	.get_noa = wpa_driver_get_p2p_noa,
+ 	.set_ap_wps_ie = wpa_driver_set_ap_wps_p2p_ie,
+ #endif /* ANDROID_P2P */
++#ifndef ANDROID_P2P
++	.set_ap_wps_ie = nl80211_rtw_set_p2p_ie,
++#endif /* !ANDROID_P2P */
+ #ifdef ANDROID
+ #ifndef ANDROID_LIB_STUB
+ 	.driver_cmd = wpa_driver_nl80211_driver_cmd,
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -1258,6 +1258,8 @@
+ 
+ 	if (cookie != drv->remain_on_chan_cookie)
+ 		return; /* not for us */
++	if (cancel_event && !drv->pending_remain_on_chan)
++		return; /* over already (nl80211_remain_on_channel_over) */
+ 
+ 	if (cancel_event)
+ 		drv->pending_remain_on_chan = 0;
+--- a/src/drivers/driver_nl80211.h
++++ b/src/drivers/driver_nl80211.h
+@@ -183,6 +183,8 @@
+ 
+ 	u64 vendor_scan_cookie;
+ 	u64 remain_on_chan_cookie;
++	unsigned int remain_on_chan_freq;
++	unsigned int remain_on_chan_duration;
+ 	u64 send_frame_cookie;
+ #define MAX_SEND_FRAME_COOKIES 20
+ 	u64 send_frame_cookies[MAX_SEND_FRAME_COOKIES];
