@@ -8,6 +8,8 @@ setxkbmap -rules evdev -model pc105 -layout us,ua -option -option grp:alt_shift_
 pgrep -x sxhkd > /dev/null || sxhkd &
 # the IR remote: mouse mode, on-screen keyboard, exit and Power
 pgrep -x ozone-remote > /dev/null || ozone-remote &
+# the photo slideshow after some minutes without a key (Files: Screensaver)
+pgrep -f "^/usr/bin/python3 /usr/local/bin/ozone-screensave[r]" > /dev/null || ozone-screensaver &
 # TV timers: starts the TV for recordings and reminders set in its guide
 pgrep -f "^/usr/bin/python3 /usr/local/bin/ozone-tv timer[s]" > /dev/null || ozone-tv timers &
 

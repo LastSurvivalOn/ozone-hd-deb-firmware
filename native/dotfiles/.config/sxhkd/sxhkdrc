@@ -9,6 +9,8 @@ super + w
     ozone-web-show
 super + t
     ozone-tv
+super + e
+    ozone-files
 super + shift + e
     ozone-power
 super + Escape

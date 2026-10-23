@@ -8,7 +8,8 @@ are mounted whenever the network is up, and come back by themselves after the se
 network was away.
 
   ozone-media              the panel's indicator
-  ozone-media menu         the drives and folders: eject, open in a terminal, add a network folder
+  ozone-media menu         the drives and folders: eject, open in Files or a terminal, add a network
+                           folder
   ozone-media daemon       the daemon (root)
   ozone-media eject PATH   unmount PATH and everything else on its drive (root)
   ozone-media forget PATH  unmount a network folder and forget it (or by its name; root)
@@ -586,12 +587,14 @@ def menu():
         return
     for label, point, drive in items:
         if label == choice:
-            what = rofi(os.path.basename(point), ['  Open in a terminal',
+            what = rofi(os.path.basename(point), ['  Open in Files', '  Open in a terminal',
                                                    '  Eject' if drive else '  Disconnect',
                                                    ] + ([] if drive else ['  Forget this folder']))
             if what is None:
                 return
-            if 'terminal' in what:
+            if 'Files' in what:
+                subprocess.Popen(['ozone-files', point])
+            elif 'terminal' in what:
                 subprocess.Popen(['ozone-terminal', '--working-directory=' + point])
             elif 'Forget' in what:
                 subprocess.run(['sudo', '-n', sys.argv[0], 'forget', point])

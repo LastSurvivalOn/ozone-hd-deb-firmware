@@ -1,0 +1,916 @@
+#!/usr/bin/python3
+"""ozone-files: videos, music and photos on the box, USB drives, SD cards and network folders,
+for the remote.
+
+  ozone-files [FOLDER]     the window: places on the left, a folder's files on the right
+  ozone-files --screensaver   the photo slideshow (or a clock) until a key or the mouse moves;
+                              started by ozone-screensaver when nothing has been done for a while
+
+Videos play in amplay (the hardware decoder; mpv for what it can't decode), from where they were
+left, with the audio track and subtitles chosen last time; a .srt next to a video is shown too.
+Music plays here, in the background of the window (mpv without video, ao=sdl: see CLAUDE.md), the
+whole folder from the track chosen. Photos open full-screen: one at a time, or a slideshow.
+
+Kept in ~/.local/share/ozone-files: state.json (where each video was left, its tracks; the last
+folder). The screensaver's settings: ~/.config/ozone/screensaver.json (the settings here).
+"""
+import ctypes
+import json
+import os
+import signal
+import random
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('Gdk', '3.0')
+gi.require_version('GdkPixbuf', '2.0')
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango  # noqa: E402
+
+HOME = os.path.expanduser('~')
+DATA = os.path.join(os.environ.get('XDG_DATA_HOME') or os.path.join(HOME, '.local/share'), 'ozone-files')
+STATE = os.path.join(DATA, 'state.json')
+SAVER_CONF = os.path.join(HOME, '.config/ozone/screensaver.json')
+RUNTIME = os.environ.get('XDG_RUNTIME_DIR') or '/tmp'
+MPV_SOCK = os.path.join(RUNTIME, 'ozone-files-mpv-%d.sock' % os.getuid())
+MEDIA = '/media'
+NAND = '/mnt/nand/linux'
+
+VIDEO = {'mkv', 'mp4', 'm4v', 'avi', 'mov', 'ts', 'm2ts', 'mts', 'webm', 'mpg', 'mpeg', 'vob', 'flv', 'wmv',
+         '3gp', 'ogv', 'divx', 'xvid'}
+AUDIO = {'mp3', 'flac', 'ogg', 'oga', 'opus', 'm4a', 'aac', 'wav', 'wma', 'ape', 'aiff', 'aif', 'mka', 'ac3', 'dts'}
+IMAGE = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff'}
+SUBS = {'srt', 'ass', 'ssa', 'vtt'}
+# FontAwesome 4
+ICONS = {'folder': '', 'video': '', 'audio': '', 'image': '', 'file': '',
+         'up': '', 'usb': '', 'net': '', 'home': '', 'drive': '', 'tv': '',
+         'download': ''}
+SAVER_DEFAULTS = {'enabled': True, 'minutes': 10, 'folder': os.path.join(HOME, 'Pictures'), 'seconds': 8}
+RESUME_MIN = 30   # s: videos stopped before this, or this close to the end, start from the beginning
+
+CSS = b"""
+* { font-family: "DejaVu Sans"; font-size: 13px; color: #cdd6f4; }
+window, dialog, scrolledwindow, list, viewport { background: #11111b; }
+.header { padding: 10px 16px; }
+.logo { font-family: "FontAwesome"; font-size: 24px; color: #cba6f7; }
+.heading { font-size: 18px; font-weight: bold; }
+.path { color: #7f849c; }
+.places { border-right: 1px solid #313244; }
+row { padding: 6px 12px; outline: none; }
+row:selected { background: #313244; }
+.icon { font-family: "FontAwesome"; font-size: 18px; color: #cba6f7; min-width: 28px; }
+.icon.video { color: #89b4fa; }
+.icon.audio { color: #a6e3a1; }
+.icon.image { color: #f9e2af; }
+.name { font-size: 15px; }
+.place { font-size: 15px; font-weight: bold; }
+.detail { color: #7f849c; font-size: 12px; }
+.resume { color: #f9e2af; font-size: 12px; }
+.empty { color: #7f849c; font-size: 15px; padding: 40px; }
+.hint { color: #7f849c; font-size: 12px; }
+.playing { background: #1e1e2e; border-top: 1px solid #313244; padding: 8px 16px; }
+.track { font-size: 15px; font-weight: bold; }
+button { background: #1e1e2e; border: 1px solid #313244; border-radius: 16px; padding: 4px 14px; box-shadow: none; }
+button:hover, button:focus { border-color: #cba6f7; }
+button.ctl { font-family: "FontAwesome"; font-size: 16px; border-radius: 20px; padding: 6px 12px; }
+button.close { font-family: "FontAwesome"; font-size: 16px; background: transparent; border: none;
+               padding: 4px 10px; color: #a6adc8; }
+button.close:hover { background: #f38ba8; color: #11111b; }
+progressbar trough { min-height: 4px; background: #313244; border: none; border-radius: 2px; }
+progressbar progress { min-height: 4px; background: #a6e3a1; border: none; border-radius: 2px; }
+menu, .menu { background: #1e1e2e; border: 1px solid #45475a; padding: 4px 0; }
+menuitem { padding: 6px 16px; }
+menuitem:hover { background: #313244; }
+entry, spinbutton { background: #1e1e2e; border: 1px solid #313244; border-radius: 6px; padding: 4px 8px; }
+switch { background: #313244; border-radius: 12px; }
+switch:checked { background: #cba6f7; }
+.viewer { background: #000000; }
+.caption { background: rgba(17, 17, 27, 0.85); padding: 8px 16px; font-size: 15px; }
+.clock { font-size: 96px; font-weight: bold; color: #cdd6f4; }
+.date { font-size: 28px; color: #a6adc8; }
+"""
+
+
+def kind(path):
+    if os.path.isdir(path):
+        return 'folder'
+    ext = path.rsplit('.', 1)[-1].lower() if '.' in os.path.basename(path) else ''
+    return 'video' if ext in VIDEO else 'audio' if ext in AUDIO else 'image' if ext in IMAGE else \
+        'subs' if ext in SUBS else 'file'
+
+
+def natural(name):
+    return [int(t) if t.isdigit() else t.casefold() for t in re.split(r'(\d+)', name)]
+
+
+def human_size(n):
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if n < 1024 or unit == 'TB':
+            return ('%d %s' if unit == 'B' else '%.1f %s') % (n, unit)
+        n /= 1024
+
+
+def clock(t):
+    t = int(t or 0)
+    return '%d:%02d:%02d' % (t // 3600, t // 60 % 60, t % 60) if t >= 3600 else '%d:%02d' % (t // 60, t % 60)
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + '.tmp', 'w') as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(path + '.tmp', path)
+
+
+def saver_settings():
+    s = dict(SAVER_DEFAULTS)
+    s.update(load_json(SAVER_CONF, {}))
+    return s
+
+
+def places():
+    """(label, path, icon): the home folders that exist, TV recordings, the drives and network folders"""
+    out = []
+    for label, sub, icon in (('Videos', 'Videos', 'video'), ('Music', 'Music', 'audio'),
+                             ('Photos', 'Pictures', 'image'), ('Downloads', 'Downloads', 'download')):
+        path = os.path.join(HOME, sub)
+        if os.path.isdir(path):
+            out.append((label, path, icon))
+    for rec in [os.path.join(NAND, 'Recordings')]:
+        if os.path.isdir(rec):
+            out.append(('TV recordings', rec, 'tv'))
+    try:
+        with open('/proc/mounts') as f:
+            mounts = [line.split() for line in f]
+    except OSError:
+        mounts = []
+    for dev, mnt, fs, *_ in mounts:
+        mnt = mnt.replace('\\040', ' ')
+        if mnt.startswith(MEDIA + '/'):
+            net = fs in ('cifs', 'fuse.rclone') or dev.startswith('//')
+            out.append((os.path.basename(mnt), mnt, 'net' if net else 'usb'))
+    out.append(('Home', HOME, 'home'))
+    return out
+
+
+def prepare_label(text='', cls=None, **kw):
+    kw.setdefault('xalign', 0)
+    w = Gtk.Label(label=text, **kw)
+    for c in (cls or '').split():
+        w.get_style_context().add_class(c)
+    return w
+
+
+# ---- music: mpv without video, through its JSON IPC ---------------------------------------------
+
+def die_with_parent():
+    """In the child: the music stops with the window, even when it is killed. SIGKILL: on SIGTERM
+    this mpv hangs on a lock while quitting (SDL's audio thread)"""
+    ctypes.CDLL('libc.so.6').prctl(1, signal.SIGKILL)   # PR_SET_PDEATHSIG
+
+
+class Music:
+    """One mpv for the window's music; None when nothing plays"""
+
+    def __init__(self):
+        self.p = None
+        self.files = []
+
+    def play(self, files, start):
+        self.stop()
+        try:
+            os.unlink(MPV_SOCK)
+        except OSError:
+            pass
+        self.files = files
+        # ao=sdl, never alsa (see mpv.conf); the real mpv: no GPU needed for sound
+        self.p = subprocess.Popen(['/usr/bin/mpv', '--no-video', '--no-terminal', '--ao=sdl', '--idle=no',
+                                   '--input-ipc-server=' + MPV_SOCK, '--playlist-start=%d' % start, '--'] + files,
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  preexec_fn=die_with_parent)
+
+    def running(self):
+        return self.p is not None and self.p.poll() is None
+
+    def stop(self):
+        if self.p and self.p.poll() is None:
+            self.cmd('quit')
+            try:
+                self.p.wait(2)
+            except subprocess.TimeoutExpired:
+                self.p.kill()
+        self.p = None
+
+    def cmd(self, *args):
+        """One command, its reply's data (or None)"""
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(0.5)
+            s.connect(MPV_SOCK)
+            s.sendall(json.dumps({'command': list(args), 'request_id': 1}).encode() + b'\n')
+            buf = b''
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                for line in buf.split(b'\n'):
+                    try:
+                        msg = json.loads(line)
+                    except ValueError:
+                        continue
+                    if msg.get('request_id') == 1:
+                        s.close()
+                        return msg.get('data')
+            s.close()
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def status(self):
+        """(title, artist, position, duration, paused, index)"""
+        title = self.cmd('get_property', 'media-title')
+        artist = self.cmd('get_property', 'metadata/by-key/Artist') or self.cmd('get_property', 'metadata/by-key/ARTIST')
+        return (title, artist, self.cmd('get_property', 'time-pos'), self.cmd('get_property', 'duration'),
+                self.cmd('get_property', 'pause'), self.cmd('get_property', 'playlist-pos'))
+
+
+# ---- the photo viewer and the screensaver ----------------------------------------------------------
+
+class Viewer:
+    """Photos full-screen: one, or a slideshow; also the screensaver (any input ends it)"""
+
+    def __init__(self, files, index, slideshow=False, screensaver=False, on_close=None):
+        self.files, self.index = files, index
+        self.screensaver, self.on_close = screensaver, on_close
+        self.interval = saver_settings()['seconds']
+        self.rotation = {}
+        self.timer = None
+        self.loading = None
+        self.cache = {}
+        self.win = Gtk.Window(title='Photos')
+        self.win.get_style_context().add_class('viewer')
+        self.win.fullscreen()
+        self.win.connect('key-press-event', self.on_key)
+        self.win.connect('destroy', self.closed)
+        overlay = Gtk.Overlay()
+        self.image = Gtk.Image()
+        overlay.add(self.image)
+        self.caption = prepare_label('', 'caption', halign=Gtk.Align.CENTER, valign=Gtk.Align.END,
+                                     margin_bottom=24, ellipsize=Pango.EllipsizeMode.MIDDLE)
+        self.caption.set_no_show_all(True)
+        overlay.add_overlay(self.caption)
+        if screensaver:
+            # every key and the mouse are its own as soon as it is up, whatever has the focus
+            self.win.connect('map-event', self.grab)
+            self.win.add_events(Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
+            self.win.connect('motion-notify-event', self.on_motion)
+            self.win.connect('button-press-event', lambda w, e: self.win.destroy())
+            self.moved = None
+            if not files:   # no photos: a clock that moves about the screen (no burn-in)
+                self.clock = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, halign=Gtk.Align.START,
+                                     valign=Gtk.Align.START)
+                self.time_label = prepare_label('', 'clock')
+                self.date_label = prepare_label('', 'date')
+                self.clock.pack_start(self.time_label, False, False, 0)
+                self.clock.pack_start(self.date_label, False, False, 0)
+                overlay.add_overlay(self.clock)
+                GLib.timeout_add_seconds(1, self.tick_clock)
+                GLib.idle_add(self.tick_clock)
+        self.win.add(overlay)
+        self.pixbuf = None
+        self.win.show_all()
+        Gdk.Window.set_cursor(self.win.get_window(), Gdk.Cursor.new_from_name(Gdk.Display.get_default(), 'none'))
+        if files:
+            self.show(index)
+            if slideshow or screensaver:
+                self.start_slideshow(announce=not screensaver)
+
+    def grab(self, w, ev):
+        seat = Gdk.Display.get_default().get_default_seat()
+        seat.grab(self.win.get_window(), Gdk.SeatCapabilities.ALL, True, None, None, None, None)
+        return False
+
+    def tick_clock(self):
+        self.time_label.set_text(time.strftime('%H:%M'))
+        self.date_label.set_text(time.strftime('%A, %d %B'))
+        if int(time.time()) % 30 == 0 or not self.clock.get_margin_start():
+            w, h = self.win.get_size()
+            self.clock.set_margin_start(random.randint(40, max(41, w - 520)))
+            self.clock.set_margin_top(random.randint(40, max(41, h - 220)))
+        return True
+
+    def on_motion(self, w, ev):
+        # the first motion event comes from the window appearing under the pointer
+        if self.moved is None:
+            self.moved = (ev.x_root, ev.y_root)
+        elif abs(ev.x_root - self.moved[0]) + abs(ev.y_root - self.moved[1]) > 8:
+            self.win.destroy()
+
+    def closed(self, w):
+        if self.timer:
+            GLib.source_remove(self.timer)
+        if self.on_close:
+            self.on_close()
+
+    def load(self, i):
+        """The photo at i, fitted to the screen (decoders scale JPEG while reading: fast)"""
+        path = self.files[i]
+        if path in self.cache:
+            return self.cache[path]
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 1280, 720, True)
+            pb = pb.apply_embedded_orientation() or pb
+        except GLib.Error:
+            pb = None
+        if len(self.cache) > 4:
+            self.cache.pop(next(iter(self.cache)))
+        self.cache[path] = pb
+        return pb
+
+    def show(self, i):
+        self.index = i % len(self.files)
+        path = self.files[self.index]
+
+        def work(index):
+            pb = self.load(index)
+            nxt = (index + 1) % len(self.files)
+            GLib.idle_add(self.shown, index, pb)
+            self.load(nxt)   # ready for the next one
+        threading.Thread(target=work, args=(self.index,), daemon=True).start()
+        if not self.screensaver:
+            self.caption.set_text('%d / %d   %s' % (self.index + 1, len(self.files), os.path.basename(path)))
+
+    def shown(self, index, pb):
+        if index != self.index:
+            return False
+        rot = self.rotation.get(self.files[index], 0)
+        if pb and rot:
+            pb = pb.rotate_simple(rot)
+        if pb:   # to the screen, keeping its shape (a rotated photo is the other way round)
+            w, h = self.win.get_size()
+            scale = min(w / pb.get_width(), h / pb.get_height())
+            if abs(scale - 1) > 0.01:
+                pb = pb.scale_simple(max(1, int(pb.get_width() * scale)), max(1, int(pb.get_height() * scale)),
+                                     GdkPixbuf.InterpType.BILINEAR)
+        self.pixbuf = pb
+        self.image.set_from_pixbuf(pb)
+        return False
+
+    def start_slideshow(self, announce=True):
+        if self.timer:
+            GLib.source_remove(self.timer)
+            self.timer = None
+            self.flash('Slideshow stopped')
+            return
+        self.timer = GLib.timeout_add_seconds(self.interval, self.next_slide)
+        if announce:
+            self.flash('Slideshow: a photo every %d s   (OK stops it)' % self.interval)
+
+    def next_slide(self):
+        if self.screensaver and len(self.files) > 1:
+            self.show(random.randrange(len(self.files)))
+        else:
+            self.show(self.index + 1)
+        return True
+
+    def flash(self, text):
+        self.caption.set_text(text)
+        self.caption.show()
+        GLib.timeout_add_seconds(3, self.caption_back)
+
+    def caption_back(self):
+        if self.screensaver:
+            self.caption.hide()
+        else:
+            self.caption.set_text('%d / %d   %s' % (self.index + 1, len(self.files),
+                                                     os.path.basename(self.files[self.index])))
+        return False
+
+    def on_key(self, w, ev):
+        if self.screensaver:   # any key: back to what was there
+            self.win.destroy()
+            return True
+        k = Gdk.keyval_name(ev.keyval) or ''
+        if k in ('Escape', 'BackSpace', 'q'):
+            self.win.destroy()
+        elif k in ('Right', 'Page_Down', 'space', 'AudioNext'):
+            self.show(self.index + 1)
+        elif k in ('Left', 'Page_Up', 'AudioPrev', 'AudioRewind'):
+            self.show(self.index - 1)
+        elif k in ('Return', 'KP_Enter', 'AudioPlay', 'AudioPause'):
+            self.start_slideshow()
+        elif k in ('Up', 'Down'):
+            path = self.files[self.index]
+            self.rotation[path] = (self.rotation.get(path, 0) + (90 if k == 'Up' else 270)) % 360
+            self.shown(self.index, self.load(self.index))
+        elif k in ('i', 'Tools', 'Menu', 'F2'):
+            if self.caption.get_visible():
+                self.caption.hide()
+            else:
+                pb = self.pixbuf
+                path = self.files[self.index]
+                st = os.stat(path)
+                self.caption.set_text('%s   %s   %s   %s' % (os.path.basename(path), human_size(st.st_size),
+                                                          time.strftime('%d.%m.%Y %H:%M', time.localtime(st.st_mtime)),
+                                                          '%dx%d shown' % (pb.get_width(), pb.get_height()) if pb else ''))
+                self.caption.show()
+        return True
+
+
+def photos_in(folder, limit=2000):
+    """The photos under folder, a few levels down (for the screensaver)"""
+    out = []
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        if root[len(folder):].count(os.sep) > 4:
+            dirs[:] = []
+        out += [os.path.join(root, f) for f in files if kind(f) == 'image']
+        if len(out) >= limit:
+            break
+    return out
+
+
+def screensaver():
+    s = saver_settings()
+    files = photos_in(s['folder']) if os.path.isdir(s['folder']) else []
+    random.shuffle(files)
+    Viewer(files, 0, screensaver=True, on_close=Gtk.main_quit)
+    Gtk.main()
+    return 0
+
+
+# ---- the window -----------------------------------------------------------------------------------
+
+class Window:
+    def __init__(self, folder):
+        self.state = load_json(STATE, {'resume': {}, 'last': None})
+        self.state.setdefault('resume', {})
+        self.music = Music()
+        self.viewer = None
+        self.busy = False
+        self.typed = ''
+        self.win = Gtk.Window(title='Files')
+        self.win.set_default_size(1280, 720)
+        self.win.connect('destroy', self.quit)
+        self.win.connect('key-press-event', self.on_key)
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        header = Gtk.Box(spacing=12)
+        header.get_style_context().add_class('header')
+        header.pack_start(prepare_label('', 'logo'), False, False, 0)
+        header.pack_start(prepare_label('Files', 'heading'), False, False, 0)
+        self.path_label = prepare_label('', 'path', ellipsize=Pango.EllipsizeMode.START)
+        header.pack_start(self.path_label, True, True, 0)
+        settings = Gtk.Button(label='Screensaver')
+        settings.connect('clicked', lambda w: GLib.idle_add(lambda: self.saver_dialog() and False))
+        header.pack_start(settings, False, False, 0)
+        close = Gtk.Button(label='', tooltip_text='Close')
+        close.get_style_context().add_class('close')
+        close.connect('clicked', lambda w: self.win.destroy())
+        header.pack_start(close, False, False, 0)
+        top.pack_start(header, False, False, 0)
+
+        body = Gtk.Box()
+        left = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        left.set_size_request(300, -1)
+        left.get_style_context().add_class('places')
+        self.places = Gtk.ListBox()
+        self.places.connect('row-activated', lambda lb, row: self.open_folder(row.path, focus=True))
+        self.places.connect('row-selected', lambda lb, row: row and self.open_folder(row.path))
+        left.add(self.places)
+        body.pack_start(left, False, False, 0)
+        self.scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.list = Gtk.ListBox(activate_on_single_click=False)
+        self.list.connect('row-activated', lambda lb, row: self.activate(row))
+        self.list.connect('button-press-event', self.on_click)
+        self.scroll.add(self.list)
+        body.pack_start(self.scroll, True, True, 0)
+        top.pack_start(body, True, True, 0)
+
+        # the music playing, with its buttons (the remote reaches them with the arrows)
+        self.bar = Gtk.Box(spacing=12)
+        self.bar.get_style_context().add_class('playing')
+        self.bar.set_no_show_all(True)
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.track = prepare_label('', 'track', ellipsize=Pango.EllipsizeMode.END)
+        self.track_detail = prepare_label('', 'detail', ellipsize=Pango.EllipsizeMode.END)
+        self.progress = Gtk.ProgressBar()
+        for w in (self.track, self.track_detail, self.progress):
+            info.pack_start(w, False, False, 0)
+        self.bar.pack_start(info, True, True, 0)
+        self.buttons = []
+        for icon, tip, action in (('', 'Previous', lambda: self.music.cmd('playlist-prev')),
+                                  ('', 'Back 10 s', lambda: self.music.cmd('seek', -10)),
+                                  ('', 'Pause', lambda: self.music.cmd('cycle', 'pause')),
+                                  ('', 'Forward 10 s', lambda: self.music.cmd('seek', 10)),
+                                  ('', 'Next', lambda: self.music.cmd('playlist-next')),
+                                  ('', 'Stop', self.stop_music)):
+            b = Gtk.Button(label=icon, tooltip_text=tip)
+            b.get_style_context().add_class('ctl')
+            b.connect('clicked', lambda w, a=action: (a(), self.update_music()))
+            self.bar.pack_start(b, False, False, 0)
+            self.buttons.append(b)
+        for w in [info] + self.buttons:
+            w.show_all()
+        top.pack_start(self.bar, False, False, 0)
+        self.hint = prepare_label('OK: open   ← →: places / files   blue (Menu): the file\'s menu   pause: the music   '
+                                  'exit: up a folder, close', 'hint', margin_start=16, margin_bottom=6)
+        top.pack_start(self.hint, False, False, 0)
+        self.win.add(top)
+        self.fill_places()
+        self.win.show_all()
+        self.folder = None
+        start = folder or self.state.get('last')
+        self.open_folder(start if start and os.path.isdir(start) else (places()[0][1]), focus=bool(folder))
+        GLib.timeout_add_seconds(1, self.update_music)
+        GLib.timeout_add_seconds(5, self.refresh_places)
+
+    # places and folders
+
+    def fill_places(self):
+        for r in self.places.get_children():
+            r.destroy()
+        self.place_list = places()
+        for label, path, icon in self.place_list:
+            row = Gtk.ListBoxRow()
+            row.path = path
+            box = Gtk.Box(spacing=10)
+            box.pack_start(prepare_label(ICONS.get(icon, ICONS['folder']), 'icon'), False, False, 0)
+            box.pack_start(prepare_label(label, 'place', ellipsize=Pango.EllipsizeMode.END), True, True, 0)
+            row.add(box)
+            self.places.add(row)
+        self.places.show_all()
+
+    def refresh_places(self):
+        """A drive plugged in or out"""
+        if [p[1] for p in places()] != [p[1] for p in self.place_list]:
+            self.fill_places()
+            if self.folder and not os.path.isdir(self.folder):
+                self.open_folder(HOME)
+        return True
+
+    def open_folder(self, path, focus=False, select=None):
+        if path == self.folder and not focus and select is None:
+            return
+        self.folder = path
+        self.state['last'] = path
+        self.path_label.set_text(path)
+        for r in self.list.get_children():
+            r.destroy()
+        self.rows = []
+        try:
+            names = [n for n in os.listdir(path) if not n.startswith('.')]
+        except OSError as e:
+            names = []
+            self.empty('Can\'t open this folder: %s' % e.strerror)
+        entries = []
+        for n in names:
+            full = os.path.join(path, n)
+            k = kind(full)
+            if k == 'subs':
+                continue
+            entries.append((k != 'folder', natural(n), n, full, k))
+        entries.sort()
+        parent = os.path.dirname(path.rstrip('/'))
+        if path not in [p[1] for p in places()] and parent and parent != path:
+            self.add_row(parent, 'up', '..', 'up a folder')
+        for _f, _s, n, full, k in entries:
+            self.add_row(full, k, n, None)
+        if not entries and names is not None and not self.rows:
+            self.empty('Nothing here')
+        self.list.show_all()
+        index = next((i for i, r in enumerate(self.rows) if r.path == select), 0)
+        if self.rows:
+            self.list.select_row(self.rows[index])
+            if focus:
+                self.rows[index].grab_focus()
+        self.scroll.get_vadjustment().set_value(0)
+
+    def empty(self, text):
+        row = Gtk.ListBoxRow(selectable=False, activatable=False)
+        row.add(prepare_label(text, 'empty', wrap=True))
+        self.list.add(row)
+
+    def add_row(self, path, k, name, detail):
+        row = Gtk.ListBoxRow()
+        row.path, row.kind = path, k
+        box = Gtk.Box(spacing=12)
+        icon = prepare_label(ICONS.get(k, ICONS['file']), 'icon ' + k)
+        box.pack_start(icon, False, False, 0)
+        info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        info.pack_start(prepare_label(name, 'name', ellipsize=Pango.EllipsizeMode.MIDDLE), False, False, 0)
+        if detail is None and k != 'folder':
+            try:
+                st = os.stat(path)
+                detail = '%s · %s' % (human_size(st.st_size), time.strftime('%d.%m.%Y', time.localtime(st.st_mtime)))
+            except OSError:
+                detail = ''
+        if detail:
+            info.pack_start(prepare_label(detail, 'detail'), False, False, 0)
+        r = self.state['resume'].get(path)
+        if k == 'video' and r and r.get('position', 0) > RESUME_MIN:
+            info.pack_start(prepare_label('Stopped at %s of %s' % (clock(r['position']), clock(r.get('duration'))),
+                                          'resume'), False, False, 0)
+        box.pack_start(info, True, True, 0)
+        row.add(box)
+        self.list.add(row)
+        self.rows.append(row)
+
+    def files_of(self, k):
+        return [r.path for r in self.rows if r.kind == k]
+
+    # opening
+
+    def activate(self, row, from_start=False):
+        if row.kind in ('folder', 'up'):
+            self.open_folder(row.path, focus=True, select=self.folder if row.kind == 'up' else None)
+        elif row.kind == 'video':
+            self.play_video(row.path, from_start)
+        elif row.kind == 'audio':
+            files = self.files_of('audio')
+            self.music.play(files, files.index(row.path))
+            self.bar.show()
+            GLib.timeout_add(600, self.update_music)
+        elif row.kind == 'image':
+            self.view_photos(row.path)
+        else:
+            self.flash('Not a video, music or photo')
+
+    def view_photos(self, path, slideshow=False):
+        files = self.files_of('image')
+        self.viewer = Viewer(files, files.index(path), slideshow=slideshow, on_close=self.viewer_closed)
+
+    def viewer_closed(self):
+        self.viewer = None
+        self.win.present()
+
+    def play_video(self, path, from_start=False):
+        if self.busy:
+            return
+        self.busy = True
+        r = self.state['resume'].get(path, {})
+        args = ['amplay', '--report', '--title', os.path.splitext(os.path.basename(path))[0]]
+        pos = r.get('position', 0)
+        if not from_start and RESUME_MIN < pos < (r.get('duration') or 0) - RESUME_MIN:
+            args += ['--start', '%.1f' % pos]
+        if 'aid' in r:
+            args += ['--aid', str(r['aid'])]
+        if 'sid' in r:
+            args += ['--sid', str(r['sid'])]
+        args += ['--repeat', str(r.get('repeat', self.state.get('repeat', 0)))]
+        if self.music.running():
+            self.music.cmd('set_property', 'pause', True)
+        self.win.hide()
+
+        def run():
+            p = subprocess.run(args + [path], capture_output=True, text=True)
+            report = dict(line.split(' ', 1) for line in p.stdout.splitlines() if ' ' in line)
+            if p.returncode == 3:   # no hardware decoder for it: mpv, in software
+                subprocess.call(['amplay', '--reset'])
+                subprocess.call(['mpv', '--fs', path])
+            else:
+                subprocess.call(['amplay', '--reset'])
+            GLib.idle_add(self.video_done, path, report)
+        threading.Thread(target=run, daemon=True).start()
+
+    def video_done(self, path, report):
+        self.busy = False
+        self.win.show()
+        self.win.present()
+        try:
+            pos, dur = float(report.get('position', 0)), float(report.get('duration', 0))
+            ended, repeat = report.get('ended') == '1', int(report.get('repeat', 0))
+            entry = {'position': 0 if ended else pos, 'duration': dur, 'aid': int(report.get('aid', 0)),
+                     'sid': int(report.get('sid', -1)), 'repeat': repeat, 'at': time.time()}
+            self.state['resume'][path] = entry
+            self.state['repeat'] = repeat
+            # old entries go: the 500 most recent are kept
+            if len(self.state['resume']) > 500:
+                for k in sorted(self.state['resume'], key=lambda k: self.state['resume'][k].get('at', 0))[:100]:
+                    del self.state['resume'][k]
+            save_json(STATE, self.state)
+        except (ValueError, KeyError):
+            ended, repeat = False, 0
+        self.open_folder(self.folder, focus=True, select=path)
+        if ended and repeat == 2:   # repeat all: the next video of the folder, round
+            videos = self.files_of('video')
+            if path in videos:
+                nxt = videos[(videos.index(path) + 1) % len(videos)]
+                self.state['resume'].pop(nxt, None)
+                GLib.timeout_add(500, lambda: self.play_video(nxt, True) and False)
+        return False
+
+    # music
+
+    def update_music(self):
+        if not self.music.running():
+            if self.bar.get_visible() and self.music.p is not None:
+                self.music.p = None
+                self.bar.hide()
+            return True
+        title, artist, pos, dur, paused, index = self.music.status()
+        if title is None:
+            return True
+        n = len(self.music.files)
+        self.track.set_text(('⏸  ' if paused else '') + str(title))
+        self.track_detail.set_text('%s%s%s / %s   ·   %s of %d' % (artist or '', '   ·   ' if artist else '', clock(pos),
+                                                                    clock(dur), (index or 0) + 1, n))
+        self.progress.set_fraction(min(1, (pos or 0) / dur) if dur else 0)
+        self.buttons[2].set_label('' if paused else '')
+        return True
+
+    def stop_music(self):
+        self.music.stop()
+        self.bar.hide()
+
+    # menus and dialogs
+
+    def flash(self, text):
+        self.path_label.set_text(text)
+        GLib.timeout_add_seconds(3, lambda: self.path_label.set_text(self.folder or '') and False)
+
+    def on_click(self, w, ev):
+        if ev.button == 3:
+            row = self.list.get_row_at_y(int(ev.y))
+            if row and hasattr(row, 'kind'):
+                self.list.select_row(row)
+                self.menu(row)
+            return True
+        return False
+
+    def menu(self, row):
+        items = []
+        if row.kind == 'video':
+            items += [('Play', lambda: self.activate(row)), ('Play from the start', lambda: self.activate(row, True))]
+        elif row.kind == 'audio':
+            items += [('Play from here (the whole folder)', lambda: self.activate(row))]
+        elif row.kind == 'image':
+            items += [('View', lambda: self.activate(row)), ('Slideshow from here', lambda: self.view_photos(row.path, True)),
+                      ('Use this folder for the screensaver', lambda: self.saver_folder(os.path.dirname(row.path)))]
+        elif row.kind == 'folder':
+            items += [('Open', lambda: self.activate(row)),
+                      ('Use for the screensaver\'s photos', lambda: self.saver_folder(row.path))]
+        if row.kind != 'up':
+            items += [None, ('Delete…', lambda: self.delete(row))]
+        m = Gtk.Menu()
+        for item in items:
+            if item is None:
+                m.append(Gtk.SeparatorMenuItem())
+                continue
+            mi = Gtk.MenuItem(label=item[0])
+            # the action once the menu is gone: a dialog run from its handler would get no clicks
+            mi.connect('activate', lambda w, a=item[1]: GLib.idle_add(lambda: a() and False))
+            m.append(mi)
+        m.show_all()
+        self._menu = m
+        m.attach_to_widget(self.win)
+        m.popup_at_widget(row, Gdk.Gravity.SOUTH_WEST, Gdk.Gravity.NORTH_WEST, None)
+        m.select_first(False)
+
+    def confirm(self, text):
+        d = Gtk.MessageDialog(transient_for=self.win, modal=True, message_type=Gtk.MessageType.QUESTION,
+                              buttons=Gtk.ButtonsType.OK_CANCEL, text=text)
+        r = d.run()
+        d.destroy()
+        return r == Gtk.ResponseType.OK
+
+    def delete(self, row):
+        name = os.path.basename(row.path)
+        what = 'the folder "%s" and everything in it' % name if row.kind == 'folder' else '"%s"' % name
+        if not self.confirm('Delete %s?' % what):
+            return
+        try:
+            if row.kind == 'folder':
+                shutil.rmtree(row.path)
+            else:
+                os.unlink(row.path)
+                base = os.path.splitext(row.path)[0]
+                for ext in ('.srt', '.ass', '.json'):   # its subtitles, a TV recording's description
+                    if os.path.exists(base + ext):
+                        os.unlink(base + ext)
+            self.state['resume'].pop(row.path, None)
+            save_json(STATE, self.state)
+        except OSError as e:
+            self.flash('Not deleted: %s' % e.strerror)
+        self.open_folder(self.folder, focus=True)
+
+    def saver_folder(self, path):
+        s = saver_settings()
+        s['folder'] = path
+        save_json(SAVER_CONF, s)
+        self.flash('Screensaver photos: %s' % path)
+
+    def saver_dialog(self):
+        s = saver_settings()
+        d = Gtk.Dialog(title='Screensaver', transient_for=self.win, modal=True)
+        d.add_buttons('Try it', 1, 'Close', Gtk.ResponseType.CLOSE)
+        g = Gtk.Grid(column_spacing=16, row_spacing=10, border_width=16)
+        d.get_content_area().add(g)
+        on = Gtk.Switch(active=s['enabled'], halign=Gtk.Align.START)
+        minutes = Gtk.SpinButton.new_with_range(1, 120, 1)
+        minutes.set_value(s['minutes'])
+        seconds = Gtk.SpinButton.new_with_range(2, 120, 1)
+        seconds.set_value(s['seconds'])
+        folder = Gtk.Entry(text=s['folder'], hexpand=True)
+        rows = (('On', on), ('After this many minutes without a key', minutes), ('Each photo for (s)', seconds),
+                ('Photos from', folder))
+        for n, (text, w) in enumerate(rows):
+            g.attach(prepare_label(text), 0, n, 1, 1)
+            g.attach(w, 1, n, 1, 1)
+        g.attach(prepare_label('Not while a video, music or a game plays. Without photos in the folder it is a '
+                               'clock. The blue key on a folder or a photo chooses the folder too.', 'hint',
+                               wrap=True, max_width_chars=60), 0, len(rows), 2, 1)
+        d.show_all()
+        while True:
+            r = d.run()
+            s.update(enabled=on.get_active(), minutes=minutes.get_value_as_int(), seconds=seconds.get_value_as_int(),
+                     folder=folder.get_text().strip() or SAVER_DEFAULTS['folder'])
+            save_json(SAVER_CONF, s)
+            if r != 1:
+                break
+            d.hide()
+            subprocess.Popen([sys.argv[0], '--screensaver'])
+            break
+        d.destroy()
+
+    # keys
+
+    def on_key(self, w, ev):
+        k = Gdk.keyval_name(ev.keyval) or ''
+        focus = self.win.get_focus()
+        in_list = focus is not None and focus.get_parent() is self.list
+        in_places = focus is not None and focus.get_parent() is self.places
+        if k in ('AudioPlay', 'AudioPause', 'space') and self.music.running() and not isinstance(focus, Gtk.Button):
+            self.music.cmd('cycle', 'pause')
+            self.update_music()
+            return True
+        if k == 'AudioStop' and self.music.running():
+            self.stop_music()
+            return True
+        if k == 'AudioRewind' and self.music.running():
+            self.music.cmd('seek', -10)
+            return True
+        if k in ('Menu', 'F2', 'Launch4') and in_list:
+            self.menu(focus)
+            return True
+        if k == 'Right' and in_places:
+            row = self.list.get_selected_row() or (self.rows[0] if self.rows else None)
+            if row:
+                row.grab_focus()
+            return True
+        if k == 'Left' and in_list:
+            row = self.places.get_selected_row()
+            (row or self.places).grab_focus()
+            return True
+        if k in ('Escape', 'BackSpace'):   # exit: up a folder, then the places, then close
+            parent = os.path.dirname(self.folder.rstrip('/'))
+            if in_list and self.folder not in [p[1] for p in self.place_list] and parent:
+                self.open_folder(parent, focus=True, select=self.folder)
+            elif in_list:
+                (self.places.get_selected_row() or self.places).grab_focus()
+            else:
+                self.win.destroy()
+            return True
+        return False
+
+    def quit(self, w):
+        self.music.stop()
+        save_json(STATE, self.state)
+        Gtk.main_quit()
+
+
+def main(argv):
+    GLib.set_prgname('ozone-files')
+    # GTK's CSS parser loses the first number of the first stylesheet to a stale errno (see yt)
+    try:
+        Gtk.CssProvider().load_from_data(b'* { padding: 0px; }')
+    except GLib.Error:
+        pass
+    css = Gtk.CssProvider()
+    css.load_from_data(CSS)
+    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    if argv[1:2] == ['--screensaver']:
+        return screensaver()
+    if argv[1:] and not os.path.isdir(argv[1]):
+        sys.exit(__doc__)
+    Window(argv[1] if argv[1:] else None)
+    Gtk.main()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

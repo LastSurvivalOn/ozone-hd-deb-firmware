@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Files
+Comment=Videos, music and photos on the box, USB drives and network folders
+Exec=ozone-files
+Icon=folder
+Terminal=false
+Categories=AudioVideo;Utility;
