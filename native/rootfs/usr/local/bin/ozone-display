@@ -1,0 +1,179 @@
+#!/usr/bin/python3
+"""ozone-display: the picture and sound output, in a menu for the remote.
+
+  ozone-display               the menu (rofi)
+  ozone-display set KEY VALUE (root) change a setting and apply it
+  ozone-display get KEY
+
+The settings are in /etc/ozone/display, which set-mode, sound-config and amplay read:
+  MODE=auto|1080p|1080p50hz|720p|...|576cvbs|480cvbs   the output (auto: as u-boot picks it)
+  MATCH_RATE=0|1      amplay switches to the 50 or 60 Hz mode of a video's frame rate while it plays
+  SOUND=auto|hdmi|analog                               where the sound goes
+  PASSTHROUGH=off|auto|on   AC-3 and DTS to the HDMI receiver as they are (auto: what its EDID lists)
+  EQ=0|1              the equalizer (ozone-equalizer)
+A new picture mode has to be kept within 15 s, or the old one comes back: a TV that can't show
+it would otherwise leave nothing on the screen to go back with.
+"""
+import os
+import subprocess
+import sys
+
+CONF = '/etc/ozone/display'
+LIB = '/usr/local/lib/ozone'
+MODE_FILE = '/sys/class/display/mode'
+CAP = '/sys/class/amhdmitx/amhdmitx0/disp_cap'
+DEFAULTS = {'MODE': 'auto', 'MATCH_RATE': '0', 'SOUND': 'auto', 'PASSTHROUGH': 'off', 'EQ': '0'}
+LABELS = {
+    '1080p': '1080p 60 Hz', '1080p50hz': '1080p 50 Hz', '1080i': '1080i 60 Hz', '1080i50hz': '1080i 50 Hz',
+    '720p': '720p 60 Hz', '720p50hz': '720p 50 Hz', '576p': '576p 50 Hz', '480p': '480p 60 Hz',
+    '576i': '576i 50 Hz', '480i': '480i 60 Hz',
+    '576cvbs': 'Analog, PAL (576i 50 Hz)', '480cvbs': 'Analog, NTSC (480i 60 Hz)',
+}
+SOUNDS = {'auto': 'Auto: HDMI, or the analog jack with analog video', 'hdmi': 'HDMI', 'analog': 'Analog jack (AV)'}
+PASSTHROUGHS = {'off': 'PCM: the box decodes everything', 'auto': 'Auto: AC-3 / DTS as they are, if the TV or receiver takes them',
+                'on': 'Always AC-3 / DTS as they are (for an AV receiver; not tried on one yet)'}
+ICON = ''   # FontAwesome tv
+
+
+def load():
+    s = dict(DEFAULTS)
+    try:
+        with open(CONF) as f:
+            for line in f:
+                k, _, v = line.strip().partition('=')
+                if k in s:
+                    s[k] = v.strip('"\'')
+    except OSError:
+        pass
+    return s
+
+
+def save(s):
+    tmp = CONF + '.tmp'
+    with open(tmp, 'w') as f:
+        f.write('# The picture and sound output: ozone-display writes this (see its help)\n')
+        for k in DEFAULTS:
+            f.write('%s=%s\n' % (k, s[k]))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, CONF)
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ''
+
+
+def modes():
+    """The modes the TV says it takes (EDID), then the analog ones"""
+    out = []
+    for line in read(CAP).split('\n'):
+        m = line.strip().rstrip('*')
+        if m and m in LABELS and m not in out:
+            out.append(m)
+    return out + ['576cvbs', '480cvbs']
+
+
+def label(mode):
+    return LABELS.get(mode, mode)
+
+
+def set_root(key, value):
+    """As root: change the setting and apply it"""
+    s = load()
+    if key not in s:
+        sys.exit('unknown setting %s' % key)
+    s[key] = value
+    save(s)
+    if key == 'MODE':
+        args = ['--now'] if value == 'auto' else [value]
+        subprocess.call([LIB + '/set-mode'] + args)
+    elif key in ('SOUND', 'EQ'):
+        subprocess.call([LIB + '/sound-config'])
+    return 0
+
+
+def rofi(prompt, items, selected=0, timeout=None):
+    cmd = ['rofi', '-dmenu', '-i', '-format', 'i', '-p', prompt, '-selected-row', str(selected),
+           '-theme-str', 'listview { lines: %d; }' % min(len(items), 12)]
+    if timeout:
+        cmd = ['timeout', str(timeout)] + cmd
+    r = subprocess.run(cmd, input='\n'.join(items), capture_output=True, text=True)
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        return None
+
+
+def sudo_set(key, value):
+    return subprocess.call(['sudo', '-n', sys.argv[0], 'set', key, value]) == 0
+
+
+def choose_mode(s):
+    options = ['auto'] + modes()
+    items = ['Auto: as at power-on (%s now)' % label(read(MODE_FILE))] + [label(m) for m in options[1:]]
+    cur = options.index(s['MODE']) if s['MODE'] in options else 0
+    i = rofi(ICON + '  Resolution', items, cur)
+    if i is None or options[i] == s['MODE']:
+        return
+    old = s['MODE']
+    sudo_set('MODE', options[i])
+    keep = rofi('Keep this picture? It goes back in 15 s', ['Keep it', 'Go back'], 1, timeout=15)
+    if keep != 0:
+        sudo_set('MODE', old)
+
+
+def menu():
+    while True:
+        s = load()
+        mode_now = read(MODE_FILE)
+        items = [
+            'Resolution: %s' % ('Auto (%s)' % label(mode_now) if s['MODE'] == 'auto' else label(s['MODE'])),
+            'Match the frame rate of videos (50 / 60 Hz): %s' % ('on' if s['MATCH_RATE'] == '1' else 'off'),
+            'Sound output: %s' % SOUNDS.get(s['SOUND'], s['SOUND']).split(':')[0],
+            'Digital sound: %s' % PASSTHROUGHS.get(s['PASSTHROUGH'], s['PASSTHROUGH']).split(':')[0],
+            'Equalizer…',
+            'Screen edges (overscan)…',
+        ]
+        i = rofi(ICON + '  Display and sound', items)
+        if i is None:
+            return 0
+        if i == 0:
+            choose_mode(s)
+        elif i == 1:
+            sudo_set('MATCH_RATE', '0' if s['MATCH_RATE'] == '1' else '1')
+        elif i == 2:
+            keys = list(SOUNDS)
+            j = rofi('Sound output', [SOUNDS[k] for k in keys], keys.index(s['SOUND']) if s['SOUND'] in keys else 0)
+            if j is not None:
+                sudo_set('SOUND', keys[j])
+        elif i == 3:
+            keys = list(PASSTHROUGHS)
+            j = rofi('Digital sound', [PASSTHROUGHS[k] for k in keys],
+                     keys.index(s['PASSTHROUGH']) if s['PASSTHROUGH'] in keys else 0)
+            if j is not None:
+                sudo_set('PASSTHROUGH', keys[j])
+        elif i == 4:
+            return os.execvp('ozone-equalizer', ['ozone-equalizer'])
+        elif i == 5:
+            return os.execvp('ozone-screen', ['ozone-screen'])
+
+
+def main(argv):
+    if len(argv) > 1 and argv[1] == 'set' and len(argv) == 4:
+        if os.geteuid() != 0:
+            os.execvp('sudo', ['sudo', '-n', argv[0]] + argv[1:])
+        return set_root(argv[2], argv[3])
+    if len(argv) > 1 and argv[1] == 'get' and len(argv) == 3:
+        print(load().get(argv[2], ''))
+        return 0
+    if len(argv) > 1:
+        sys.exit(__doc__)
+    return menu()
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

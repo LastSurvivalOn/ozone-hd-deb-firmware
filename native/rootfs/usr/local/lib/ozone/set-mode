@@ -1,0 +1,89 @@
+#!/bin/sh
+# set-mode [MODE | --boot | --hdmi | --apply]: the video output's mode, and the desktop scaled into it.
+#
+# The desktop is 1280x720 (fb0); the OSD scaler stretches it into the output, inside the margins
+# ozone-screen keeps (/etc/ozone/screen, in 1080p pixels, scaled here to the mode). The mode the
+# viewer chose is MODE= in /etc/ozone/display (ozone-display):
+#   auto            as u-boot picks at power-on: hdmimode= if a TV answers on HDMI, else cvbsmode=
+#   1080p, 720p50hz, 576cvbs...   a mode of /sys/class/display/mode
+#
+#   set-mode MODE    switch to MODE now (amplay matching a video's frame rate, ozone-display)
+#   set-mode --boot  the chosen mode at power-on (ozone-hw)
+#   set-mode --hdmi  a TV turned up on HDMI while the output is analog (hdmi-watch)
+#   set-mode --now   the chosen mode now (ozone-display, for auto)
+#   set-mode --apply the scaler for the current mode again (ozone-screen's margins changed)
+# As root it also points the sound at the output (sound-config: HDMI, or the analog jack with
+# composite video). The video group may run it too: the sysfs files are its (ozone-hw).
+MODE_FILE=/sys/class/display/mode
+FB=/sys/class/graphics/fb0
+HDMI=/sys/class/amhdmitx/amhdmitx0
+CONF=/etc/ozone/display
+
+MODE=auto
+[ -r $CONF ] && . $CONF
+
+cmdline() { sed -n "s/.*$1=\([^ ]*\).*/\1/p" /proc/cmdline; }
+hdmimode=$(cmdline hdmimode); hdmimode=${hdmimode:-1080p}
+cvbsmode=$(cmdline cvbsmode); cvbsmode=${cvbsmode:-576cvbs}
+
+size() {
+    case $1 in
+    1080*) echo 1920 1080 ;;
+    720*) echo 1280 720 ;;
+    576*) echo 720 576 ;;
+    480*) echo 720 480 ;;
+    *) echo 1920 1080 ;;
+    esac
+}
+
+scaler() {
+    set -- $(size "$(cat $MODE_FILE)")
+    w=$1 ht=$2
+    h=0 v=0
+    [ -r /etc/ozone/screen ] && read h v < /etc/ozone/screen
+    case "$h$v" in *[!0-9]*|'') h=0 v=0 ;; esac
+    h=$((h * w / 1920)) v=$((v * ht / 1080))
+    echo 0 > $FB/free_scale
+    echo 0 0 1279 719 > $FB/free_scale_axis
+    echo $h $v $((w - 1 - h)) $((ht - 1 - v)) > $FB/window_axis
+    echo 0x10001 > $FB/free_scale
+}
+
+switch() {
+    if [ "$(cat $MODE_FILE)" != "$1" ]; then
+        echo "$1" > $MODE_FILE || exit 1
+        sleep 1   # the scaler is set up again by the driver meanwhile
+    fi
+    scaler
+    [ "$(id -u)" = 0 ] && /usr/local/lib/ozone/sound-config
+    exit 0
+}
+
+tv() { [ "$(cat $HDMI/hpd_state 2> /dev/null)" = 1 ]; }
+
+# the mode wanted now: the chosen one, if it fits what is connected
+wanted() {
+    case $MODE in
+    auto|'') tv && echo $hdmimode || echo $cvbsmode ;;
+    *cvbs) echo $MODE ;;
+    *) tv && echo $MODE || echo $cvbsmode ;;
+    esac
+}
+
+case "$1" in
+--boot)
+    # u-boot's choice stands for auto; a chosen mode replaces it
+    [ "$MODE" = auto ] || [ -z "$MODE" ] && { scaler; [ "$(id -u)" = 0 ] && /usr/local/lib/ozone/sound-config; exit 0; }
+    switch "$(wanted)" ;;
+--hdmi)
+    case $MODE in *cvbs) exit 0 ;; esac   # analog chosen: it stays
+    switch "$(wanted)" ;;
+--now)
+    switch "$(wanted)" ;;
+--apply)
+    scaler ;;
+'')
+    echo "usage: $0 MODE | --boot | --hdmi | --now | --apply" >&2; exit 2 ;;
+*)
+    switch "$1" ;;
+esac

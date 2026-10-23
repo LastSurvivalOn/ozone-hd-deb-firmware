@@ -26,18 +26,14 @@ start)
     echo interactive > $CPU/scaling_governor
     for c in /sys/devices/system/cpu/cpu[1-3]/online; do echo 1 > $c; done
 
-    # 1280x720 desktop, the hardware scaler stretches it to 1080p. It must be 16 bit (RGB565): all 32-bit
-    # Amlogic OSD formats have alpha and X writes zeros there, so the layer turns transparent (black screen);
-    # modern Xorg no longer supports 24 bit
+    # 1280x720 desktop, the hardware scaler stretches it to the output. It must be 16 bit (RGB565): all
+    # 32-bit Amlogic OSD formats have alpha and X writes zeros there, so the layer turns transparent
+    # (black screen); modern Xorg no longer supports 24 bit
     fbset -fb /dev/fb0 -g 1280 720 1280 1440 16 -rgba 5/11,6/5,5/0,0/0
-    echo 0 0 1279 719 > $FB/fb0/free_scale_axis
-    # into the whole 1080p output, or a window inside it for screens that cut off the edges
-    # (ozone-screen keeps the margins in /etc/ozone/screen; amplay puts the video there too)
-    h=0 v=0
-    [ -r /etc/ozone/screen ] && read h v < /etc/ozone/screen
-    case "$h$v" in *[!0-9]*|'') h=0 v=0 ;; esac
-    echo $h $v $((1919 - h)) $((1079 - v)) > $FB/fb0/window_axis
-    echo 0x10001 > $FB/fb0/free_scale
+    # the output mode chosen in ozone-display (else u-boot's), and the desktop into it: the whole
+    # output, or a window inside it for screens that cut off the edges (ozone-screen's margins in
+    # /etc/ozone/screen; amplay puts the video there too). Also the sound to that output.
+    /usr/local/lib/ozone/set-mode --boot
     dd if=/dev/zero of=/dev/fb0 bs=1M count=8 2>/dev/null
     # u-boot's logo sits on fb1 in memory the kernel doesn't reserve, so take it over on fb0
     [ -f $SPLASH ] && cat $SPLASH > /dev/fb0
@@ -62,8 +58,11 @@ start)
 
     # Hardware video decoder (amplay): the stream ports and the sysfs knobs it drives
     chgrp video /dev/amstream_* /dev/amvideo && chmod g+rw /dev/amstream_* /dev/amvideo
+    # (amplay switches the output's mode to match a video's frame rate, through set-mode; digital_raw
+    # sends AC-3 / DTS to an AV receiver as they are)
     for a in video/axis video/screen_mode video/disable_video video/show_first_frame_nosync tsync/enable \
-             tsync/startsync_mode graphics/fb0/blank graphics/fb0/color_key graphics/fb0/enable_key; do
+             tsync/startsync_mode display/mode audiodsp/digital_raw audiodsp/digital_codec graphics/fb0/free_scale_axis \
+             graphics/fb0/blank graphics/fb0/color_key graphics/fb0/enable_key; do
         chgrp video /sys/class/$a && chmod g+w /sys/class/$a
     done
     # Compressed swap in RAM (zram, LZO on this kernel): a browser tab can take 250 MB of the 830

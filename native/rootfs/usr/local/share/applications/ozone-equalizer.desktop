@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Equalizer
+Comment=The 10-band equalizer of all the sound
+Exec=ozone-equalizer
+Icon=multimedia-volume-control
+Terminal=false
+Categories=AudioVideo;Settings;

@@ -2,31 +2,23 @@
 # HDMI plugged in after power-on. u-boot picks the output when the box starts: with no TV on HDMI
 # (unplugged, or a TV in standby that doesn't answer) it is analog 576cvbs, and nothing switches
 # it later; in Android a system service does. This checks every 2 s and, once a TV is there while
-# the output is still analog, switches to the HDMI mode u-boot would have picked (hdmimode= on the
-# kernel command line) and puts the desktop back into it, as ozone-hw does at boot.
+# the output is still analog, switches to the HDMI mode chosen in ozone-display, or the one u-boot
+# would have picked (hdmimode= on the kernel command line), with the desktop and sound (set-mode).
 # Started by ozone-hw; changes go to /var/log/hdmi-watch.log.
 HDMI=/sys/class/amhdmitx/amhdmitx0
 MODE=/sys/class/display/mode
-FB=/sys/class/graphics/fb0
-
-hdmimode=$(sed -n 's/.*hdmimode=\([^ ]*\).*/\1/p' /proc/cmdline)
-hdmimode=${hdmimode:-1080p}
 
 while true; do
     read hpd < $HDMI/hpd_state
     read mode < $MODE
     if [ "$hpd" = 1 ] && case $mode in *cvbs) true ;; *) false ;; esac; then
-        echo "$(date '+%F %T') TV on HDMI, output $mode -> $hdmimode"
-        echo $hdmimode > $MODE
-        sleep 1
-        # the OSD scaler, as at boot (see ozone-hw)
-        h=0 v=0
-        [ -r /etc/ozone/screen ] && read h v < /etc/ozone/screen
-        case "$h$v" in *[!0-9]*|'') h=0 v=0 ;; esac
-        echo 0 > $FB/free_scale
-        echo 0 0 1279 719 > $FB/free_scale_axis
-        echo $h $v $((1919 - h)) $((1079 - v)) > $FB/window_axis
-        echo 0x10001 > $FB/free_scale
+        echo "$(date '+%F %T') TV on HDMI, output $mode"
+        # the mode chosen in ozone-display, or u-boot's hdmimode=; the desktop and sound follow
+        /usr/local/lib/ozone/set-mode --hdmi
+        read mode < $MODE
+        echo "$(date '+%F %T') output now $mode"
+        # analog chosen: it stays, and this doesn't ask again until the TV goes and comes back
+        case $mode in *cvbs) while [ "$(cat $HDMI/hpd_state)" = 1 ]; do sleep 2; done ;; esac
     fi
     sleep 2
 done

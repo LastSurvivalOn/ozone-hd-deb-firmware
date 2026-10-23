@@ -1,0 +1,215 @@
+#!/usr/bin/python3
+"""ozone-equalizer: the 10-band equalizer of all the sound, for the remote.
+
+The bands are alsaequal's controls (the caps LADSPA Eq10 filter, see sound-config), kept in
+/etc/ozone/alsaequal.bin: what is set here plays at once, in whatever is playing. Turning it on
+or off rewrites /etc/asound.conf (ozone-display set EQ), which takes effect from the next thing
+that starts playing.
+
+Keys: ← / → a band, ↑ / ↓ its level (1 dB), 0-9 a preset, OK turn it on / off, Esc close.
+"""
+import re
+import subprocess
+import sys
+
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('Gdk', '3.0')
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+
+BANDS = ['31', '63', '125', '250', '500', '1k', '2k', '4k', '8k', '16k']
+RANGE = 12   # dB either way on the sliders (the filter itself goes from -48 to +24)
+PRESETS = [
+    ('Flat', [0] * 10),
+    ('More bass', [6, 5, 4, 2, 0, 0, 0, 0, 0, 0]),
+    ('Less bass', [-6, -5, -3, -1, 0, 0, 0, 0, 0, 0]),
+    ('More treble', [0, 0, 0, 0, 0, 1, 2, 4, 5, 6]),
+    ('Voice', [-4, -3, -1, 1, 3, 4, 3, 1, 0, -2]),
+    ('Rock', [4, 3, 1, -1, -2, -1, 1, 3, 4, 4]),
+    ('Pop', [-1, 1, 3, 4, 3, 1, 0, -1, -1, -1]),
+    ('Classical', [3, 2, 1, 0, 0, 0, -1, 1, 2, 3]),
+    ('Night (quiet loud parts)', [-3, -2, -1, 0, 1, 2, 2, 1, -1, -2]),
+    ('Small speakers', [-8, -6, -2, 1, 2, 2, 1, 2, 3, 3]),
+]
+
+CSS = b"""
+* { font-family: "DejaVu Sans"; font-size: 13px; color: #cdd6f4; }
+window { background: #11111b; }
+.heading { font-size: 18px; font-weight: bold; }
+.logo { font-family: "FontAwesome"; font-size: 24px; color: #cba6f7; }
+.hint { color: #7f849c; font-size: 12px; }
+.db { font-family: "JetBrains Mono"; font-size: 13px; color: #a6adc8; }
+.band { font-family: "JetBrains Mono"; font-size: 14px; font-weight: bold; }
+scale trough { min-width: 8px; background: #313244; border-radius: 4px; }
+scale highlight { background: #cba6f7; border-radius: 4px; }
+scale slider { min-width: 22px; min-height: 22px; background: #cdd6f4; border-radius: 11px; }
+scale:focus slider { background: #f9e2af; }
+.bandbox { padding: 6px; border-radius: 8px; }
+.bandbox.focused { background: #1e1e2e; }
+button { background: #1e1e2e; border: 1px solid #313244; border-radius: 16px; padding: 4px 14px; }
+button:focus, button:hover { border-color: #cba6f7; }
+switch { background: #313244; border-radius: 12px; }
+switch:checked { background: #cba6f7; }
+"""
+
+
+def to_value(db):
+    return max(0, min(100, round((db + 48) * 100 / 72)))
+
+
+def to_db(value):
+    return round(value * 72 / 100 - 48)
+
+
+def amixer(*args):
+    return subprocess.run(['amixer', '-D', 'equal'] + list(args), capture_output=True, text=True)
+
+
+def read_bands():
+    out = amixer('contents').stdout
+    vals = [int(m.group(1)) for m in re.finditer(r': values=(\d+)', out)]
+    return [to_db(v) for v in vals[:10]] if len(vals) >= 10 else None
+
+
+def eq_on():
+    return subprocess.run(['ozone-display', 'get', 'EQ'], capture_output=True, text=True).stdout.strip() == '1'
+
+
+class Window:
+    def __init__(self):
+        # GTK's CSS parser loses the first number of the first stylesheet to a stale errno (see yt)
+        try:
+            Gtk.CssProvider().load_from_data(b'* { padding: 0px; }')
+        except GLib.Error:
+            pass
+        css = Gtk.CssProvider()
+        css.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.win = Gtk.Window(title='Equalizer')
+        self.win.set_default_size(1100, 560)
+        self.win.connect('destroy', Gtk.main_quit)
+        self.win.connect('key-press-event', self.on_key)
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, border_width=24)
+        head = Gtk.Box(spacing=12)
+        for text, cls in (('', 'logo'), ('Equalizer', 'heading')):
+            lb = Gtk.Label(label=text)
+            lb.get_style_context().add_class(cls)
+            head.pack_start(lb, False, False, 0)
+        self.status = Gtk.Label(label='', xalign=0)
+        self.status.get_style_context().add_class('hint')
+        head.pack_start(self.status, True, True, 0)
+        self.switch = Gtk.Switch(active=eq_on(), valign=Gtk.Align.CENTER)
+        self.switch.connect('notify::active', self.on_switch)
+        head.pack_start(self.switch, False, False, 0)
+        top.pack_start(head, False, False, 0)
+
+        presets = Gtk.Box(spacing=8)
+        for n, (name, _gains) in enumerate(PRESETS):
+            b = Gtk.Button(label='%d %s' % ((n + 1) % 10, name))
+            b.connect('clicked', lambda w, n=n: self.preset(n))
+            presets.pack_start(b, False, False, 0)
+        scroll = Gtk.ScrolledWindow(vscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroll.add(presets)
+        scroll.set_size_request(-1, 48)
+        top.pack_start(scroll, False, False, 0)
+
+        bands = Gtk.Box(spacing=6, homogeneous=True)
+        self.scales, self.boxes, self.dbs = [], [], []
+        gains = read_bands() or [0] * 10
+        for i, name in enumerate(BANDS):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            box.get_style_context().add_class('bandbox')
+            db = Gtk.Label(label='')
+            db.get_style_context().add_class('db')
+            sc = Gtk.Scale(orientation=Gtk.Orientation.VERTICAL, inverted=True, draw_value=False,
+                           adjustment=Gtk.Adjustment(value=max(-RANGE, min(RANGE, gains[i])), lower=-RANGE,
+                                                     upper=RANGE, step_increment=1, page_increment=3))
+            sc.add_mark(0, Gtk.PositionType.RIGHT, None)
+            sc.connect('value-changed', lambda w, i=i: self.changed(i))
+            sc.connect('focus-in-event', lambda w, e, i=i: self.focused(i))
+            band = Gtk.Label(label=name)
+            band.get_style_context().add_class('band')
+            box.pack_start(db, False, False, 0)
+            box.pack_start(sc, True, True, 0)
+            box.pack_start(band, False, False, 0)
+            bands.pack_start(box, True, True, 0)
+            self.scales.append(sc)
+            self.boxes.append(box)
+            self.dbs.append(db)
+            self.show_db(i)
+        top.pack_start(bands, True, True, 0)
+        hint = Gtk.Label(label='← → a band   ↑ ↓ its level   0-9 a preset   OK on / off   exit: close', xalign=0)
+        hint.get_style_context().add_class('hint')
+        top.pack_start(hint, False, False, 0)
+        self.win.add(top)
+        self.win.show_all()
+        self.scales[0].grab_focus()
+        self.update_status()
+
+    def show_db(self, i):
+        v = int(self.scales[i].get_value())
+        self.dbs[i].set_text('%+d dB' % v if v else '0 dB')
+
+    def changed(self, i):
+        v = to_value(int(round(self.scales[i].get_value())))
+        amixer('-q', 'cset', 'numid=%d' % (i + 1), '%d,%d' % (v, v))
+        self.show_db(i)
+
+    def focused(self, i):
+        for n, b in enumerate(self.boxes):
+            (b.get_style_context().add_class if n == i else b.get_style_context().remove_class)('focused')
+        return False
+
+    def preset(self, n):
+        name, gains = PRESETS[n]
+        for i, g in enumerate(gains):
+            self.scales[i].set_value(g)
+        self.status.set_text(name)
+
+    def update_status(self):
+        if not self.switch.get_active():
+            self.status.set_text('Off: the sound goes out as it is')
+
+    def on_switch(self, sw, _p):
+        on = sw.get_active()
+        subprocess.call(['ozone-display', 'set', 'EQ', '1' if on else '0'])
+        self.status.set_text('On, from the next thing that starts playing' if on else
+                             'Off, from the next thing that starts playing')
+
+    def on_key(self, w, ev):
+        k = Gdk.keyval_name(ev.keyval) or ''
+        focus = self.win.get_focus()
+        i = self.scales.index(focus) if focus in self.scales else None
+        if k == 'Escape':
+            self.win.destroy()
+            return True
+        digit = k.replace('KP_', '')
+        if len(digit) == 1 and digit.isdigit():
+            self.preset((int(digit) - 1) % 10)
+            return True
+        if i is not None and k in ('Left', 'Right'):
+            self.scales[max(0, min(9, i + (1 if k == 'Right' else -1)))].grab_focus()
+            return True
+        if i is not None and k in ('Up', 'Down'):
+            sc = self.scales[i]
+            sc.set_value(sc.get_value() + (1 if k == 'Up' else -1))
+            return True
+        if k in ('Return', 'KP_Enter') and i is not None:
+            self.switch.set_active(not self.switch.get_active())
+            return True
+        return False
+
+
+def main():
+    if read_bands() is None:
+        # the bands' file is made by sound-config (as root), whether the equalizer is on or not
+        subprocess.call(['ozone-display', 'set', 'EQ', '1' if eq_on() else '0'])
+    GLib.set_prgname('ozone-equalizer')
+    Window()
+    Gtk.main()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

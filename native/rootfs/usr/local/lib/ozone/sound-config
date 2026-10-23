@@ -1,0 +1,98 @@
+#!/bin/sh
+# sound-config: writes /etc/asound.conf for the output and the equalizer chosen in
+# /etc/ozone/display (ozone-display, ozone-equalizer); run by set-mode when the output changes.
+#   SOUND=auto    HDMI, or the analog jack when the picture goes out as composite video (cvbs)
+#   SOUND=hdmi | analog
+#   EQ=1          the 10-band equalizer (alsaequal with the caps LADSPA plugins) before the output
+#
+# What the Amlogic driver allows (see also amplay and CLAUDE.md):
+# 1. It hangs the kernel if silence filling is enabled in sw_params (mpv does that with ao=alsa,
+#    so mpv uses ao=sdl). The format is pinned to S16_LE just in case.
+# 2. There is no volume control, so a software "Master" (softvol).
+# 3. dmix is impossible (the driver has no mmap), so one program plays sound at a time.
+# 4. HDMI takes its audio from the SPDIF (IEC958) encoder (dmesg at boot: "hdmitx: audio: SPDIF ...
+#    Enable audio spdif to HDMI"), so HDMI is device 1, "SPDIF PCM". Device 0 (I2S) is the analog
+#    jack, next to the composite video.
+SOUND=auto EQ=0
+[ -r /etc/ozone/display ] && . /etc/ozone/display
+
+device=1
+case $SOUND in
+analog) device=0 ;;
+auto) case "$(cat /sys/class/display/mode 2> /dev/null)" in *cvbs) device=0 ;; esac ;;
+esac
+
+out=hw_out
+eq=
+pin=''
+have_eq=
+[ -e /usr/lib/arm-linux-gnueabihf/alsa-lib/libasound_module_pcm_equal.so ] && have_eq=1
+# the bands' controls always (ozone-equalizer sets them with the equalizer off too: without this,
+# the package's ctl.equal would keep them in each user's ~/.alsaequal.bin)
+[ $have_eq ] && eq='
+ctl.equal {
+    type equal
+    controls "/etc/ozone/alsaequal.bin"
+}
+'
+if [ "$EQ" = 1 ] && [ $have_eq ]; then
+    out=eq_in
+    pin='; channels 2; rate 48000'
+    # The equalizer works in floats. Every plug in the chain has its format, channels and rate
+    # pinned: left to negotiate, softvol and a float plugin found no configuration at all
+    # ("snd1_pcm_hw_param_get_min: Assertion ... failed").
+    eq='
+# the equalizer (ozone-equalizer sets its bands; amixer -D equal contents)
+pcm.eq_in {
+    type plug
+    slave { pcm "equalizer"; format FLOAT_LE; channels 2; rate 48000; }
+}
+
+pcm.equalizer {
+    type equal
+    slave.pcm "hw_out"
+    controls "/etc/ozone/alsaequal.bin"
+}
+
+ctl.equal {
+    type equal
+    controls "/etc/ozone/alsaequal.bin"
+}
+'
+fi
+
+tmp=/etc/asound.conf.new
+cat > $tmp << EOF
+# Written by /usr/local/lib/ozone/sound-config from /etc/ozone/display: edit that, not this.
+# Output: device $device ($( [ $device = 1 ] && echo HDMI || echo "analog jack" )), equalizer: $( [ $out = eq_in ] && echo on || echo off ).
+pcm.!default {
+    type plug
+    slave { pcm "softvol"; format S16_LE$pin; }
+}
+
+pcm.softvol {
+    type softvol
+    slave.pcm "$out"
+    control {
+        name "Master"
+        card 0
+    }
+}
+$eq
+pcm.hw_out {
+    type plug
+    slave { pcm "hw:0,$device"; format S16_LE$pin; }
+}
+
+ctl.!default {
+    type hw
+    card 0
+}
+EOF
+cmp -s $tmp /etc/asound.conf && rm $tmp || mv $tmp /etc/asound.conf
+
+# the equalizer's bands: made by the plugin the first time it is opened, then the audio group's
+if [ $have_eq ] && [ ! -e /etc/ozone/alsaequal.bin ]; then
+    amixer -q -D equal contents > /dev/null 2>&1
+    chgrp audio /etc/ozone/alsaequal.bin && chmod 664 /etc/ozone/alsaequal.bin
+fi

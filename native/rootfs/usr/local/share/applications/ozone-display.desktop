@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Display and sound
+Comment=Resolution, analog output, frame rate, sound output, digital sound
+Exec=ozone-display
+Icon=video-display
+Terminal=false
+Categories=Settings;

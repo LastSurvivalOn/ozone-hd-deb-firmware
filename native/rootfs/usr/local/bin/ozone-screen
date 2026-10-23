@@ -33,10 +33,25 @@ def load():
         return 0, 0
 
 
+def output_size():
+    """The output mode's pixels: the margins are kept in 1080p pixels and scaled to it"""
+    try:
+        with open('/sys/class/display/mode') as f:
+            mode = f.read().strip()
+    except OSError:
+        mode = ''
+    for prefix, size in (('1080', (1920, 1080)), ('720', (1280, 720)), ('576', (720, 576)), ('480', (720, 480))):
+        if mode.startswith(prefix):
+            return size
+    return W, H
+
+
 def apply(h, v):
     """The scaler draws the desktop into this window, the rest of the output stays black"""
+    w, ht = output_size()
+    h, v = h * w // W, v * ht // H
     with open(FB + '/window_axis', 'w') as f:
-        f.write('%d %d %d %d' % (h, v, W - 1 - h, H - 1 - v))
+        f.write('%d %d %d %d' % (h, v, w - 1 - h, ht - 1 - v))
     with open(FB + '/free_scale', 'w') as f:
         f.write('0x10001')   # the window only takes effect when scaling is (re)enabled
 
