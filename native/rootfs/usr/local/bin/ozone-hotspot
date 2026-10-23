@@ -1,0 +1,276 @@
+#!/usr/bin/python3
+"""ozone-hotspot: the box as a WiFi hotspot, sharing its connection (the cable, PPPoE, or WiFi).
+
+  ozone-hotspot menu      on / off, the name and the password (rofi)
+  ozone-hotspot status    "on: NAME" or "off"
+  ozone-hotspot start | stop   (root)
+
+hostapd makes the access point, dnsmasq gives the addresses (192.168.43.x) and forwards DNS, and
+iptables masquerades the clients behind the box's way out. The 8189ES driver has a second
+interface, p2p0, on a phy of its own: the hotspot goes there first, so the box itself stays on
+its WiFi network; if hostapd can't start on it, on wlan0, with the box's own WiFi off meanwhile.
+Settings in /etc/ozone/hotspot.json (root only: the password); log /var/log/hotspot.log.
+"""
+import json
+import os
+import secrets
+import subprocess
+import sys
+import time
+
+CONF = '/etc/ozone/hotspot.json'
+RUN = '/run/ozone-hotspot'
+LOG = '/var/log/hotspot.log'
+NET = '192.168.43'
+IPTABLES = 'iptables-legacy'   # the nf_tables one fails on kernel 3.10 ("rule set generation id")
+DEFAULTS = {'ssid': 'Ozone-%s', 'password': None, 'channel': 6}
+
+
+def sh(*args, **kw):
+    return subprocess.call(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+
+
+def log(text):
+    with open(LOG, 'a') as f:
+        f.write('%s %s\n' % (time.strftime('%F %T'), text))
+
+
+def load():
+    try:
+        with open(CONF) as f:
+            c = json.load(f)
+    except (OSError, ValueError):
+        c = {}
+    for k, v in DEFAULTS.items():
+        c.setdefault(k, v)
+    if '%s' in c['ssid']:
+        try:
+            with open('/sys/class/net/wlan0/address') as f:
+                c['ssid'] = c['ssid'] % f.read().strip().replace(':', '')[-4:].upper()
+        except OSError:
+            c['ssid'] = c['ssid'] % '1'
+    if not c['password']:
+        c['password'] = ''.join(secrets.choice('abcdefghjkmnpqrstuvwxyz23456789') for _ in range(10))
+    return c
+
+
+def save(c):
+    fd = os.open(CONF + '.tmp', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(c, f, indent=1)
+    os.replace(CONF + '.tmp', CONF)
+
+
+def running():
+    try:
+        with open(RUN + '/iface') as f:
+            iface = f.read().strip()
+        with open(RUN + '/hostapd.pid') as f:
+            os.kill(int(f.read()), 0)
+        return iface
+    except PermissionError:   # root's process, asked by the user: it is there
+        return iface
+    except (OSError, ValueError):
+        return None
+
+
+def uplink():
+    r = subprocess.run(['ip', 'route', 'show', 'default'], capture_output=True, text=True)
+    f = r.stdout.split()
+    return f[f.index('dev') + 1] if 'dev' in f else None
+
+
+def wifi_client(on):
+    """The box's own WiFi (wpa_supplicant and its wpa_cli, from ozone-wifi)"""
+    if on:
+        sh('/etc/init.d/ozone-wifi', 'start')
+    else:
+        for p in ('wpa_cli.wlan0', 'wpa_supplicant.wlan0'):
+            sh('start-stop-daemon', '--stop', '--quiet', '--pidfile', '/run/%s.pid' % p, '--remove-pidfile')
+        sh('/usr/local/lib/ozone/net-apply', 'wlan0', 'down')
+
+
+def start_hostapd(iface, c):
+    conf = os.path.join(RUN, 'hostapd.conf')
+    fd = os.open(conf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write('interface=%s\ndriver=nl80211\nssid=%s\nutf8_ssid=1\ncountry_code=UA\nhw_mode=g\nchannel=%d\n'
+                'ieee80211n=1\nwmm_enabled=1\nauth_algs=1\nwpa=2\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\n'
+                'wpa_passphrase=%s\nctrl_interface=%s/hostapd\n' % (iface, c['ssid'], c['channel'], c['password'], RUN))
+    sh('ip', 'link', 'set', iface, 'up')
+    pid = os.path.join(RUN, 'hostapd.pid')
+    with open(LOG, 'a') as out:
+        subprocess.call(['hostapd', '-B', '-P', pid, '-f', LOG, conf], stdout=out, stderr=out)
+    for _ in range(20):   # up once it says so
+        time.sleep(0.5)
+        r = subprocess.run(['hostapd_cli', '-p', RUN + '/hostapd', '-i', iface, 'status'],
+                           capture_output=True, text=True)
+        if 'state=ENABLED' in r.stdout:
+            return True
+    stop_hostapd()
+    return False
+
+
+def stop_hostapd():
+    try:
+        with open(os.path.join(RUN, 'hostapd.pid')) as f:
+            os.kill(int(f.read()), 15)
+    except (OSError, ValueError):
+        pass
+    time.sleep(1)
+
+
+def start():
+    if running():
+        return 0
+    os.makedirs(RUN, exist_ok=True)
+    c = load()
+    save(c)
+    up = uplink()
+    log('starting %s, the way out %s' % (c['ssid'], up))
+    iface = None
+    if up != 'p2p0' and start_hostapd('p2p0', c):   # beside the box's own WiFi
+        iface = 'p2p0'
+    else:
+        log('p2p0 refused: on wlan0, the box\'s own WiFi off')
+        wifi_client(False)
+        if start_hostapd('wlan0', c):
+            iface = 'wlan0'
+    if not iface:
+        log('hostapd did not start')
+        wifi_client(True)
+        print('The hotspot did not start (see %s)' % LOG, file=sys.stderr)
+        return 1
+    with open(RUN + '/iface', 'w') as f:
+        f.write(iface)
+    sh('ip', '-4', 'addr', 'flush', 'dev', iface)
+    sh('ip', 'addr', 'add', NET + '.1/24', 'dev', iface)
+    # addresses and DNS for the clients; it forwards to the box's own servers. A group of aid_inet:
+    # only that group may open sockets on this kernel (ANDROID_PARANOID_NETWORK)
+    sh('dnsmasq', '--interface=' + iface, '--bind-interfaces', '--except-interface=lo',
+       '--dhcp-range=%s.10,%s.200,12h' % (NET, NET), '--dhcp-option=option:router,%s.1' % NET,
+       '--pid-file=' + RUN + '/dnsmasq.pid', '--dhcp-leasefile=' + RUN + '/leases', '--user=nobody',
+       '--group=aid_inet', '--log-facility=' + LOG)
+    with open('/proc/sys/net/ipv4/ip_forward', 'w') as f:
+        f.write('1')
+    sh(IPTABLES, '-t', 'nat', '-A', 'POSTROUTING', '-s', NET + '.0/24', '!', '-d', NET + '.0/24', '-j', 'MASQUERADE')
+    sh(IPTABLES, '-A', 'FORWARD', '-s', NET + '.0/24', '-j', 'ACCEPT')
+    sh(IPTABLES, '-A', 'FORWARD', '-d', NET + '.0/24', '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT')
+    log('on %s: %s' % (iface, c['ssid']))
+    return 0
+
+
+def stop():
+    iface = running()
+    try:
+        with open(RUN + '/dnsmasq.pid') as f:
+            os.kill(int(f.read()), 15)
+    except (OSError, ValueError):
+        pass
+    stop_hostapd()
+    for args in (['-t', 'nat', '-D', 'POSTROUTING', '-s', NET + '.0/24', '!', '-d', NET + '.0/24', '-j', 'MASQUERADE'],
+                 ['-D', 'FORWARD', '-s', NET + '.0/24', '-j', 'ACCEPT'],
+                 ['-D', 'FORWARD', '-d', NET + '.0/24', '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT']):
+        sh(IPTABLES, *args)
+    with open('/proc/sys/net/ipv4/ip_forward', 'w') as f:
+        f.write('0')
+    if iface:
+        sh('ip', '-4', 'addr', 'flush', 'dev', iface)
+    if iface == 'wlan0':
+        wifi_client(True)
+    for n in ('iface', 'hostapd.pid', 'dnsmasq.pid'):
+        try:
+            os.unlink(os.path.join(RUN, n))
+        except OSError:
+            pass
+    log('off')
+    return 0
+
+
+# ---- the menu (as the user) -----------------------------------------------------------------------
+
+def rofi(prompt, items, message=None):
+    cmd = ['rofi', '-dmenu', '-i', '-format', 'i', '-p', prompt, '-theme-str', 'listview { lines: %d; }' % len(items)]
+    if message:
+        cmd += ['-mesg', message]
+    r = subprocess.run(cmd, input='\n'.join(items), capture_output=True, text=True)
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        return None
+
+
+def ask(prompt, text=''):
+    r = subprocess.run(['rofi', '-dmenu', '-p', prompt, '-filter', text, '-theme-str', 'listview { lines: 0; }'],
+                       input='', capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def notify(text):
+    subprocess.call(['ozone-notify', text], stderr=subprocess.DEVNULL)
+
+
+def root(*args, data=None):
+    return subprocess.run(['sudo', '-n', sys.argv[0]] + list(args), input=data, capture_output=True, text=True)
+
+
+def menu():
+    while True:
+        c = json.loads(root('show').stdout or '{}')
+        on = c.get('on')
+        items = ['Turn it off' if on else 'Turn it on', 'Name: %s' % c.get('ssid'), 'Password: %s' % c.get('password')]
+        message = ('On: phones and computers can join "%s" with the password %s' % (c.get('ssid'), c.get('password'))
+                   if on else 'The box shares its connection over WiFi')
+        i = rofi('WiFi hotspot', items, message)
+        if i is None:
+            return 0
+        if i == 0:
+            notify('Hotspot: %s…' % ('turning off' if on else 'starting'))
+            r = root('stop' if on else 'start')
+            notify(r.stderr.strip() or ('Hotspot off' if on else 'Hotspot "%s" on, password %s' % (c['ssid'], c['password'])))
+        elif i in (1, 2):
+            key = 'ssid' if i == 1 else 'password'
+            v = ask('Name' if i == 1 else 'Password (8 or more characters)', c.get(key, ''))
+            if not v:
+                continue
+            if key == 'password' and not 8 <= len(v.encode()) <= 63:
+                notify('A WiFi password has 8 to 63 characters')
+                continue
+            root('set', key, v)
+            if on:   # again, with the new name or password
+                root('stop')
+                root('start')
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else 'menu'
+    if cmd in ('start', 'stop', 'show', 'set'):
+        if os.geteuid() != 0:
+            sys.exit('as root')
+        if cmd == 'show':   # for the menu: the settings, and whether it runs
+            c = load()
+            save(c)
+            c['on'] = bool(running())
+            print(json.dumps(c))
+            return 0
+        if cmd == 'set' and len(argv) == 4 and argv[2] in ('ssid', 'password'):
+            c = load()
+            c[argv[2]] = argv[3]
+            save(c)
+            return 0
+        return start() if cmd == 'start' else stop()
+    if cmd == 'status':
+        iface = running()
+        if not iface:
+            print('off')
+        else:
+            r = root('show')
+            print('on: %s' % json.loads(r.stdout or '{}').get('ssid', iface))
+        return 0
+    if cmd == 'menu':
+        return menu()
+    sys.exit(__doc__)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
