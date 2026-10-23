@@ -1,0 +1,11 @@
+#!/bin/sh
+# OpenVPN's up / down script for ozone-vpn: the DNS servers it pushes
+# (foreign_option_N = "dhcp-option DNS a.b.c.d") replace the usual ones while it is up
+case "$script_type" in
+up)
+    dns=$(env | sed -n 's/^foreign_option_[0-9]*=dhcp-option DNS //p')
+    [ -n "$dns" ] && exec /usr/local/bin/ozone-vpn dns $dns ;;
+down)
+    exec /usr/local/bin/ozone-vpn dns ;;
+esac
+exit 0

@@ -1,0 +1,444 @@
+#!/usr/bin/python3
+"""ozone-vpn: VPN connections, for the remote: OpenVPN (.ovpn) and WireGuard (.conf) files from the
+VPN provider or your own server.
+
+  ozone-vpn menu        connect, disconnect, add a file (from ~/VPN, Downloads or a USB drive), remove
+  ozone-vpn status      "on: NAME" or "off"
+  ozone-vpn connect NAME | disconnect | import PATH [USER PASSWORD] | remove NAME   (root)
+
+The files are kept in /etc/ozone/vpn (root only), with a login for OpenVPN files that ask for
+one. All the traffic goes through the VPN while it is on (OpenVPN as its file says; WireGuard by
+two half routes, 0/1 and 128/1, and a route to its server through the usual way out), and its DNS
+servers replace the usual ones until it goes off. WireGuard runs in user space (wireguard-go):
+kernel 3.10 has no WireGuard. Log: /var/log/vpn.log.
+"""
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+DIR = '/etc/ozone/vpn'
+RUN = '/run/ozone-vpn'
+LOG = '/var/log/vpn.log'
+WG = 'wg0'
+WG_GO = '/usr/local/bin/wireguard-go'
+RESOLV = '/etc/resolv.conf'
+
+
+def sh(*args):
+    return subprocess.call(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def log(text):
+    with open(LOG, 'a') as f:
+        f.write('%s %s\n' % (time.strftime('%F %T'), text))
+
+
+def kind(path):
+    try:
+        with open(path, errors='replace') as f:
+            text = f.read(65536)
+    except OSError:
+        return None
+    if re.search(r'^\s*\[Interface\]', text, re.M | re.I) and re.search(r'^\s*\[Peer\]', text, re.M | re.I):
+        return 'wireguard'
+    if re.search(r'^\s*(client|remote|dev\s+tun|<ca>)', text, re.M):
+        return 'openvpn'
+    return None
+
+
+def configs():
+    """name -> (path, kind)"""
+    out = {}
+    try:
+        for n in sorted(os.listdir(DIR)):
+            p = os.path.join(DIR, n)
+            k = kind(p) if n.endswith(('.ovpn', '.conf')) else None
+            if k:
+                out[n.rsplit('.', 1)[0]] = (p, k)
+    except OSError:
+        pass
+    return out
+
+
+def current():
+    try:
+        with open(RUN + '/name') as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def save_dns(servers):
+    """The VPN's DNS servers in resolv.conf, the usual one kept to put back"""
+    if not servers:
+        return
+    if not os.path.exists(RUN + '/resolv.conf'):
+        shutil.copy(RESOLV, RUN + '/resolv.conf')
+    with open(RESOLV + '.vpn', 'w') as f:
+        f.write('# ozone-vpn\n' + ''.join('nameserver %s\n' % s for s in servers))
+    os.replace(RESOLV + '.vpn', RESOLV)
+
+
+def restore_dns():
+    if os.path.exists(RUN + '/resolv.conf'):
+        shutil.copy(RUN + '/resolv.conf', RESOLV)
+        os.unlink(RUN + '/resolv.conf')
+
+
+def way_out():
+    r = subprocess.run(['ip', 'route', 'show', 'default'], capture_output=True, text=True)
+    m = re.search(r'via (\S+) dev (\S+)', r.stdout)
+    return m.groups() if m else (None, None)
+
+
+# ---- OpenVPN --------------------------------------------------------------------------------------
+
+UP_SCRIPT = '/usr/local/lib/ozone/vpn-updown'   # sets the DNS servers it pushes
+
+
+def openvpn_up(name, path):
+    script = UP_SCRIPT
+    args = ['openvpn', '--config', path, '--daemon', 'ozone-vpn', '--writepid', RUN + '/openvpn.pid',
+            '--log-append', LOG, '--script-security', '2', '--up', script, '--down', script, '--up-restart',
+            '--connect-retry', '5', '30', '--cd', DIR]
+    auth = os.path.join(DIR, name + '.auth')
+    if os.path.exists(auth):
+        args += ['--auth-user-pass', auth]
+    if sh(*args):
+        return 'OpenVPN did not start (see %s)' % LOG
+    for _ in range(45):   # connected once its tunnel has an address
+        time.sleep(1)
+        r = subprocess.run(['ip', '-4', '-o', 'addr', 'show', 'dev', 'tun0'], capture_output=True, text=True)
+        if ' inet ' in r.stdout:
+            return None
+        if not alive(RUN + '/openvpn.pid'):
+            return 'OpenVPN stopped: %s' % last_error()
+    return 'No connection in 45 s: %s' % last_error()
+
+
+def last_error():
+    try:
+        with open(LOG, errors='replace') as f:
+            lines = [l.strip() for l in f.readlines()[-40:]]
+    except OSError:
+        return 'no log'
+    for l in reversed(lines):
+        if re.search(r'AUTH_FAILED|error|Error|failed|refused|TLS|Cannot', l):
+            return l[-160:]
+    return 'see %s' % LOG
+
+
+def alive(pidfile):
+    try:
+        with open(pidfile) as f:
+            os.kill(int(f.read()), 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+# ---- WireGuard (user space) ---------------------------------------------------------------------
+
+def wg_parse(path):
+    """The [Interface] lines wg-quick reads (Address, DNS, MTU), and the file wg setconf takes"""
+    extra = {'address': [], 'dns': [], 'mtu': None}
+    keep = []
+    with open(path) as f:
+        for line in f:
+            m = re.match(r'\s*(\w+)\s*=\s*(.*?)\s*$', line)
+            key = m.group(1).lower() if m else None
+            if key == 'address':
+                extra['address'] += [a.strip() for a in m.group(2).split(',') if a.strip()]
+            elif key == 'dns':
+                extra['dns'] += [a.strip() for a in m.group(2).split(',') if a.strip()]
+            elif key == 'mtu':
+                extra['mtu'] = m.group(2)
+            elif key in ('table', 'preup', 'postup', 'predown', 'postdown', 'saveconfig'):
+                continue
+            else:
+                keep.append(line)
+    return extra, ''.join(keep)
+
+
+def wg_up(path):
+    if not os.path.exists(WG_GO):
+        return 'WireGuard needs %s (install-network.sh builds it)' % WG_GO
+    extra, conf = wg_parse(path)
+    stripped = RUN + '/wg.conf'
+    fd = os.open(stripped, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(conf)
+    # it goes to the background by itself: a child with WG_PROCESS_FOREGROUND=1 added to the
+    # environment, but one that is already set wins, and with 0 each child would start another
+    env = {k: v for k, v in os.environ.items() if k != 'WG_PROCESS_FOREGROUND'}
+    env['LOG_LEVEL'] = 'error'
+    if subprocess.call([WG_GO, WG], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL):
+        return 'wireguard-go did not start'
+    for _ in range(20):
+        if os.path.exists('/sys/class/net/' + WG):
+            break
+        time.sleep(0.25)
+    if sh('wg', 'setconf', WG, stripped):
+        wg_down()
+        return 'The WireGuard file was not accepted'
+    for a in extra['address']:
+        if ':' not in a:   # IPv4 only: the box has no IPv6 way out to send it to
+            sh('ip', 'addr', 'add', a, 'dev', WG)
+    sh('ip', 'link', 'set', 'mtu', extra['mtu'] or '1420', 'up', 'dev', WG)
+    # its server through the usual way out, everything else through the tunnel
+    gw, dev = way_out()
+    endpoints = re.findall(r'^\s*Endpoint\s*=\s*\[?([^\]\s]+?)\]?:\d+\s*$', conf, re.M | re.I)
+    routes = []
+    for host in endpoints:
+        try:
+            ip = socket.gethostbyname(host)
+        except OSError:
+            continue
+        near = subprocess.run(['ip', 'route', 'get', ip], capture_output=True, text=True).stdout
+        if gw and ' via ' in near:   # not when it is on the home network itself
+            sh('ip', 'route', 'add', ip, 'via', gw, 'dev', dev)
+            routes.append(ip)
+    allowed = ' '.join(re.findall(r'^\s*AllowedIPs\s*=\s*(.*)$', conf, re.M | re.I))
+    nets = [n.strip() for n in allowed.replace(',', ' ').split() if n.strip() and ':' not in n]
+    for n in nets:
+        if n == '0.0.0.0/0':
+            sh('ip', 'route', 'add', '0.0.0.0/1', 'dev', WG)
+            sh('ip', 'route', 'add', '128.0.0.0/1', 'dev', WG)
+        else:
+            sh('ip', 'route', 'add', n, 'dev', WG)
+    with open(RUN + '/routes', 'w') as f:
+        f.write(' '.join(routes))
+    save_dns([d for d in extra['dns'] if re.match(r'^[\d.]+$', d)])
+    return None
+
+
+def wg_down():
+    try:
+        with open(RUN + '/routes') as f:
+            for ip in f.read().split():
+                sh('ip', 'route', 'del', ip)
+        os.unlink(RUN + '/routes')
+    except OSError:
+        pass
+    sh('ip', 'link', 'del', WG)   # wireguard-go goes with its interface
+
+
+# ---- both ------------------------------------------------------------------------------------------
+
+def connect(name):
+    c = configs().get(name)
+    if not c:
+        return 'No VPN %s' % name
+    disconnect()
+    os.makedirs(RUN, exist_ok=True)
+    path, k = c
+    log('connecting %s (%s)' % (name, k))
+    error = openvpn_up(name, path) if k == 'openvpn' else wg_up(path)
+    if error:
+        log(error)
+        disconnect()
+        return error
+    with open(RUN + '/name', 'w') as f:
+        f.write(name)
+    log('on: %s' % name)
+    return None
+
+
+def disconnect():
+    name = current()
+    if alive(RUN + '/openvpn.pid'):
+        with open(RUN + '/openvpn.pid') as f:
+            try:
+                os.kill(int(f.read()), 15)
+            except (OSError, ValueError):
+                pass
+        for _ in range(20):
+            if not alive(RUN + '/openvpn.pid'):
+                break
+            time.sleep(0.25)
+    if os.path.exists('/sys/class/net/' + WG):
+        wg_down()
+    restore_dns()
+    for n in ('name', 'openvpn.pid', 'wg.conf'):
+        try:
+            os.unlink(os.path.join(RUN, n))
+        except OSError:
+            pass
+    if name:
+        log('off: %s' % name)
+
+
+def import_file(path, user=None, password=None):
+    k = kind(path)
+    if not k:
+        return 'Not an OpenVPN or WireGuard file'
+    os.makedirs(DIR, mode=0o700, exist_ok=True)
+    base = re.sub(r'[^\w.-]+', '_', os.path.basename(path)).rsplit('.', 1)[0][:40] or 'vpn'
+    dest = os.path.join(DIR, base + ('.ovpn' if k == 'openvpn' else '.conf'))
+    shutil.copy(path, dest)
+    os.chmod(dest, 0o600)
+    if user:
+        auth = os.path.join(DIR, base + '.auth')
+        fd = os.open(auth, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write('%s\n%s\n' % (user, password or ''))
+    log('added %s (%s)' % (base, k))
+    return None
+
+
+def needs_login(path):
+    """An OpenVPN file that asks for a user name and password, and doesn't name a file with them"""
+    try:
+        with open(path, errors='replace') as f:
+            return bool(re.search(r'^\s*auth-user-pass\s*$', f.read(), re.M))
+    except OSError:
+        return False
+
+
+# ---- the menu (as the user) -----------------------------------------------------------------------
+
+def rofi(prompt, items, message=None):
+    cmd = ['rofi', '-dmenu', '-i', '-format', 'i', '-p', prompt,
+           '-theme-str', 'listview { lines: %d; }' % max(1, min(len(items), 12))]
+    if message:
+        cmd += ['-mesg', message]
+    r = subprocess.run(cmd, input='\n'.join(items), capture_output=True, text=True)
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        return None
+
+
+def ask(prompt, password=False):
+    cmd = ['rofi', '-dmenu', '-p', prompt, '-theme-str', 'listview { lines: 0; }']
+    if password:
+        cmd.insert(2, '-password')
+    r = subprocess.run(cmd, input='', capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def notify(text):
+    subprocess.call(['ozone-notify', text], stderr=subprocess.DEVNULL)
+
+
+def root(*args):
+    return subprocess.run(['sudo', '-n', sys.argv[0]] + list(args), capture_output=True, text=True)
+
+
+def found_files():
+    """VPN files the user can add: in ~/VPN, ~/Downloads and the top of each drive"""
+    out = []
+    folders = [os.path.expanduser('~/VPN'), os.path.expanduser('~/Downloads')]
+    try:
+        folders += [os.path.join('/media', d) for d in os.listdir('/media')]
+    except OSError:
+        pass
+    for d in folders:
+        try:
+            for n in sorted(os.listdir(d)):
+                p = os.path.join(d, n)
+                if n.lower().endswith(('.ovpn', '.conf')) and os.path.isfile(p) and kind(p):
+                    out.append(p)
+        except OSError:
+            pass
+    return out
+
+
+def menu():
+    while True:
+        names = json.loads(root('list').stdout or '[]')
+        on = current()
+        items = ['%s  %s%s' % ('●' if n == on else '○', n, '   (connected)' if n == on else '') for n in names]
+        extra = (['Disconnect'] if on else []) + ['Add a VPN file…'] + (['Remove one…'] if names else [])
+        i = rofi('VPN', items + extra, 'On: %s' % on if on else
+                 'OpenVPN (.ovpn) or WireGuard (.conf) files from the provider: put them in VPN or Downloads, '
+                 'or on a USB drive, and add them here')
+        if i is None:
+            return 0
+        if i < len(names):
+            notify('VPN: connecting to %s…' % names[i])
+            r = root('connect', names[i])
+            notify(r.stdout.strip() or r.stderr.strip() or 'VPN on: %s' % names[i])
+            continue
+        action = extra[i - len(names)]
+        if action == 'Disconnect':
+            root('disconnect')
+            notify('VPN off')
+        elif action.startswith('Add'):
+            files = found_files()
+            if not files:
+                notify('No .ovpn or .conf files in VPN, Downloads or on a USB drive')
+                continue
+            j = rofi('Add', [os.path.basename(f) + '   ' + os.path.dirname(f) for f in files])
+            if j is None:
+                continue
+            args = ['import', files[j]]
+            if needs_login(files[j]):
+                user = ask('VPN user name')
+                if user is None:
+                    continue
+                password = ask('VPN password', password=True)
+                if password is None:
+                    continue
+                args += [user, password]
+            r = root(*args)
+            notify(r.stdout.strip() or r.stderr.strip() or 'VPN added: %s' % os.path.basename(files[j]))
+        else:
+            j = rofi('Remove', names)
+            if j is not None:
+                root('remove', names[j])
+                notify('VPN removed: %s' % names[j])
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else 'menu'
+    if cmd in ('connect', 'disconnect', 'import', 'remove', 'list', 'dns'):
+        if os.geteuid() != 0:
+            sys.exit('as root')
+        if cmd == 'list':
+            print(json.dumps(list(configs())))
+        elif cmd == 'connect' and len(argv) == 3:
+            error = connect(argv[2])
+            if error:
+                print(error)
+                return 1
+        elif cmd == 'disconnect':
+            disconnect()
+        elif cmd == 'import' and len(argv) in (3, 5):
+            error = import_file(argv[2], *argv[3:5])
+            if error:
+                print(error)
+                return 1
+        elif cmd == 'remove' and len(argv) == 3:
+            if current() == argv[2]:
+                disconnect()
+            for ext in ('.ovpn', '.conf', '.auth'):
+                p = os.path.join(DIR, argv[2] + ext)
+                if os.path.exists(p):
+                    os.unlink(p)
+        elif cmd == 'dns':   # OpenVPN's up / down script
+            if argv[2:]:
+                save_dns([a for a in argv[2:] if re.match(r'^[\d.]+$', a)])
+            else:
+                restore_dns()
+        else:
+            sys.exit(__doc__)
+        return 0
+    if cmd == 'status':
+        name = current()
+        print('on: %s' % name if name else 'off')
+        return 0
+    if cmd == 'menu':
+        return menu()
+    sys.exit(__doc__)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
