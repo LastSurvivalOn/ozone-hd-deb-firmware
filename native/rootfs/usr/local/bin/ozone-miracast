@@ -768,22 +768,31 @@ class App:
         ctl.request('P2P_STOP_FIND')
         ctl.request('P2P_EXT_LISTEN 300 400')
 
-    def connect(self, ctl, addr, how):
-        """Once per peer and attempt: a GO negotiation request can follow a provision discovery"""
-        if self.connecting == addr and time.time() - self.connecting_at < 30:
-            return
-        self.connecting, self.connecting_at = addr, time.time()
-        # no more listening meanwhile: its turns on the radio held up the group (the scan for the
-        # phone's group was put off by 5 s, its own group's beacons came too late)
+    def quiet(self, ctl):
+        """No more listening while a group forms: its turns on the radio held it up (the scan for
+        the phone's group was put off by 5 s, the box's own group's beacons came too late)"""
         ctl.request('P2P_EXT_LISTEN')
         ctl.request('P2P_STOP_FIND')
+
+    def connect(self, ctl, addr, how):
+        """Once per peer, way and attempt. After a provision discovery (the phone asked, with a
+        button press or a PIN) the phone starts the GO negotiation itself: it is authorized for it
+        ("auth"); starting one from here failed then, as a phone known only from its probe
+        requests is not one to connect to. A GO negotiation request from a phone not authorized
+        yet (it skipped the provision discovery) is answered with one of ours"""
+        if (self.connecting, self.connecting_how) == (addr, how) and time.time() - self.connecting_at < 30:
+            return
+        self.connecting, self.connecting_how, self.connecting_at = addr, how, time.time()
+        if not how.endswith(' auth'):   # an authorized phone still has to reach the box: listening on
+            self.quiet(ctl)
         r = ctl.request('P2P_CONNECT %s %s' % (addr, how), timeout=10)
         log('connect %s %s: %s' % (addr, how.split()[-1], r))
 
     def wait_group(self, ev, ctl, peers):
         """Phones asking to connect, until a group starts: (iface, role, the peer's device address)"""
         find_at = time.time()
-        self.connecting, self.connecting_at = None, 0
+        self.connecting, self.connecting_how, self.connecting_at = None, None, 0
+        pins = {}   # address -> the PIN shown for it
         while not self.quit.is_set():
             e = ev.event(1)
             if time.time() - find_at > 120:   # the listen times out by itself now and then
@@ -802,22 +811,34 @@ class App:
                 find_at = time.time()
             elif what == 'P2P-DEVICE-FOUND' and addr:
                 self.peer_info(ctl, addr, peers)
-            elif what in ('P2P-PROV-DISC-PBC-REQ', 'P2P-GO-NEG-REQUEST') and addr:
+            elif what == 'P2P-PROV-DISC-PBC-REQ' and addr:
+                name, _p = peers.get(addr) or self.peer_info(ctl, addr, peers)
+                self.say('Connecting to %s…' % name)
+                self.connect(ctl, addr, 'pbc auth')
+            elif what == 'P2P-GO-NEG-SUCCESS':
+                ctl.request('P2P_EXT_LISTEN')   # the group next (see quiet)
+            elif what == 'P2P-GO-NEG-REQUEST' and addr:
                 name, _p = peers.get(addr) or self.peer_info(ctl, addr, peers)
                 m = re.search(r'dev_passwd_id=(\d+)', e)
-                if what == 'P2P-GO-NEG-REQUEST' and m and m.group(1) == '1':
-                    continue   # a PIN that we show: P2P-PROV-DISC-SHOW-PIN says which
+                pw = m.group(1) if m else '4'
                 self.say('Connecting to %s…' % name)
-                self.connect(ctl, addr, 'pbc')
+                if pw == '1' and addr in pins:   # the PIN shown here, typed on the phone
+                    self.connect(ctl, addr, '%s display' % pins[addr])
+                elif pw == '5' and addr in pins:   # one the phone showed, typed here
+                    self.connect(ctl, addr, '%s keypad' % pins[addr])
+                elif pw == '4':
+                    self.connect(ctl, addr, 'pbc')
             elif what == 'P2P-PROV-DISC-SHOW-PIN' and addr and len(f) > 2:
                 name, _p = peers.get(addr) or self.peer_info(ctl, addr, peers)
                 self.say('Type this PIN on %s:' % name, pin=f[2])
-                self.connect(ctl, addr, '%s display' % f[2])
+                pins[addr] = f[2]
+                self.connect(ctl, addr, '%s display auth' % f[2])
             elif what == 'P2P-PROV-DISC-ENTER-PIN' and addr:
                 name, _p = peers.get(addr) or self.peer_info(ctl, addr, peers)
                 pin = self.ask_pin(name)
                 if pin:
-                    self.connect(ctl, addr, '%s keypad' % pin)
+                    pins[addr] = pin
+                    self.connect(ctl, addr, '%s keypad auth' % pin)
             elif what in ('P2P-GO-NEG-FAILURE', 'P2P-GROUP-FORMATION-FAILURE', 'WPS-FAIL'):
                 self.say('Connecting failed: try again on the phone')
                 self.connecting = None
