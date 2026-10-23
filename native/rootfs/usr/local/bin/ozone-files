@@ -853,7 +853,8 @@ class Window:
         left.get_style_context().add_class('places')
         self.places = Gtk.ListBox()
         self.places.connect('row-activated', lambda lb, row: self.open_folder(row.path, focus=True))
-        self.places.connect('row-selected', lambda lb, row: row and self.open_folder(row.path))
+        self.places.connect('row-selected', lambda lb, row: row and not self.marking_place and self.open_folder(row.path))
+        self.marking_place = False   # the place shown as the current one, not chosen
         left.add(self.places)
         body.pack_start(left, False, False, 0)
         self.scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
@@ -898,7 +899,8 @@ class Window:
         self.win.show_all()
         self.folder = None
         start = folder or self.state.get('last')
-        self.open_folder(start if start and os.path.isdir(start) else (places()[0][1]), focus=bool(folder))
+        # the cursor in the list from the start (or on the place, when the folder is empty)
+        self.open_folder(start if start and os.path.isdir(start) else (places()[0][1]), focus=True)
         GLib.timeout_add_seconds(1, self.update_music)
         GLib.timeout_add_seconds(5, self.refresh_places)
 
@@ -924,6 +926,8 @@ class Window:
             self.fill_places()
             if self.folder and not os.path.isdir(self.folder):
                 self.open_folder(HOME)
+            else:
+                self.mark_place(self.folder)
         return True
 
     def open_folder(self, path, focus=False, select=None):
@@ -961,12 +965,27 @@ class Window:
         for r in self.rows:
             if r.path in self.marked:
                 r.check.show()
+        self.mark_place(path)
         index = next((i for i, r in enumerate(self.rows) if r.path == select), 0)
         if self.rows:
             self.list.select_row(self.rows[index])
             if focus:
                 self.rows[index].grab_focus()
+        elif focus and self.places.get_selected_row():   # nothing here: the cursor on the place
+            self.places.get_selected_row().grab_focus()
         self.scroll.get_vadjustment().set_value(0)
+
+    def mark_place(self, path):
+        """The place the folder is in, highlighted on the left (the deepest one that holds it)"""
+        best = None
+        for row in self.places.get_children():
+            p = getattr(row, 'path', None)
+            if p and (path == p or path.startswith(p.rstrip('/') + '/')) and (best is None or len(p) > len(best.path)):
+                best = row
+        if best is not None and best is not self.places.get_selected_row():
+            self.marking_place = True
+            self.places.select_row(best)
+            self.marking_place = False
 
     def empty(self, text):
         row = Gtk.ListBoxRow(selectable=False, activatable=False)
@@ -1531,9 +1550,11 @@ class Window:
             if row:
                 row.grab_focus()
             return True
-        if k == 'Left' and in_list:
-            row = self.places.get_selected_row()
-            (row or self.places).grab_focus()
+        if k == 'Left' and not in_places:   # from the files, or from wherever the focus was
+            self.mark_place(self.folder)
+            row = self.places.get_selected_row() or (self.places.get_children() or [None])[0]
+            if row is not None:
+                row.grab_focus()
             return True
         # the music's buttons: down from the end of the list, up or exit back into it
         if k == 'Down' and in_list and self.bar.get_visible() and self.rows and focus is self.rows[-1]:
@@ -1555,6 +1576,7 @@ class Window:
             if in_list and self.folder not in [p[1] for p in self.place_list] and parent:
                 self.open_folder(parent, focus=True, select=self.folder)
             elif in_list:
+                self.mark_place(self.folder)
                 (self.places.get_selected_row() or self.places).grab_focus()
             else:
                 self.win.destroy()
