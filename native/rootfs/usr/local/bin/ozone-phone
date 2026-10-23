@@ -1,0 +1,108 @@
+#!/usr/bin/python3
+"""ozone-phone: the remote control on a phone. ozone-remote serves it (a web page on port 8080, to
+the home network only); this shows its address and a QR code to open it with the phone's camera.
+
+  ozone-phone show     the address and the QR code (exit or OK closes it)
+  ozone-phone status   "on: http://ADDRESS:8080" if it answers, for the Network menu
+"""
+import socket
+import subprocess
+import sys
+import urllib.request
+
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('Gdk', '3.0')
+gi.require_version('GdkPixbuf', '2.0')
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk  # noqa: E402
+
+PORT = 8080
+
+CSS = b"""
+* { font-family: "DejaVu Sans"; color: #cdd6f4; }
+window { background: #11111b; }
+.title { font-size: 26px; font-weight: bold; }
+.url { font-family: "JetBrains Mono"; font-size: 30px; color: #cba6f7; }
+.hint { font-size: 16px; color: #a6adc8; }
+"""
+
+
+def address():
+    """The box's address on the home network: the one its way out uses"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('192.0.2.1', 9))   # no packet goes: it only picks the route
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def url():
+    a = address()
+    return 'http://%s:%d' % (a, PORT) if a else None
+
+
+def answers():
+    try:
+        with urllib.request.urlopen('http://127.0.0.1:%d/' % PORT, timeout=2) as r:
+            return r.status == 200
+    except OSError:
+        return False
+
+
+def show():
+    u = url()
+    try:
+        Gtk.CssProvider().load_from_data(b'* { padding: 0px; }')   # see yt: the first number of the
+    except GLib.Error:                                             # first stylesheet fails to parse
+        pass
+    css = Gtk.CssProvider()
+    css.load_from_data(CSS)
+    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    win = Gtk.Window(title='Phone remote')
+    win.set_default_size(1280, 720)
+    win.connect('destroy', Gtk.main_quit)
+    win.connect('key-press-event', lambda w, e: (win.destroy(), True)[1]
+                if Gdk.keyval_name(e.keyval) in ('Escape', 'Return', 'KP_Enter', 'BackSpace') else False)
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18, valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER)
+    title = Gtk.Label(label='The remote control on your phone')
+    title.get_style_context().add_class('title')
+    box.pack_start(title, False, False, 0)
+    if u and answers():
+        png = subprocess.run(['qrencode', '-t', 'PNG', '-s', '9', '-m', '2', '-o', '-', u], capture_output=True).stdout
+        if png:
+            loader = GdkPixbuf.PixbufLoader()
+            loader.write(png)
+            loader.close()
+            box.pack_start(Gtk.Image.new_from_pixbuf(loader.get_pixbuf()), False, False, 0)
+        lb = Gtk.Label(label=u)
+        lb.get_style_context().add_class('url')
+        box.pack_start(lb, False, False, 0)
+        hint = 'Point the phone\'s camera at the code, or open this address in its browser.\n' \
+               'The phone has to be on the same home network (WiFi) as the box.'
+    else:
+        hint = 'It isn\'t running: it starts with the desktop (ozone-remote).' if u else 'The box has no network.'
+    h = Gtk.Label(label=hint, justify=Gtk.Justification.CENTER)
+    h.get_style_context().add_class('hint')
+    box.pack_start(h, False, False, 0)
+    win.add(box)
+    win.show_all()
+    GLib.set_prgname('ozone-phone')
+    Gtk.main()
+    return 0
+
+
+def main(argv):
+    if argv[1:] == ['status']:
+        u = url()
+        print('on: %s' % u if u and answers() else 'off')
+        return 0
+    if argv[1:] in ([], ['show']):
+        return show()
+    sys.exit(__doc__)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

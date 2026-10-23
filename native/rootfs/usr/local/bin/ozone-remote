@@ -14,6 +14,9 @@ which kbd-merge merges into X's keyboard like any other. On the way it adds:
            closes the TV window (Esc); any other window it closes.
   info     the panel, over a fullscreen window too (ozone-panel); in mouse mode the right button.
            In the player: the video's info (TV: the channel's, and the signal); in Files a file's.
+  phone    the same remote as a web page, http://BOX:8080 from a phone on the home network
+           (ozone-phone shows the address and a QR code): every button, a touchpad for the
+           pointer, and text typed on the phone's own keyboard.
   Power    sleep (ozone-standby) when let go; any button wakes the box (ozone-standby can't see
            the remote, which is held here, so this wakes it). Held for 2 s: power off (the box's
            deep sleep, red LED; Power turns it on again).
@@ -27,7 +30,10 @@ If this isn't running, kbd-merge still passes the remote on as plain keys.
   ozone-remote status   the panel's indicator
 """
 import fcntl
+import ipaddress
+import json
 import os
+import threading
 import signal
 import struct
 import subprocess
@@ -580,6 +586,225 @@ class Remote:
         return subprocess.call(['pgrep', '-f', '^amplay .*--t[v]'], stdout=subprocess.DEVNULL) == 0
 
 
+# ---- the remote on a phone: a web page ------------------------------------------------------------
+
+PHONE_PORT = 8080
+# the page's buttons, as the IR remote's keys (remote.conf)
+PHONE_KEYS = {
+    'power': 'KEY_POWER', 'mute': 'KEY_MUTE', 'home': 'KEY_HOMEPAGE', 'browse': 'KEY_WWW', 'usb': 'KEY_F16',
+    'volup': 'KEY_VOLUMEUP', 'voldown': 'KEY_VOLUMEDOWN', 'pageup': 'KEY_PAGEUP', 'pagedown': 'KEY_PAGEDOWN',
+    'up': 'KEY_UP', 'down': 'KEY_DOWN', 'left': 'KEY_LEFT', 'right': 'KEY_RIGHT', 'ok': 'KEY_ENTER',
+    'exit': 'KEY_ESC', 'info': 'KEY_F13', 'text': 'KEY_F14', 'epg': 'KEY_F15', 'mouse': 'KEY_F19',
+    'red': 'KEY_PROG1', 'green': 'KEY_PROG2', 'yellow': 'KEY_PROG3', 'blue': 'KEY_PROG4',
+    'pause': 'KEY_PLAYPAUSE', 'stop': 'KEY_STOPCD', 'rewind': 'KEY_REWIND', 'forward': 'KEY_FASTFORWARD',
+    'delete': 'KEY_BACKSPACE', 'tv': 'KEY_F17', 'radio': 'KEY_F18', 'record': 'KEY_RECORD',
+    **{str(d): 'KEY_%d' % d for d in range(10)},
+}
+REPEATS = {'KEY_UP', 'KEY_DOWN', 'KEY_LEFT', 'KEY_RIGHT', 'KEY_VOLUMEUP', 'KEY_VOLUMEDOWN', 'KEY_PAGEUP',
+           'KEY_PAGEDOWN', 'KEY_BACKSPACE', 'KEY_REWIND', 'KEY_FASTFORWARD', 'KEY_POWER'}
+
+PHONE_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#11111b"><title>Ozone remote</title>
+<style>
+:root { --bg:#11111b; --btn:#1e1e2e; --line:#313244; --text:#cdd6f4; --sub:#a6adc8; --acc:#cba6f7; }
+* { box-sizing:border-box; -webkit-tap-highlight-color:transparent; user-select:none; -webkit-user-select:none; }
+body { margin:0; background:var(--bg); color:var(--text); font:16px system-ui, sans-serif; touch-action:manipulation; }
+main { max-width:420px; margin:0 auto; padding:12px 14px 24px; }
+.tabs { display:flex; gap:6px; margin-bottom:12px; }
+.tabs button { flex:1; padding:10px; border-radius:10px; border:1px solid var(--line); background:var(--btn); color:var(--sub); font:inherit; }
+.tabs button.on { color:var(--bg); background:var(--acc); border-color:var(--acc); }
+.row { display:grid; gap:8px; margin:8px 0; }
+.c3 { grid-template-columns:repeat(3,1fr); } .c4 { grid-template-columns:repeat(4,1fr); } .c2 { grid-template-columns:1fr 1fr; }
+.k { padding:14px 4px; border-radius:14px; border:1px solid var(--line); background:var(--btn); color:var(--text);
+     font:inherit; font-size:15px; min-height:52px; }
+.k:active, .k.held { background:var(--line); }
+.pad { display:grid; grid-template-columns:repeat(3,1fr); grid-template-rows:repeat(3,64px); gap:8px; margin:14px 0; }
+.pad .k { font-size:22px; } .pad .ok { border-radius:50%; background:var(--acc); color:var(--bg); font-weight:bold; }
+.red{background:#f38ba8;color:#11111b}.green{background:#a6e3a1;color:#11111b}.yellow{background:#f9e2af;color:#11111b}.blue{background:#89b4fa;color:#11111b}
+.power { color:#f38ba8; }
+#touch { height:300px; border-radius:16px; border:1px dashed var(--line); background:#181825; display:flex;
+         align-items:center; justify-content:center; color:var(--sub); text-align:center; touch-action:none; }
+textarea { width:100%; height:90px; border-radius:12px; border:1px solid var(--line); background:var(--btn);
+           color:var(--text); font:inherit; padding:10px; }
+.hidden { display:none; } .hint { color:var(--sub); font-size:13px; margin-top:12px; }
+#state { color:var(--sub); font-size:13px; text-align:center; min-height:18px; }
+</style></head><body><main>
+<div class="tabs"><button class="on" data-tab="keys">Remote</button><button data-tab="mouse">Touchpad</button><button data-tab="type">Type</button></div>
+<div id="keys">
+ <div class="row c4"><button class="k power" data-k="power">&#x23FB;</button><button class="k" data-k="mute">Mute</button><button class="k" data-k="home">Home</button><button class="k" data-k="info">Info</button></div>
+ <div class="pad"><span></span><button class="k" data-k="up">&#x25B2;</button><span></span>
+  <button class="k" data-k="left">&#x25C0;</button><button class="k ok" data-k="ok">OK</button><button class="k" data-k="right">&#x25B6;</button>
+  <span></span><button class="k" data-k="down">&#x25BC;</button><span></span></div>
+ <div class="row c3"><button class="k" data-k="exit">Exit</button><button class="k" data-k="delete">Delete</button><button class="k" data-k="text">Keyboard</button></div>
+ <div class="row c4"><button class="k" data-k="volup">Vol +</button><button class="k" data-k="voldown">Vol &minus;</button><button class="k" data-k="pageup">Page +</button><button class="k" data-k="pagedown">Page &minus;</button></div>
+ <div class="row c4"><button class="k red" data-k="red">&nbsp;</button><button class="k green" data-k="green">&nbsp;</button><button class="k yellow" data-k="yellow">&nbsp;</button><button class="k blue" data-k="blue">&nbsp;</button></div>
+ <div class="row c4"><button class="k" data-k="rewind">&#x23EA;</button><button class="k" data-k="pause">&#x23EF;</button><button class="k" data-k="forward">&#x23E9;</button><button class="k" data-k="stop">&#x23F9;</button></div>
+ <div class="row c4"><button class="k" data-k="tv">TV</button><button class="k" data-k="epg">Guide</button><button class="k" data-k="browse">Web</button><button class="k" data-k="usb">Files</button></div>
+ <div class="row c3"><button class="k" data-k="1">1</button><button class="k" data-k="2">2</button><button class="k" data-k="3">3</button>
+  <button class="k" data-k="4">4</button><button class="k" data-k="5">5</button><button class="k" data-k="6">6</button>
+  <button class="k" data-k="7">7</button><button class="k" data-k="8">8</button><button class="k" data-k="9">9</button>
+  <button class="k" data-k="mouse">Mouse</button><button class="k" data-k="0">0</button><button class="k" data-k="record">&#x23FA;</button></div>
+</div>
+<div id="mouse" class="hidden">
+ <div id="touch">Slide to move the pointer<br>tap: click &nbsp; two fingers: scroll</div>
+ <div class="row c2"><button class="k" id="lclick">Click</button><button class="k" id="rclick">Right click</button></div>
+</div>
+<div id="type" class="hidden">
+ <textarea id="text" placeholder="Type here, then Send: it goes where the cursor is on the TV (a search, an address)"></textarea>
+ <div class="row c3"><button class="k" id="send">Send</button><button class="k" data-k="delete">Delete</button><button class="k" data-k="ok">Enter</button></div>
+</div>
+<div id="state"></div>
+<p class="hint">Add this page to the home screen to have it as an app.</p>
+</main><script>
+const state = document.getElementById('state');
+function post(path, body) {
+  return fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)})
+    .then(r => { state.textContent = r.ok ? '' : 'The box refused it'; })
+    .catch(() => { state.textContent = 'No connection to the box'; });
+}
+document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('.tabs button').forEach(x => x.classList.toggle('on', x === b));
+  ['keys','mouse','type'].forEach(t => document.getElementById(t).classList.toggle('hidden', t !== b.dataset.tab));
+});
+document.querySelectorAll('[data-k]').forEach(b => {
+  const k = b.dataset.k;
+  const down = e => { e.preventDefault(); b.classList.add('held'); if (navigator.vibrate) navigator.vibrate(12); post('/key', {key:k, down:1}); };
+  const up = e => { e.preventDefault(); if (!b.classList.contains('held')) return; b.classList.remove('held'); post('/key', {key:k, down:0}); };
+  b.addEventListener('pointerdown', down); b.addEventListener('pointerup', up);
+  b.addEventListener('pointercancel', up); b.addEventListener('pointerleave', up);
+});
+const pad = document.getElementById('touch');
+let last = null, moved = 0, fingers = 0, acc = {x:0, y:0}, t0 = 0, timer = null;
+function flush() { timer = null; if (acc.x || acc.y) { post('/move', {dx:Math.round(acc.x), dy:Math.round(acc.y), scroll:fingers > 1}); acc = {x:0, y:0}; } }
+pad.addEventListener('touchstart', e => { e.preventDefault(); fingers = e.touches.length; const t = e.touches[0]; last = {x:t.clientX, y:t.clientY}; moved = 0; t0 = Date.now(); });
+pad.addEventListener('touchmove', e => { e.preventDefault(); const t = e.touches[0]; const dx = t.clientX - last.x, dy = t.clientY - last.y;
+  last = {x:t.clientX, y:t.clientY}; moved += Math.abs(dx) + Math.abs(dy); const f = fingers > 1 ? 0.15 : 2.2;
+  acc.x += dx * f; acc.y += dy * f; if (!timer) timer = setTimeout(flush, 40); });
+pad.addEventListener('touchend', e => { e.preventDefault(); if (e.touches.length) return; if (moved < 8 && Date.now() - t0 < 300) post('/click', {button: fingers > 1 ? 'right' : 'left'}); fingers = 0; });
+document.getElementById('lclick').onclick = () => post('/click', {button:'left'});
+document.getElementById('rclick').onclick = () => post('/click', {button:'right'});
+document.getElementById('send').onclick = () => { const t = document.getElementById('text'); if (t.value) post('/type', {text:t.value}).then(() => t.value = ''); };
+</script></body></html>
+"""
+
+
+class PhoneServer:
+    """The page and its requests, in a thread; what they do happens in GTK's (the Remote)"""
+
+    def __init__(self, remote):
+        import http.server
+        self.remote = remote
+        self.held = {}   # key -> repeat timer
+        server = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def allowed(self):
+                try:
+                    ip = ipaddress.ip_address(self.client_address[0])
+                except ValueError:
+                    return False
+                if getattr(ip, 'ipv4_mapped', None):
+                    ip = ip.ipv4_mapped
+                return ip.is_private or ip.is_loopback   # the home network only
+
+            def reply(self, code, body=b'', ctype='text/plain'):
+                self.send_response(code)
+                self.send_header('Content-Type', ctype)
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if not self.allowed():
+                    return self.reply(403)
+                if self.path in ('/', '/index.html'):
+                    return self.reply(200, PHONE_PAGE.encode(), 'text/html; charset=utf-8')
+                self.reply(404)
+
+            def do_POST(self):
+                if not self.allowed():
+                    return self.reply(403)
+                try:
+                    n = int(self.headers.get('Content-Length') or 0)
+                    data = json.loads(self.rfile.read(min(n, 65536)) or b'{}')
+                except ValueError:
+                    return self.reply(400)
+                ok = server.handle(self.path, data)
+                self.reply(200 if ok else 400)
+
+        class Server(http.server.ThreadingHTTPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+        try:
+            self.httpd = Server(('0.0.0.0', PHONE_PORT), Handler)
+        except OSError as e:
+            log('phone remote: port %d: %s' % (PHONE_PORT, e))
+            return
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        log('phone remote on port %d' % PHONE_PORT)
+
+    def handle(self, path, data):
+        r = self.remote
+        if path == '/key':
+            name = PHONE_KEYS.get(str(data.get('key')))
+            if not name:
+                return False
+            code = getattr(E, name)
+            down = bool(data.get('down'))
+            GLib.idle_add(self.key, name, code, down)
+            return True
+        if path == '/move':
+            dx, dy = int(data.get('dx', 0)), int(data.get('dy', 0))
+            if data.get('scroll'):
+                if dy:
+                    GLib.idle_add(lambda: r.mouse.emit((E.EV_REL, E.REL_WHEEL, -1 if dy > 0 else 1)) and False)
+            else:
+                GLib.idle_add(lambda: r.mouse.emit((E.EV_REL, E.REL_X, dx), (E.EV_REL, E.REL_Y, dy)) and False)
+            return True
+        if path == '/click':
+            button = E.BTN_RIGHT if data.get('button') == 'right' else E.BTN_LEFT
+            GLib.idle_add(lambda: (r.mouse.key(button, 1), r.mouse.key(button, 0)) and False)
+            return True
+        if path == '/type':
+            text = str(data.get('text', ''))[:2000]
+            if text:
+                Keyboard.xdotool('type', '--clearmodifiers', '--', text)
+            return True
+        return False
+
+    def key(self, name, code, down):
+        """A press and its release from the page, as the IR remote's (held: repeats as it does)"""
+        timer = self.held.pop(name, None)
+        if timer:
+            GLib.source_remove(timer)
+        if down:
+            self.remote.key(code, 1)
+            if name in REPEATS:
+                self.held[name] = GLib.timeout_add(400, self.repeat, name, code, True)
+            else:   # a release that never comes (the phone's page closed) can't leave it down
+                self.held[name] = GLib.timeout_add(8000, self.key, name, code, False)
+        else:
+            self.remote.key(code, 0)
+        return False
+
+    def repeat(self, name, code, first):
+        if name not in self.held:
+            return False
+        self.remote.key(code, 2)
+        if first:   # every 110 ms from now on, for 30 s at most
+            self.held[name] = GLib.timeout_add(110, self.repeat, name, code, False)
+            GLib.timeout_add(30000, self.key, name, code, False)
+            return False
+        return True
+
+
 def main():
     if daemon_pid():
         sys.exit('%s is already running' % NAME)
@@ -592,6 +817,7 @@ def main():
     Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css,
                                              Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
     remote = Remote()
+    PhoneServer(remote)
     try:
         Gtk.main()
     finally:
