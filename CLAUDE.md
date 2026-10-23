@@ -103,6 +103,8 @@ Several of these were found by bricking or hanging the box. Don't undo them.
     also loaded glvnd's `libGL.so.1` (WebKit), a plain call from the shim binds to glvnd's stubs:
     call libMali through `MALI()`. Link the shim with `--no-as-needed -lMali`, or the dependency
     is dropped and every GL program breaks.
+- **Display and sound settings:** `/etc/ozone/display` (written by `ozone-display`); `lib/ozone/set-mode` sets the output mode and the desktop scaler for it (boot, hdmi-watch, ozone-display, amplay's frame-rate matching), `lib/ozone/sound-config` writes `/etc/asound.conf` (HDMI = device 1, analog jack = device 0, the equalizer). With softvol and a float plugin (alsaequal, LADSPA) in one chain, every plug needs format, channels and rate pinned, or ALSA finds no configuration. A running hdmi-watch is the boot-time copy: restart it after changing it.
+- GDK key names for media keys have no `XF86` prefix (`AudioStop`, `Launch4`, `Tools`). mpv started with `ao=sdl` can hang on SIGTERM; stop it over its IPC (`quit`), or SIGKILL.
 - The CPU governor is `interactive` with all cores online (`ozone-hw`); the stock `hotplug` was slower for interactive use.
 - Run `sync` after deploying files to the box. A crash has left a 0-byte init script before.
 - Android's `/system` partition is nearly full and is mounted read-only. Remount it rw only briefly, as `autostart.sh` does (hybrid mode).

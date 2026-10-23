@@ -15,12 +15,13 @@ mouse work too.
 5. [The video player](#5-the-video-player)
 6. [Television (DVB-T2)](#6-television-dvb-t2)
 7. [The browser](#7-the-browser)
-8. [Sound](#8-sound)
+8. [Picture and sound settings](#8-picture-and-sound-settings)
 9. [When something goes wrong](#9-when-something-goes-wrong)
 10. [The remote control](#10-the-remote-control)
 11. [USB drives, SD cards and network folders](#11-usb-drives-sd-cards-and-network-folders)
-12. [Games](#12-games)
-13. [All key combinations](#13-all-key-combinations)
+12. [Files: videos, music and photos](#12-files-videos-music-and-photos)
+13. [Games](#13-games)
+14. [All key combinations](#14-all-key-combinations)
 
 ---
 
@@ -217,20 +218,36 @@ for example "This video is not available".
 
 ## 5. The video player
 
-The player is used by YouTube, TV and local files. Moving the mouse shows the controls:
+The player is used by YouTube, TV and the videos in **Files** (section 12). Moving the mouse, or a
+key, shows the controls:
 - at the top: the title and ✕ (close);
-- at the bottom: the buttons, the time, the progress bar and the volume.
+- at the bottom: the buttons, the time, the progress bar (with a tick at each chapter) and the volume.
 
 They hide again after 3 s.
 
-| Keys | Action |
-|---|---|
-| **Space**, **Enter** or **P** | pause / play |
-| **←** / **→** | back / forward 10 s |
-| **PgDn** / **PgUp** | back / forward 1 minute |
-| **↑** / **↓** | volume up / down |
-| **M** | mute on/off |
-| **Q**, **Esc** or **Backspace** | quit |
+| Keys | Remote | Action |
+|---|---|---|
+| **Space**, **Enter** or **P** | **OK**, **pause** | pause / play |
+| **←** / **→** | **<<** | back / forward 10 s |
+| **PgDn** / **PgUp** | **page− / page+** | back / forward 1 minute; in a video with chapters, the previous / next chapter |
+| **↑** / **↓** | **vol+ / vol−** | volume up / down |
+| **M** | **mute** | mute on/off |
+| **I** | **info** | what the video is: its tracks, subtitles, chapters, and what plays now |
+| **A** | **yellow** | the next audio track (languages, a commentary…) |
+| **S** | **green** | subtitles: the next language, then off |
+| **Z** | **blue** | picture shape: as it is, full screen, 4:3, 16:9 |
+| **R** | **red** | repeat: off, this video, all the videos of the folder |
+| **Q**, **Esc** or **Backspace** | **exit**, **stop** | quit (exit first closes the info) |
+
+**Subtitles** come from the video itself (text, or pictures as on DVDs and Blu-rays) or from a
+file next to it with the same name: `Film.mkv` takes `Film.srt`, `Film.ukr.srt`, `Film.en.ass`…
+Subtitle files in Windows Cyrillic (often the case with Ukrainian ones) show right too.
+
+**Videos in Files continue where they were stopped**, with the audio track, the subtitles and the
+repeat chosen last time; a video watched to its end starts from the beginning.
+
+What plays: H.264 and H.265 (HEVC) up to 1080p, MPEG-2 and MPEG-1, in the hardware decoder. Other
+video (MPEG-4 ASP / DivX, VP9, AV1…) goes to the software player, which manages about 360p.
 
 | Mouse | Action |
 |---|---|
@@ -425,13 +442,34 @@ window (section 4) through the hardware decoder, and other videos open in the vi
 the play button (F7). Some sites (Vimeo, social networks) only give their videos to signed-in
 users: sign in to the site in the browser first, and the player gets the browser's sign-in.
 
-## 8. Sound
+## 8. Picture and sound settings
 
-Sound comes out of the TV over HDMI.
+**Display and sound** in the app menu (**home** on the remote) has:
+
+- **Resolution**: **Auto** (as at power-on: HDMI if a TV answers, else the analog output), or one of
+  the modes the TV says it takes (1080p and 720p at 60 or 50 Hz, 576p, 480p), or **Analog** (PAL or
+  NTSC, for a TV on the yellow composite plug). A new mode has to be kept within 15 s with **Keep
+  it**; otherwise the old one comes back, so a TV that can't show it is no problem.
+- **Match the frame rate of videos**: while a video plays, the output switches to 50 Hz for 25 and
+  50 fps videos (European TV, most films from here) and to 60 Hz for 30 and 60 fps ones, so the
+  motion is even; it switches back afterwards. The TV goes dark for a second or two at each
+  switch, which is why it is off to begin with.
+- **Sound output**: **Auto** (HDMI; the analog jack when the picture goes out analog), **HDMI**,
+  or the **analog jack**.
+- **Digital sound**: **PCM** (the box decodes everything), or AC-3 and DTS as they are, for an AV
+  receiver that decodes them: **Auto** (only if the TV or receiver says it takes them) or
+  **Always**. Not tried with a receiver yet; with the TV's own speakers keep PCM.
+- **Equalizer…**: ten bands from 31 Hz to 16 kHz, for all the sound. **← / →** choose a band,
+  **↑ / ↓** its level, the digits a preset (bass, treble, voice, night…), **OK** turns it on and
+  off. Levels change at once; turning it on or off takes effect from the next thing that starts
+  playing.
+- **Screen edges (overscan)…**: the picture's edges, for a TV that cuts them off.
+
+**Volume:**
 
 | How | Action |
 |---|---|
-| keyboard volume / mute keys | volume ±5 %, mute |
+| keyboard volume / mute keys, the remote's **vol+ / vol−**, **mute** | volume ±5 %, mute |
 | wheel over the 🔈 percentage on the panel | volume |
 | click on 🔈 | mute on/off (the level comes back on the next click) |
 | **↑ / ↓**, **M** in the player | volume, mute |
@@ -464,9 +502,9 @@ The box's own remote can run everything by itself: point it at the box.
 | **home** | the open windows and all the apps (YouTube, TV, the browser, Power, Screen size, WiFi…) |
 | **browse** | the browser |
 | **usb** | the drives and network folders (section 11) |
-| **info** | the panel, over a full-screen window too (in mouse mode: the right mouse button); while watching TV, the channel's info |
-| red | YouTube; while watching TV, the next list of channels |
-| yellow, green, blue | in YouTube: the next tab, add to a playlist, remove (section 4); while watching TV: audio, subtitles, picture shape; in the TV window, green is the next list and blue the channel's menu |
+| **info** | the panel, over a full-screen window too (in mouse mode: the right mouse button); in the player, the video's info (TV: the channel's) |
+| red | YouTube; in the player, repeat; while watching TV, the next list of channels |
+| yellow, green, blue | in YouTube: the next tab, add to a playlist, remove (section 4); in the player and on TV: audio, subtitles, picture shape; in the TV window, green is the next list and blue the channel's menu |
 | **epg**, **dvb**, **TV/radio** | the TV window |
 | **vol+ / vol−**, **mute** | volume |
 | **page+ / page−** | in the player on TV: next / previous channel; in lists, a page up / down |
@@ -541,7 +579,42 @@ and whenever the network or that computer comes back. If it doesn't connect, a m
 a wrong user name or password, no such folder, the computer doesn't answer, or there's no computer
 by that name.
 
-## 12. Games
+## 12. Files: videos, music and photos
+
+**Files** (in the app menu, **Super+E**, or **Open in Files** in the drives menu) shows the places
+on the left (Videos, Music, Photos and Downloads in the box, TV recordings, every USB drive, SD
+card and network folder, Home) and a folder's files on the right: folders first, then videos 🎬,
+music 🎵 and photos 🖼, with their size and date. A video that was stopped says where.
+
+| Remote | Keys | Action |
+|---|---|---|
+| **↑ / ↓** | | choose |
+| **← / →** | | between the places and the files |
+| **OK** | **Enter** | open: a folder, a video, a piece of music, a photo |
+| **blue** | **Menu**, **F2**, a right click | the file's menu: play from the start, a slideshow, use for the screensaver, delete |
+| **pause** | **Space** | pause / play the music |
+| **stop** | | stop the music |
+| **<<** | | the music 10 s back |
+| **exit** | **Esc** | up a folder, then the places, then close |
+
+**Videos** play in the video player (section 5), from where they were left.
+
+**Music** plays in the window: **OK** on a song plays it and the songs after it in that folder.
+The bar at the bottom shows the song, the artist and the time, with buttons (go down to them with
+the arrows): previous, 10 s back, pause, 10 s forward, next, stop. The music stops when the window
+is closed.
+
+**Photos** open full screen: **← / →** the previous / next one, **OK** a slideshow (again: stop),
+**↑ / ↓** turn the photo, **info** (or **I**) its name, size and date, **exit** back to the files.
+
+**The screensaver**: after 10 minutes without a key, the mouse or the remote, a slideshow of the
+photos in **Photos** (or the folder chosen with **blue** on a folder → *Use for the screensaver's
+photos*), or a clock that moves about the screen if there are none. Any key or the mouse ends it,
+and that key does nothing else. Not while a video, music, TV or a game plays. **Screensaver** at
+the top of the window: on / off, after how many minutes, how long each photo stays, the folder,
+and **Try it**.
+
+## 13. Games
 
 **RetroArch** in the app menu (**Super+D**) plays games of these consoles:
 
@@ -564,7 +637,7 @@ Put the game files in the **Games** folder of your home folder, or on a USB driv
 
 A USB gamepad works too: plug it in before starting RetroArch.
 
-## 13. All key combinations
+## 14. All key combinations
 
 ### Anywhere
 | Keys | Action |

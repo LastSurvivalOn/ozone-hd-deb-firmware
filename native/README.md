@@ -40,7 +40,8 @@ Desktop packages:
 `xserver-xorg-core xserver-xorg-legacy xserver-xorg-video-fbdev xserver-xorg-input-evdev
 xserver-xorg-input-mouse xinit x11-xserver-utils x11-utils x11-xkb-utils xfonts-base bspwm sxhkd polybar rofi
 feh lxterminal fish bash-completion fonts-jetbrains-mono fonts-font-awesome fonts-noto-color-emoji mpv alsa-utils
-python3 nodejs dbus-x11 python3-gi gir1.2-webkit2-4.1 gir1.2-gtk-3.0 libglib2.0-bin xdotool wpasupplicant` (with `--no-install-recommends`), and to build amplay: `gcc libc6-dev make
+python3 nodejs dbus-x11 python3-gi gir1.2-webkit2-4.1 gir1.2-gtk-3.0 libglib2.0-bin xdotool wpasupplicant` (with `--no-install-recommends`;
+install-desktop.sh adds the equalizer's `libasound2-plugin-equal caps`), and to build amplay: `gcc libc6-dev make
 pkg-config libavformat-dev libavcodec-dev libswresample-dev libavutil-dev libasound2-dev libx11-dev
 libxft-dev libzvbi-dev`.
 
@@ -348,3 +349,69 @@ How the driver is driven, and what breaks it:
 - YouTube sends one long request at about twice the video's bit rate (~1 MB/s for 1080p60, on a
   cable that does 9.5), and a request for a 10 MB range at the full line rate. amplay reads HTTP
   files that way, as yt-dlp does: 78 MB in 45 s of 1080p60 instead of 49.
+- HEVC needs `dec_format` 15 (`VIDEO_DEC_FORMAT_HEVC`) in SYSINFO, or most frames come late and are
+  dropped. Measured with x265 test files: 1080p25 with B-frames and 720p play at 24-25 fps, as
+  H.264 does; MPEG-2 576i too. Every codec drops frames in the first 2-3 s (the kernel's start).
+
+Files (from `ozone-files`, or `amplay FILE`): `--report` prints where it stopped, the audio track,
+the subtitles and the repeat at the end, and `--start`, `--aid`, `--sid`, `--repeat` take them back.
+Audio tracks are the video's program's; a new one restarts the session at the same place (its
+decoder or passthrough between the two). Subtitles: every subtitle stream of the file is decoded
+in the demuxer's thread (it reads tens of seconds ahead, so a stream chosen later still has its
+lines) into one queue, and the chosen one is shown: pictures (DVB, PGS, DVD) as RGBA on the player
+window as for TV, text (SubRip, ASS without its styling, mov_text) by osd.c on dark boxes. Files
+next to the video (`NAME.srt`, `NAME.LANG.srt`, `.ass`, `.ssa`, `.vtt`) are read whole at the start
+with FFmpeg, as Windows-1251 if they aren't UTF-8. PgUp / PgDn jump between chapters where a file has
+them.
+
+**Frame rate** (`MATCH_RATE=1` in `/etc/ozone/display`): amplay switches the output to the 50 Hz
+mode of the current one for 25 and 50 fps (TV too), back to the 60 Hz one for 30 and 60, through
+`/usr/local/lib/ozone/set-mode` (the mode and the desktop scaler; `display/mode` and the scaler
+files are the video group's), before the decoder opens and back after it closes. The mode to go
+back to is kept in `/tmp/amplay-mode-UID`, so `amplay --reset` restores it after a crash. The
+kernel's own automation (`policy_fr_auto`) stays off: it oopses when a decoder closes.
+
+**Passthrough** (`PASSTHROUGH=on`, or `auto` and the EDID's `aud_cap` lists AC-3 / DTS): the
+packets go through FFmpeg's `spdif` muxer (IEC 61937 bursts in 16-bit stereo at the stream's rate)
+straight to `hw:0,1`, with `audiodsp/digital_raw` 2 and `digital_codec` set before it opens.
+softvol and the equalizer are bypassed (they would change the bits), so the volume is the
+receiver's. Not tried with a receiver: the HDMI transmitter still logs `Audio Type: PCM`, so the
+receiver has to detect the bursts itself, which most do.
+
+## Display and sound
+
+`ozone-display` (a rofi menu, "Display and sound") keeps its settings in `/etc/ozone/display`
+(`MODE`, `MATCH_RATE`, `SOUND`, `PASSTHROUGH`, `EQ`) and applies them with:
+
+- `/usr/local/lib/ozone/set-mode`: the output mode and the 1280x720 desktop scaled into it, with
+  ozone-screen's margins (kept in 1080p pixels) scaled to the mode. ozone-hw runs it at boot
+  (`--boot`: auto keeps u-boot's choice), hdmi-watch when a TV turns up on HDMI while the output is
+  analog (`--hdmi`: not if analog was chosen), amplay to match frame rates. A new mode has to be
+  confirmed within 15 s (`timeout rofi`), else the old one comes back.
+- `/usr/local/lib/ozone/sound-config`: writes `/etc/asound.conf` for the output (HDMI is device 1,
+  SPDIF; the analog jack is device 0, I2S; auto takes the analog jack with a `cvbs` mode) and the
+  equalizer. Tested: 576cvbs sets the scaler to 720x576 and the sound to device 0, and X carries
+  on; nothing was connected to the composite output to look at.
+- The equalizer is alsaequal (`libasound2-plugin-equal`, the caps LADSPA `Eq10` filter), its bands
+  in `/etc/ozone/alsaequal.bin` (audio group), which `ozone-equalizer` sets with `amixer -D equal`
+  and which play at once. In the chain softvol → plug → equal → plug → hw every plug has its format,
+  channels and rate pinned: left to negotiate, softvol and the float plugin found no configuration
+  ("snd1_pcm_hw_param_get_min: Assertion failed"), whatever the order. ~6 % CPU, whole 16-frame
+  blocks still reach the I2S driver (no "unligned").
+
+## Files, music, photos, screensaver
+
+`ozone-files` (GTK): places (the home folders, TV recordings, every mount in `/media`) and a
+folder's files. Videos go to `amplay --report` (mpv if it exits 3) with what was saved in
+`~/.local/share/ozone-files/state.json`; music to one `/usr/bin/mpv --no-video --ao=sdl` with a JSON
+IPC socket, the folder's songs as its playlist. The mpv has PR_SET_PDEATHSIG to SIGKILL: SIGTERM made it
+hang on a lock while quitting (SDL's audio thread). Photos: GdkPixbuf scaled while loading (a
+4000x3000 JPEG fits 1280x720 without decoding it whole), EXIF orientation applied, the next one
+loaded in a thread; shown in a Gtk.Image (cairo from Python needs python3-gi-cairo, which isn't
+installed).
+
+`ozone-screensaver` (started by bspwmrc) reads X's idle time from the MIT-SCREEN-SAVER extension
+(libXss through ctypes) every 15 s and starts `ozone-files --screensaver` after the minutes set,
+unless amplay, mpv or RetroArch runs or the box is in standby. The saver grabs the keyboard and
+pointer once it is mapped, so the first key ends it wherever the focus was.
+

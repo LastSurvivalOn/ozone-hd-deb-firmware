@@ -11,7 +11,10 @@ IP=$(box_ip "${1:-}")
 echo ">> system files"
 tar -C "$HERE/rootfs" -czf - \
     usr/local/lib/ozone/desktop usr/local/lib/ozone/gen-xorg-input usr/local/lib/ozone/kbd-merge usr/local/lib/ozone/splash \
-    usr/local/lib/ozone/hdmi-watch etc/init.d/ozone-hw \
+    usr/local/lib/ozone/hdmi-watch usr/local/lib/ozone/set-mode usr/local/lib/ozone/sound-config etc/init.d/ozone-hw \
+    usr/local/bin/ozone-display usr/local/bin/ozone-equalizer usr/local/bin/ozone-files usr/local/bin/ozone-screensaver \
+    usr/local/share/applications/ozone-display.desktop usr/local/share/applications/ozone-equalizer.desktop \
+    usr/local/share/applications/ozone-files.desktop \
     usr/local/bin/yt usr/local/bin/ozone-web usr/local/bin/ozone-web-show usr/local/share/applications/ozone-web.desktop usr/local/bin/ozone-power usr/local/bin/ozone-screen usr/local/share/applications/ozone-screen.desktop usr/local/bin/ozone-standby usr/local/bin/ozone-notify etc/init.d/ozone-input etc/ozone/remote.conf etc/ozone/native-only \
     usr/local/bin/ozone-wifi usr/local/bin/ozone-volume usr/local/bin/ozone-remote usr/local/bin/ozone-panel usr/local/bin/ozone-media usr/local/share/applications/ozone-media.desktop usr/local/bin/ozone-terminal usr/local/share/applications/ozone-terminal.desktop usr/local/bin/ozone-sysinfo usr/local/share/applications/ozone-sysinfo.desktop etc/init.d/ozone-media usr/local/share/applications/ozone-wifi.desktop usr/local/share/applications/yt.desktop usr/local/share/applications/ozone-tv.desktop usr/local/share/applications/ozone-power.desktop etc/init.d/ozone-wifi usr/local/lib/ozone/wifi-event usr/local/lib/ozone/netwatch \
     usr/local/lib/ozone/gen-xorg-screen etc/X11/Xwrapper.config etc/asound.conf |
@@ -56,6 +59,10 @@ ssh_box 'set -e
     # drives and network folders (ozone-media: FAT, NTFS, exFAT, ext; cifs-utils for SMB1 servers)
     sudo apt-get install -y -qq --no-install-recommends ntfs-3g exfat-fuse cifs-utils > /dev/null
     sudo update-rc.d ozone-media defaults
+    # the equalizer (sound-config puts it in /etc/asound.conf when it is turned on)
+    sudo apt-get install -y -qq --no-install-recommends libasound2-plugin-equal caps > /dev/null
+    # the folders Files starts with
+    mkdir -p ~/Videos ~/Music ~/Pictures
     # ozone-web opens links from other programs
     sudo update-alternatives --install /usr/bin/x-www-browser x-www-browser /usr/local/bin/ozone-web 60 > /dev/null
     fc-list : family | grep -i -E "jetbrains|fontawesome" | sort -u'

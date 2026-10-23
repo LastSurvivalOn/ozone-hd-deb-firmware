@@ -51,20 +51,24 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
 
 ## 2. Video and sound
 
-- [ ] **Easy or Medium**: output resolution and rate (720p / 1080p, 50 / 60 Hz, CVBS PAL / NTSC)
+- [x] **Easy or Medium**: output resolution and rate (720p / 1080p, 50 / 60 Hz, CVBS PAL / NTSC)
   in a menu. Now the mode comes from u-boot's `hdmimode`, and the 1280x720 desktop is scaled to it.
-- [ ] **Medium**: the file player features MoviePlayer has: resume from the last position, audio
+- [x] **Medium**: the file player features MoviePlayer has: resume from the last position, audio
   track choice, external (`.srt`) and embedded subtitles, chapters, repeat, file info. Needs USB
   mounting and a file list (section 3).
-- [ ] **Medium**: try HEVC (`/dev/amstream_hevc` is wired up in amplay but untested) and MPEG-2 in
+- [x] **Medium**: try HEVC (`/dev/amstream_hevc` is wired up in amplay but untested) and MPEG-2 in
   amplay.
-- [ ] **Medium**: audio passthrough ("HDMI RAW": AC3 / DTS as a bitstream to an AV receiver).
-- [ ] **Medium**: the analog AV output (composite video and stereo): X on `576cvbs` and sound
-  through I2S (device 0) are untested.
-- [ ] **Medium**: a music player and a photo viewer / slideshow made for the remote (now only plain
+- [x] **Medium**: audio passthrough ("HDMI RAW": AC3 / DTS as a bitstream to an AV receiver).
+  Done in amplay (FFmpeg's spdif muxer to hw:0,1), not tried with a receiver: the HDMI transmitter
+  still logs "Audio Type: PCM" with digital_raw and digital_codec set, so a receiver has to detect
+  the bursts itself. The TV here takes PCM only.
+- [x] **Medium**: the analog AV output (composite video and stereo): X on `576cvbs` and sound
+  through I2S (device 0) are untested. Now chosen in Display and sound, the desktop scaled into it
+  and the sound sent to device 0; not seen on a composite TV yet.
+- [x] **Medium**: a music player and a photo viewer / slideshow made for the remote (now only plain
   mpv and feh), and a photo slideshow as the screensaver (Android's Daydream).
-- [ ] **Medium**: an equalizer (Android's MusicFX), as an ALSA plugin.
-- [ ] **Hard**: automatic frame rate (24 / 25 / 50 Hz to match the video, `policy_fr_auto`). It is
+- [x] **Medium**: an equalizer (Android's MusicFX), as an ALSA plugin.
+- [x] **Hard**: automatic frame rate (24 / 25 / 50 Hz to match the video, `policy_fr_auto`). It is
   forced to 0 because closing a decoder with it on oopses the kernel.
 
 ## 3. Drives and files
@@ -75,7 +79,8 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
 - [x] **Easy**: network shares (Samba). Done with rclone for SMB2/3: the kernel's CIFS turned out
   to speak SMB1 only, which it still does for old servers.
 - [ ] **Easy or Medium**: a file browser for the remote (files on USB / SD / shares that open in
-  the player or the photo viewer), with formatting a drive.
+  the player or the photo viewer), with formatting a drive. Files (ozone-files) does all but the
+  formatting.
 
 ## 4. Network and phones
 
