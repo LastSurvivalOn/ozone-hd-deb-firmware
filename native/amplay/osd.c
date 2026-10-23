@@ -59,6 +59,7 @@
 #define ICON_MUSIC  "\xef\x80\x81"   /* f001 */
 #define ICON_LOCK   "\xef\x80\xa3"   /* f023 */
 #define CHANNELS_HINT "Enter: channels"   /* in the bottom bar when there is a list */
+#define CLOSE_W     72          /* the close button: the top bar's full height, this wide */
 
 enum { C_KEY, C_BG, C_TRACK, C_FILL, C_TEXT, C_SUB, C_RED, C_GREEN, C_YELLOW, NCOLORS };
 static const char *COLOR_NAMES[NCOLORS] = { KEY_COLOR, "#11111b", "#45475a", "#cba6f7", "#cdd6f4", "#a6adc8",
@@ -78,6 +79,7 @@ static struct {
     GC gc;
     Cursor arrow, blank;
     int visible, grabbed, hide_after;
+    int close_hover;           /* the pointer on the close button: drawn red */
     int64_t last_input;
     char held[256];            /* keys down, to tell autorepeat from a new press */
     int hit[NHITS][2];
@@ -740,7 +742,7 @@ static void draw(const struct osd_state *s)
     /* redraw only when something visible changed */
     char sig[sizeof O.sig];
     snprintf(sig, sizeof sig, "%d|%s|%d|%d|%s|%d|%d|%d|%s|%s|%d", fill, line, s->paused, s->muted, vol, O.w, s->live,
-             s->recording, ind, title, s->nmarks);
+             s->recording, ind, title, s->nmarks * 2 + O.close_hover);
     if (!strcmp(sig, O.sig))
         return;
     strcpy(O.sig, sig);
@@ -756,7 +758,9 @@ static void draw(const struct osd_state *s)
     }
     if (s->recording)
         text(O.top_d, O.font, C_RED, O.w - PAD - 40 - rec_w, 28, "● REC");
-    text(O.top_d, O.icons, C_SUB, O.w - PAD - 16, 29, ICON_CLOSE);
+    if (O.close_hover)
+        XftDrawRect(O.top_d, &O.col[C_RED], O.w - CLOSE_W, 0, CLOSE_W, TOP_H);
+    text(O.top_d, O.icons, O.close_hover ? C_BG : C_SUB, O.w - CLOSE_W / 2 - 8, 29, ICON_CLOSE);
 
     /* bottom: progress, buttons, time, volume */
     XftDrawRect(O.bar_d, &O.col[C_BG], 0, 0, O.w, BAR_H);
@@ -1046,7 +1050,7 @@ static int click_action(XButtonEvent *b, struct osd_event *e)
     if (b->button != Button1)
         return 0;
     if (b->window == O.top) {
-        if (b->x >= O.w - PAD - 32) {
+        if (b->x >= O.w - CLOSE_W) {
             *e = (struct osd_event){ OSD_QUIT, 0 };
             return 1;
         }
@@ -1168,9 +1172,15 @@ int osd_poll(struct osd_event *ev, int max)
                 n++;
             break;
         }
-        case MotionNotify:
+        case MotionNotify: {
             show();
+            int hover = x.xmotion.window == O.top && x.xmotion.x >= O.w - CLOSE_W;
+            if (hover != O.close_hover) {
+                O.close_hover = hover;
+                O.sig[0] = 0;   /* redraw */
+            }
             break;
+        }
         case Expose:
             if (x.xexpose.window == O.win) {
                 if (x.xexpose.count == 0) {

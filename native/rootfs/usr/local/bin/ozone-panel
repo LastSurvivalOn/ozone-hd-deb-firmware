@@ -4,7 +4,7 @@
 polybar keeps itself just above bspwm's monitor window (wm-restack = bspwm), so fullscreen windows
 cover it. This raises it to the top while the pointer is at the top edge of the screen or on the
 panel, or for a few seconds after "ozone-panel peek" (info on the remote, see ozone-remote), and then
-puts it back where polybar keeps it.
+puts it back where polybar keeps it. Not with the pointer over amplay, which has its own top bar.
 
   ozone-panel          the daemon (started by bspwmrc); it asks X where the pointer is 10 times a
                        second, which costs next to nothing
@@ -58,6 +58,7 @@ class Panel:
         self.shown = False
         self.until = 0
         self.peek = False
+        self.player_at, self.player_up = -10, False
         signal.signal(signal.SIGUSR1, self.on_peek)
 
     def on_peek(self, *_):
@@ -108,6 +109,14 @@ class Panel:
                                 ctypes.byref(ch))
         self.x.XFlush(self.dpy)
 
+    def player(self):
+        """amplay is up (asked at most every 2 s: the pointer may stay at the edge)"""
+        now = time.monotonic()
+        if now - self.player_at > 2:
+            self.player_at = now
+            self.player_up = subprocess.call(['pgrep', '-x', 'amplay'], stdout=subprocess.DEVNULL) == 0
+        return self.player_up
+
     def run(self):
         while True:
             time.sleep(TICK)
@@ -121,7 +130,9 @@ class Panel:
                 continue
             y = self.pointer_y()
             if not self.shown:
-                if y == 0:
+                # not over the player: its own top bar has the title and the close button there, and
+                # the panel's close (bspc node -c) would close the window behind it instead
+                if y == 0 and not self.player():
                     self.show(LINGER)
                 continue
             if y < self.height:
