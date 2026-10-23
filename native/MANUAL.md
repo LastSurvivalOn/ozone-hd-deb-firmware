@@ -21,7 +21,8 @@ mouse work too.
 11. [USB drives, SD cards and network folders](#11-usb-drives-sd-cards-and-network-folders)
 12. [Files: videos, music and photos](#12-files-videos-music-and-photos)
 13. [Games](#13-games)
-14. [All key combinations](#14-all-key-combinations)
+14. [The network, the hotspot, VPN, phones](#14-the-network-the-hotspot-vpn-phones)
+15. [All key combinations](#15-all-key-combinations)
 
 ---
 
@@ -64,7 +65,8 @@ Linux always starts by default.
 
 ## 2. The desktop and the panel
 
-**WiFi.** Click **WiFi** on the panel (or "WiFi" in the app menu). After a few seconds a list of
+**WiFi.** Click **WiFi** on the panel (or "WiFi" in the app menu; the panel's item opens the
+Network menu, section 14, where **WiFi networks** is the second line). After a few seconds a list of
 networks appears, strongest first:
 - the bars show the signal;
 - 🔒 means a password is needed;
@@ -76,7 +78,9 @@ themselves after a reboot. The list also has **Rescan**, **Disconnect** and **Fo
 When the network cable is plugged in and working, WiFi turns itself off after a few seconds. When
 you pull the cable out, WiFi connects again within a few seconds. If you turned WiFi off with
 **Disconnect**, it stays off. To use WiFi with the cable plugged in, choose the network again in
-the list.
+the list. A router with a **WPS** button: choose **WPS: the router's button** and press the
+button on the router within two minutes, or **WPS: a PIN** and type the PIN shown into the router's
+page.
 
 
 The panel is the bar along the top of the screen. From left to right:
@@ -93,8 +97,8 @@ The panel is the bar along the top of the screen. From left to right:
 | pointer and keyboard icons | the remote's mouse mode and the on-screen keyboard (section 10): green when on, a click switches them |
 | drive icon | USB drives, SD cards and network folders (section 11): how many are open; a click gives the list |
 | CPU %, memory, temperature | system load |
-| IP address | the cable connection (shown only with the cable plugged in) |
-| WiFi | the WiFi network the box is on. Click it to choose a network. It stays grey when not connected. |
+| IP address | the cable connection (shown only with the cable plugged in). Click it for the Network menu (section 14). |
+| WiFi | the WiFi network the box is on. Click it for the Network menu. It stays grey when not connected. |
 | 🔈 percentage | volume. Click to mute, scroll the wheel over it to change the volume. |
 | date and time | |
 | ✕ | closes the active window |
@@ -653,7 +657,56 @@ Put the game files in the **Games** folder of your home folder, or on a USB driv
 
 A USB gamepad works too: plug it in before starting RetroArch.
 
-## 14. All key combinations
+## 14. The network, the hotspot, VPN, phones
+
+**Network** in the app menu, or a click on the address or WiFi on the panel. The line at the top
+shows the box's addresses, its way out to the internet and its DNS servers. **OK** opens a line,
+**exit** goes back; where something has to be typed, press **text** on the remote for the on-screen
+keyboard (or type on the phone, below).
+
+| Line | What it does |
+|---|---|
+| **Cable** | **Automatic (DHCP)**: the router gives the address (the usual way). **Fixed address…**: the address with its prefix (`192.168.1.50/24`), the router's address and the DNS servers. **PPPoE…**: for a provider whose cable comes straight into the box, with the login and password from the contract. |
+| **WiFi networks (and WPS)** | the WiFi list (section 2) |
+| **WiFi address** | automatic, or a fixed address on WiFi, from the next connection |
+| **WiFi hotspot** | the box as a WiFi network for phones and laptops, below |
+| **VPN** | below |
+| **Proxy** | a proxy server (`http://host:port`, with `user:password@` if it needs one) for the browser, YouTube and the player at once; the rest of the programs use it from the next start of the desktop |
+| **Remote control on the phone** | below |
+| **Receive videos from a phone (DLNA)** | below |
+
+**The WiFi hotspot** shares the box's internet (the cable, PPPoE, or its own WiFi) over WiFi.
+**Turn it on**, then join the network it shows ("Ozone-…") with the password shown, on the phone or
+laptop. **Name** and **Password** change them. The box stays on its own WiFi network meanwhile.
+
+**VPN** connects through a VPN service or a server of your own. The VPN provider gives a file:
+OpenVPN (`.ovpn`) or WireGuard (`.conf`). Put it in a **VPN** folder in your home folder, in
+**Downloads** or on a USB drive, then **VPN → Add a VPN file…** (it asks for the login when the file
+needs one). **Connect to NAME** sends all the internet through it, with its own DNS servers;
+**Disconnect** goes back to the usual way. It stays off after a restart.
+
+**The remote control on the phone**: **Remote control on the phone…** shows a QR code: point the
+phone's camera at it (or open the address shown, `http://…:8080`, in the phone's browser). The
+phone has to be on the same home WiFi as the box (or on its hotspot). The page has three tabs:
+**Remote** (the box's remote: arrows, OK, exit, home, volume, the player's keys, the colour keys),
+**Touchpad** (move the pointer with a finger, tap to click, two fingers to scroll) and **Type**
+(type on the phone's keyboard, in any language, and send it to the box: into a search box, a
+password field…). Add the page to the phone's home screen to have it at hand.
+
+**Sending to the box (DLNA)**: the box shows up as **Ozone TV** in the apps that "cast" or "play
+to" a TV: BubbleUPnP and other DLNA apps on Android, VLC, Kodi, a phone's gallery with "Play on
+another device", Windows' **Cast to device** (right click on a video). Videos play in the video
+player, music and photos full screen; the phone pauses, winds and stops them, and sets the volume,
+and the remote works as usual (**exit** stops). **Receive videos from a phone** turns it off or on,
+and gives it another name. (YouTube's own cast button needs Google's protocol, which the box
+doesn't have.)
+
+**Media servers**: a NAS, Jellyfin, Plex, minidlna or a computer sharing its media library is in
+**Files → Media servers** (or **Media servers** in the app menu): choose the server, then its
+folders; **OK** plays a video, a piece of music (and the ones after it) or a photo (a slideshow
+of that folder), **exit** goes up a folder.
+
+## 15. All key combinations
 
 ### Anywhere
 | Keys | Action |

@@ -23,6 +23,7 @@ recovery partition  → stock Android boot.img (T2, SmartTube)
 ./install-desktop.sh <ip>           # bspwm/polybar/rofi, yt, X autostart
 ./install-gpu.sh <ip>               # Mali-450 GPU for X: modules, X driver, ozone-gl, mpv on the GPU
 ./install-games.sh <ip>             # RetroArch (NES, GB, GBA) and glmark2, needs the GPU
+./install-network.sh <ip>           # Network menu, hotspot, VPN, phone remote, DLNA
 ```
 
 `install-gpu.sh` builds the kernel modules here first if they aren't in `out/gpu/` yet
@@ -82,6 +83,51 @@ cable has had an address for two checks (6 s), it disconnects WiFi (`wpa_cli dis
 reconnects it when the cable goes, unless WiFi was off from the WiFi window already. `wifi-event`
 removes wlan0's address on any disconnect: on the same subnet as the cable, its route took the
 replies to what came in over the cable. Logs: `/var/log/wpa_supplicant.log`, `/var/log/netwatch.log`.
+
+## Network menu, hotspot, VPN, phones, DLNA
+
+`install-network.sh` adds them (packages: `iw hostapd dnsmasq-base iptables openvpn ppp pppoe
+wireguard-tools qrencode`; the hostapd and openvpn init scripts are disabled, the tools start their
+own daemons). The menus run as the user and call themselves through `sudo -n` for what needs
+root; sudo's `secure_path` has no `/usr/local/bin`, so they pass their full path.
+
+- **`ozone-network`** (rofi; the panel's address and WiFi open it) keeps its settings in
+  `/etc/ozone/network.json` (root, 600: the PPPoE password), and `lib/ozone/net-apply` applies them:
+  netwatch calls it when the cable comes in or out (and at start for a static address or PPPoE),
+  wifi-event on WiFi (dis)association. DHCP is dhclient with `IF_METRIC` (100 cable, 600 WiFi);
+  static is `ip addr`/`ip route` and resolv.conf. **PPPoE**: the kernel has PPP but no
+  `CONFIG_PPPOE`, so it is pppd with the user-space `pppoe` as its pty (`/var/log/pppoe.log`); the
+  password goes through `pap-secrets`/`chap-secrets`. The **proxy** goes to `/etc/ozone/proxy`
+  (read by yt and ozone-web at start: WebKit gets it through its network proxy settings),
+  `/etc/environment` (the next session) and apt. **WPS** is in `ozone-wifi`: `wpa_cli wps_pbc` or
+  `wps_pin any`.
+- **`ozone-hotspot`**: hostapd on `p2p0`, the 8189ES's second interface, which is a phy of its
+  own and does AP mode while `wlan0` stays a client (wlan0 as a fallback, the box's WiFi off
+  meanwhile). 192.168.43.1/24; dnsmasq hands out addresses and forwards DNS, running as
+  `nobody:aid_inet` (only that group may open sockets). NAT with **`iptables-legacy`**: the
+  nf_tables one fails on 3.10 ("Could not fetch rule set generation id"). Settings in
+  `/etc/ozone/hotspot.json` (root), log `/var/log/hotspot.log`.
+- **`ozone-vpn`**: OpenVPN and WireGuard files in `/etc/ozone/vpn` (root, 700). OpenVPN runs as a
+  daemon with `lib/ozone/vpn-updown` for the pushed DNS servers (`/run` is noexec, so the script
+  can't live there). WireGuard: no kernel module, so `wireguard-go` (`vpn/build-wireguard-go.sh`,
+  Go cross-built here: static ARMv7, 2.7 MB), then `wg setconf` with what wg-quick would do by hand
+  (addresses, MTU, a host route to the endpoint unless it is on the LAN, `0/1` and `128/1`, DNS).
+  wireguard-go forks itself into the background by adding `WG_PROCESS_FOREGROUND=1` to its
+  environment, but the first copy of a variable wins: with `WG_PROCESS_FOREGROUND=0` already set,
+  every child forks another. Log `/var/log/vpn.log`. Tested against OpenVPN (TLS, redirect-gateway)
+  and WireGuard servers in docker on the laptop: with a server on the LAN, OpenVPN's host route to
+  it via the router loses the tunnel (a test artefact, not a real setup).
+- **Phone remote**: `ozone-remote` serves a page on port 8080 (private and loopback addresses
+  only): `POST /key` (remote.conf's key names, pressed and released, repeats while held), `/move`,
+  `/click` (its mouse device) and `/type` (xdotool type). `ozone-phone show` is the address with a
+  QR code (`qrencode`).
+- **`ozone-dlna`**: a UPnP MediaRenderer (SSDP on every LAN address, HTTP on port 49494: the
+  descriptions, SOAP for AVTransport / RenderingControl / ConnectionManager, GENA events with
+  LastChange). Videos go to `amplay --control` (commands `pause`, `play`, `seek S`, `quit` on stdin;
+  `pos S DURATION playing|paused|loading` every second on stdout), mpv (IPC) when amplay exits 3,
+  and for music and photos. Volume is the Master control. `ozone-dlna browse` is a ContentDirectory
+  client in rofi (SSDP search for MediaServer, Browse in pages of 200), Files' "Media servers"
+  place opens it. Settings `~/.config/ozone/dlna.json`, log `~/.cache/ozone-dlna.log`.
 
 ## Android files
 
@@ -321,6 +367,7 @@ amplay film.mkv
 amplay --audio <audio url> <video url>      # what yt does with YouTube's DASH streams
 amplay --program 101 recording.ts           # one service of a broadcast TS
 amplay --tv                                 # the TV player, run by ozone-tv (see Television)
+amplay --control URL                        # driven by another program (DLNA): stdin/stdout
 amplay --reset                              # brings the desktop back if amplay was killed
 ```
 

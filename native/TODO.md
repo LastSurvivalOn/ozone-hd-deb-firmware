@@ -84,14 +84,15 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
 
 ## 4. Network and phones
 
-- [ ] **Easy**: PPPoE, static IP / DNS, proxy, WPS in the WiFi / network menu. Now only choosing a
-  WiFi network.
-- [ ] **Easy or Medium**: a remote control and keyboard on the phone (Android has RC_Server, the
-  Google TV IP remote and RemoteIME), for example as a web page served by the box.
-- [ ] **Medium**: a WiFi hotspot (hostapd on the 8189ES; untested whether its driver does AP mode).
-- [ ] **Medium**: DLNA: browsing media servers, and a renderer so that a phone can "send" a video to
-  the box (for example gmrender-resurrect with amplay).
-- [ ] **Medium**: VPN.
+- [x] **Easy**: PPPoE, static IP / DNS, proxy, WPS in the WiFi / network menu: the Network menu
+  (`ozone-network`, the panel's address; `install-network.sh`).
+- [x] **Easy or Medium**: a remote control and keyboard on the phone: a web page that ozone-remote
+  serves on port 8080 (buttons, a touchpad, typing), with a QR code in the Network menu.
+- [x] **Medium**: a WiFi hotspot (`ozone-hotspot`): hostapd on `p2p0`, so the box stays on its own
+  WiFi network, sharing the cable, PPPoE or WiFi.
+- [x] **Medium**: DLNA (`ozone-dlna`): a renderer that phones and computers send videos, music and
+  photos to (amplay, mpv), and the media servers on the network as a place in Files.
+- [x] **Medium**: VPN (`ozone-vpn`): OpenVPN and WireGuard (wireguard-go, in user space) files.
 - [ ] **Hard**: Miracast (mirroring a phone's screen): WiFi Direct on `p2p0`, which the driver
   already creates, plus RTSP and H.264 into amplay.
 
