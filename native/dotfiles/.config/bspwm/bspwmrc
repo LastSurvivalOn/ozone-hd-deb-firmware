@@ -12,6 +12,9 @@ pgrep -x ozone-remote > /dev/null || ozone-remote &
 pgrep -f "^/usr/bin/python3 /usr/local/bin/ozone-screensave[r]" > /dev/null || ozone-screensaver &
 # TV timers: starts the TV for recordings and reminders set in its guide
 pgrep -f "^/usr/bin/python3 /usr/local/bin/ozone-tv timer[s]" > /dev/null || ozone-tv timers &
+# DLNA: phones and computers can send videos, music and photos to the box (unless turned off in
+# the Network menu; it checks that itself, and that it isn't running already)
+ozone-dlna renderer &
 
 bspc monitor -d 1 2 3 4 5
 

@@ -11,7 +11,8 @@ left, with the audio track and subtitles chosen last time; a .srt next to a vide
 Files and folders can be marked, copied or cut and pasted (in a thread, with the progress at the
 top), renamed, deleted, and new folders made; info shows what a file is (ffprobe for videos and
 music, the EXIF of photos).
-Music plays here, in the background of the window (mpv without video, ao=sdl: see CLAUDE.md), the
+The media servers on the home network (DLNA: a NAS, Jellyfin, Plex...) are a place too, which
+opens ozone-dlna's browser. Music plays here, in the background of the window (mpv without video, ao=sdl: see CLAUDE.md), the
 whole folder from the track chosen. Photos open full-screen: one at a time, or a slideshow.
 
 Kept in ~/.local/share/ozone-files: state.json (where each video was left, its tracks; the last
@@ -44,6 +45,7 @@ RUNTIME = os.environ.get('XDG_RUNTIME_DIR') or '/tmp'
 MPV_SOCK = os.path.join(RUNTIME, 'ozone-files-mpv-%d.sock' % os.getuid())
 MEDIA = '/media'
 NAND = '/mnt/nand/linux'
+DLNA = 'dlna:'   # the media servers on the network: a place, browsed by ozone-dlna
 
 VIDEO = {'mkv', 'mp4', 'm4v', 'avi', 'mov', 'ts', 'm2ts', 'mts', 'webm', 'mpg', 'mpeg', 'vob', 'flv', 'wmv',
          '3gp', 'ogv', 'divx', 'xvid'}
@@ -54,6 +56,7 @@ SUBS = {'srt', 'ass', 'ssa', 'vtt'}
 ICONS = {'folder': '', 'video': '', 'audio': '', 'image': '', 'file': '',
          'up': '', 'usb': '', 'net': '', 'home': '', 'drive': '', 'tv': '',
          'download': ''}
+ICONS['dlna'] = ICONS['net']
 SAVER_DEFAULTS = {'enabled': True, 'minutes': 10, 'folder': os.path.join(HOME, 'Pictures'), 'seconds': 8}
 RESUME_MIN = 30   # s: videos stopped before this, or this close to the end, start from the beginning
 
@@ -151,7 +154,8 @@ def saver_settings():
 
 
 def places():
-    """(label, path, icon): the home folders that exist, TV recordings, the drives and network folders"""
+    """(label, path, icon): the home folders that exist, TV recordings, the drives and network folders,
+    the media servers"""
     out = []
     for label, sub, icon in (('Videos', 'Videos', 'video'), ('Music', 'Music', 'audio'),
                              ('Photos', 'Pictures', 'image'), ('Downloads', 'Downloads', 'download')):
@@ -171,6 +175,7 @@ def places():
         if mnt.startswith(MEDIA + '/'):
             net = fs in ('cifs', 'fuse.rclone') or dev.startswith('//')
             out.append((os.path.basename(mnt), mnt, 'net' if net else 'usb'))
+    out.append(('Media servers', DLNA, 'dlna'))
     out.append(('Home', HOME, 'home'))
     return out
 
@@ -924,7 +929,7 @@ class Window:
         """A drive plugged in or out"""
         if [p[1] for p in places()] != [p[1] for p in self.place_list]:
             self.fill_places()
-            if self.folder and not os.path.isdir(self.folder):
+            if self.folder and self.folder != DLNA and not os.path.isdir(self.folder):
                 self.open_folder(HOME)
             else:
                 self.mark_place(self.folder)
@@ -937,12 +942,12 @@ class Window:
             self.marked.clear()   # marks are of one folder
         self.folder = path
         self.state['last'] = path
-        self.path_label.set_text(path)
+        self.path_label.set_text('Media servers (DLNA)' if path == DLNA else path)
         for r in self.list.get_children():
             r.destroy()
         self.rows = []
         try:
-            names = [n for n in os.listdir(path) if not n.startswith('.')]
+            names = [n for n in os.listdir(path) if not n.startswith('.')] if path != DLNA else []
         except OSError as e:
             names = []
             self.empty('Can\'t open this folder: %s' % e.strerror)
@@ -957,6 +962,9 @@ class Window:
         parent = os.path.dirname(path.rstrip('/'))
         if path not in [p[1] for p in places()] and parent and parent != path:
             self.add_row(parent, 'up', '..', 'up a folder')
+        if path == DLNA:
+            self.add_row(DLNA, 'dlna', 'Browse the media servers on the network…',
+                         'DLNA: a NAS, Jellyfin, Plex, minidlna, a computer sharing its media')
         for _f, _s, n, full, k in entries:
             self.add_row(full, k, n, None)
         if not entries and names is not None and not self.rows:
@@ -1038,6 +1046,8 @@ class Window:
             GLib.timeout_add(600, self.update_music)
         elif row.kind == 'image':
             self.view_photos(row.path)
+        elif row.kind == 'dlna':
+            subprocess.Popen(['ozone-dlna', 'browse'])
         else:
             self.flash('Not a video, music or photo')
 
@@ -1132,7 +1142,7 @@ class Window:
 
     def flash(self, text):
         self.path_label.set_text(text)
-        GLib.timeout_add_seconds(3, lambda: self.path_label.set_text(self.folder or '') and False)
+        GLib.timeout_add_seconds(3, lambda: self.path_label.set_text('Media servers (DLNA)' if self.folder == DLNA else self.folder or '') and False)
 
     def on_click(self, w, ev):
         if ev.button == 3:
@@ -1204,7 +1214,7 @@ class Window:
         if self.marked:
             paths = [r.path for r in self.rows if r.path in self.marked]
         else:
-            paths = [row.path] if row is not None and getattr(row, 'kind', 'up') != 'up' else []
+            paths = [row.path] if row is not None and getattr(row, 'kind', 'up') not in ('up', 'dlna') else []
         if with_subs:
             for p in list(paths):
                 if kind(p) == 'video':
@@ -1220,7 +1230,7 @@ class Window:
         (row.get_style_context().add_class if on else row.get_style_context().remove_class)('marked')
 
     def toggle_mark(self, row, step=False):
-        if row is None or row.kind == 'up':
+        if row is None or row.kind in ('up', 'dlna'):
             return
         on = row.path not in self.marked
         (self.marked.add if on else self.marked.discard)(row.path)
@@ -1263,6 +1273,9 @@ class Window:
             return
         paths, mode = self.clip
         dest = self.folder
+        if dest == DLNA:
+            self.say('Paste into a folder of the box')
+            return
         for p in paths:
             if os.path.isdir(p) and (dest == p or dest.startswith(p.rstrip('/') + '/')):
                 self.say('A folder can\'t go into itself')
@@ -1317,6 +1330,8 @@ class Window:
         return name in ('.', '..') or '/' in name or '\0' in name
 
     def new_folder(self):
+        if self.folder == DLNA:
+            return
         name = self.ask('New folder', 'The new folder\'s name, in %s:' % self.folder, 'New folder')
         if not name:
             return
@@ -1332,7 +1347,7 @@ class Window:
         self.open_folder(self.folder, focus=True, select=path)
 
     def rename(self, row):
-        if row is None or row.kind == 'up':
+        if row is None or row.kind in ('up', 'dlna'):
             return
         old = row.path
         name = self.ask('Rename', 'The new name of %s:' % os.path.basename(old), os.path.basename(old))
@@ -1378,7 +1393,7 @@ class Window:
     # info
 
     def info(self, row):
-        if row is None or row.kind == 'up':
+        if row is None or row.kind in ('up', 'dlna'):
             return
         path = row.path
         self.say('Reading %s…' % os.path.basename(path))

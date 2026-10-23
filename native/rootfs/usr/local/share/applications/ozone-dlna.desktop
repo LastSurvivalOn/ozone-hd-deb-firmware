@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Media servers
+Comment=Videos, music and photos from the media servers on the home network (DLNA)
+Exec=ozone-dlna browse
+Icon=network-server
+Terminal=false
+Categories=AudioVideo;Network;

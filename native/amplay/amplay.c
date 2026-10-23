@@ -17,6 +17,11 @@
  *                                                  URL: a file or anything FFmpeg opens; N: the
  *                                                  service of a broadcast TS (a recording)
  *   amplay --tv [--banner SECONDS]                 the TV player, see "TV" below
+ *   amplay --control ... URL                       a file or stream played for another program (the
+ *                                                  DLNA renderer): commands on stdin, one per line,
+ *                                                  "pause", "play", "seek SECONDS", "quit"; once a
+ *                                                  second "pos SECONDS DURATION playing|paused|loading"
+ *                                                  on stdout
  *   amplay --reset                                 put the desktop back after a crash
  *
  * Keys: Space/P pause, Left/Right -/+10 s, PgDn/PgUp -/+60 s, Up/Down volume, M mute, Q/Esc quit.
@@ -374,7 +379,7 @@ static struct {
     double chapters[256];
     int nchap;
     int repeat;               /* 0 off, 1 this file, 2 all the files (the caller plays the next) */
-    int ended, report;
+    int ended, report, control;
     char flags[48];
 
     volatile sig_atomic_t quit;
@@ -694,7 +699,7 @@ static void mute_toggle(void)
 /* ---- keyboards ----------------------------------------------------------------------------- */
 
 #define MAX_KBD 16
-static struct pollfd kbd[MAX_KBD];
+static struct pollfd kbd[MAX_KBD + 1];   /* + stdin, for --control */
 static int nkbd;
 
 static int has_bit(const unsigned long *bits, int n)
@@ -3238,10 +3243,51 @@ static int probe(const char *url)
     return 0;
 }
 
+/* --control: a command line from stdin */
+static void control_command(char *line)
+{
+    if (!strcmp(line, "pause") || !strcmp(line, "play")) {
+        if (P.user_paused != (line[1] == 'a'))
+            toggle_pause();
+    } else if (!strncmp(line, "seek ", 5)) {
+        double to = atof(line + 5);
+        seek_to(to, to < play_time());
+    } else if (!strcmp(line, "quit")) {
+        P.quit = 1;
+    }
+}
+
+/* --control: what came on stdin; its end (the caller gone) quits */
+static void control_read(void)
+{
+    static char cmd[4096];
+    static size_t ncmd;
+    ssize_t r = read(0, cmd + ncmd, sizeof cmd - 1 - ncmd);
+    if (r == 0 || (r < 0 && errno != EAGAIN && errno != EINTR)) {
+        P.quit = 1;
+        return;
+    }
+    if (r < 0)
+        return;
+    ncmd += r;
+    cmd[ncmd] = 0;
+    char *nl, *p = cmd;
+    while ((nl = strchr(p, '\n')) && !P.quit) {
+        *nl = 0;
+        if (*p)
+            control_command(p);
+        p = nl + 1;
+    }
+    ncmd -= p - cmd;
+    memmove(cmd, p, ncmd);
+    if (ncmd == sizeof cmd - 1)
+        ncmd = 0;
+}
+
 static void usage(void)
 {
     fputs("usage: amplay [-v] [--audio URL] [--start SECONDS] [--title TEXT] [--program N]\n"
-          "              [--aid N] [--sid N] [--repeat 0|1|2] [--report] URL\n"
+          "              [--aid N] [--sid N] [--repeat 0|1|2] [--report] [--control] URL\n"
           "       amplay --tv [--banner SECONDS]\n"
           "       amplay --probe URL                (what it is, as JSON in ffprobe's shape)\n"
           "       amplay --reset\n", stderr);
@@ -3264,13 +3310,14 @@ int main(int argc, char **argv)
         { "repeat", required_argument, NULL, 'R' },
         { "report", no_argument, NULL, 'P' },
         { "probe", required_argument, NULL, 'Q' },
+        { "control", no_argument, NULL, 'C' },
         { 0 }
     };
     const char *audio_url = NULL;
     double start = 0;
     int c, banner = 0, aid = -1, sid = -1;
     P.program = -1;
-    while ((c = getopt_long(argc, argv, "a:s:rt:vTb:p:A:S:R:PQ:", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "a:s:rt:vTb:p:A:S:R:PQ:C", opts, NULL)) != -1) {
         switch (c) {
         case 'a': audio_url = optarg; break;
         case 's': start = atof(optarg); break;
@@ -3279,6 +3326,7 @@ int main(int argc, char **argv)
         case 'S': sid = atoi(optarg); break;
         case 'R': P.repeat = atoi(optarg) % 3; break;
         case 'P': P.report = 1; break;
+        case 'C': P.control = 1; break;
         case 'Q': av_log_set_level(AV_LOG_QUIET); return probe(optarg);
         case 't': P.title = optarg; break;
         case 'T': P.tv = 1; break;
@@ -3428,11 +3476,26 @@ int main(int argc, char **argv)
     if (start > 0)
         P.last_pos = start;
     int status = session_start() < 0;
+    if (P.control) {
+        fcntl(0, F_SETFL, O_NONBLOCK);
+        kbd[nkbd] = (struct pollfd){ .fd = 0, .events = POLLIN };
+    }
+    int64_t told_at = 0;
     while (!P.quit && !status) {
         /* right after the start or a pause the kernel moves pcrscr (see sync_clock, set_paused),
            so catch that quickly */
         int fast = !P.started || now_us() - P.started_at < 2000000 || now_us() - P.resumed_at < 1000000;
-        int ready = poll(kbd, nkbd, fast ? 20 : 100) > 0;
+        int ready = poll(kbd, nkbd + P.control, fast ? 20 : 100) > 0;
+        if (P.control) {
+            if (kbd[nkbd].revents & (POLLIN | POLLHUP))
+                control_read();
+            if (now_us() - told_at > 1000000) {
+                printf("pos %.1f %.1f %s\n", play_time(), P.duration,
+                       P.user_paused ? "paused" : !P.started || P.buffering ? "loading" : "playing");
+                fflush(stdout);
+                told_at = now_us();
+            }
+        }
         if (P.x11) {
             struct osd_event ev[8];
             int n = osd_poll(ev, 8);
