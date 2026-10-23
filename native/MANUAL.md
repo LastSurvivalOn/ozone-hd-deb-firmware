@@ -674,6 +674,7 @@ keyboard (or type on the phone, below).
 | **Proxy** | a proxy server (`http://host:port`, with `user:password@` if it needs one) for the browser, YouTube and the player at once; the rest of the programs use it from the next start of the desktop |
 | **Remote control on the phone** | below |
 | **Receive videos from a phone (DLNA)** | below |
+| **Show a phone's screen (Miracast)** | below |
 
 **The WiFi hotspot** shares the box's internet (the cable, PPPoE, or its own WiFi) over WiFi.
 **Turn it on**, then join the network it shows ("Ozone-…") with the password shown, on the phone or
@@ -700,6 +701,17 @@ player, music and photos full screen; the phone pauses, winds and stops them, an
 and the remote works as usual (**exit** stops). **Receive videos from a phone** turns it off or on,
 and gives it another name. (YouTube's own cast button needs Google's protocol, which the box
 doesn't have.)
+
+**A phone's screen on the TV (Miracast)**: open **Screen mirroring** (in the app menu, or
+**Network → Show a phone's screen**). While it says "Waiting for a phone or a computer", the box is
+**Ozone TV** for a phone's screen mirroring: on Android it is **Cast**, **Smart View** (Samsung),
+**Screen mirroring** or **Wireless display** in the settings or the quick settings; on Windows,
+**Win+K**. Choose **Ozone TV**; after a few seconds the phone's screen is on the TV, with its
+sound. A phone that asks for a PIN shows it, or the box shows one to type on the phone. **exit**
+on the remote ends it and waits for the next one; **exit** again closes Screen mirroring. If it
+says "Connecting failed", choose Ozone TV on the phone again. The phone and the box connect over
+WiFi Direct, so neither needs the home network for it; the WiFi hotspot has to be off meanwhile.
+(Apple's AirPlay and Google's Chromecast are other protocols, which the box doesn't have.)
 
 **Media servers**: a NAS, Jellyfin, Plex, minidlna or a computer sharing its media library is in
 **Files → Media servers** (or **Media servers** in the app menu): choose the server, then its

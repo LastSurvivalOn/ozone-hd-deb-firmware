@@ -1,0 +1,18 @@
+#!/bin/sh
+# dhclient's script for a WiFi Direct group the phone owns (ozone-miracast): the address only, no
+# routes and no DNS from the phone; its address (the group owner's) for ozone-miracast to connect to
+RUN=/run/ozone-miracast
+case "$reason" in
+BOUND|RENEW|REBIND|REBOOT)
+    ip -4 addr flush dev "$interface"
+    ip addr add "$new_ip_address/${new_subnet_mask:-255.255.255.0}" dev "$interface"
+    echo "${new_routers%% *}" > $RUN/peer
+    # some phones give no router: the DHCP server is the group owner then
+    [ -n "$new_routers" ] || echo "$new_dhcp_server_identifier" > $RUN/peer
+    ;;
+EXPIRE|FAIL|RELEASE|STOP)
+    ip -4 addr flush dev "$interface"
+    rm -f $RUN/peer
+    ;;
+esac
+exit 0

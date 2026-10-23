@@ -24,6 +24,7 @@ recovery partition  → stock Android boot.img (T2, SmartTube)
 ./install-gpu.sh <ip>               # Mali-450 GPU for X: modules, X driver, ozone-gl, mpv on the GPU
 ./install-games.sh <ip>             # RetroArch (NES, GB, GBA) and glmark2, needs the GPU
 ./install-network.sh <ip>           # Network menu, hotspot, VPN, phone remote, DLNA
+./install-miracast.sh <ip>          # screen mirroring (a patched wpa_supplicant, built on the box)
 ```
 
 `install-gpu.sh` builds the kernel modules here first if they aren't in `out/gpu/` yet
@@ -128,6 +129,38 @@ root; sudo's `secure_path` has no `/usr/local/bin`, so they pass their full path
   and for music and photos. Volume is the Master control. `ozone-dlna browse` is a ContentDirectory
   client in rofi (SSDP search for MediaServer, Browse in pages of 200), Files' "Media servers"
   place opens it. Settings `~/.config/ozone/dlna.json`, log `~/.cache/ozone-dlna.log`.
+
+## Screen mirroring (Miracast)
+
+`ozone-miracast` is a Wi-Fi Display sink. WiFi Direct runs on `p2p0` in a wpa_supplicant of its
+own (`/usr/local/sbin/wpa_supplicant-p2p`, control socket for the user's group in
+`/run/ozone-miracast/ctrl`), with the WFD device information "primary sink, RTSP 7236". The box
+only listens (Extended Listen Timing, 300 ms of every 400, on channel 1), stops when a phone starts
+connecting, and wants to own the group (`p2p_go_intent=14`); `wpa_cli -a` runs `ozone-miracast` as
+root at each group's start and end, for dnsmasq on the group (we own it) or dhclient with
+`lib/ozone/miracast-dhcp` (no routes from the phone). Then it is the RTSP client of the phone's port
+7236 (M1-M7: H.264 constrained baseline in the CEA modes up to 1080p60, AAC; keep-alives; IDR
+requests), takes the RTP on UDP 1028 into segment files in `/dev/shm`, reads the PAT and PMT from
+them, and `amplay --tv --rate 30` plays them as live TV: 0.3-0.5 s from arrival to the screen.
+`touch /run/ozone-miracast-debug` before opening it logs wpa_supplicant's debug output in
+`/var/log/miracast.log`; the session's log is `~/.cache/ozone-miracast.log`.
+
+Debian's wpa_supplicant can't do it with the vendor 8189ES driver; `miracast/build-wpa.sh` builds
+the same version with Debian's patches and `miracast/patches/wpa-rtw-p2p.patch`:
+- the driver reports the start of a remain-on-channel but never its end, so P2P waited for ever
+  after its first listen: the end is made up when the time is over or after a cancel;
+- it never passes probe requests up and answers them itself, as a group owner it builds beacons and
+  association responses too, all with the WPS and P2P IEs of the Android private command
+  `SET_AP_WPS_P2P_IE` (now `set_ap_wps_ie`): without them no phone found the box or joined its group;
+- it deauthenticates a removed station with reason 3 ("leaving") whatever the reason (3.10's
+  `DEL_STATION` has none), and after WPS a client takes that for the group's end: a WPS enrollee
+  gets 500 ms to leave by itself, as it does, before the station is removed.
+
+Tested with the laptop as the source (NetworkManager's WiFi P2P with a WFD IE, a small RTSP source
+and ffmpeg's `rtp_mpegts`): found in 2-10 s, the box's group formed 8 times in 9 (the first after
+start once failed), picture in 5-10 s from choosing it. As a client of the source's group the box
+was refused by the laptop's group owner after WPS one time in two, so it owns the group. Not tried
+with a real phone or Windows here; no HDCP, no UIBC (the phone's touch from the TV), no LPCM audio.
 
 ## Android files
 

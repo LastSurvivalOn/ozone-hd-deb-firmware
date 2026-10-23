@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Screen mirroring
+Comment=A phone's or a computer's screen on the TV (Miracast: Cast, Smart View, Win+K)
+Exec=ozone-miracast
+Icon=video-display
+Terminal=false
+Categories=AudioVideo;Network;

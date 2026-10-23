@@ -93,8 +93,8 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
 - [x] **Medium**: DLNA (`ozone-dlna`): a renderer that phones and computers send videos, music and
   photos to (amplay, mpv), and the media servers on the network as a place in Files.
 - [x] **Medium**: VPN (`ozone-vpn`): OpenVPN and WireGuard (wireguard-go, in user space) files.
-- [ ] **Hard**: Miracast (mirroring a phone's screen): WiFi Direct on `p2p0`, which the driver
-  already creates, plus RTSP and H.264 into amplay.
+- [x] **Hard**: Miracast (mirroring a phone's screen, `ozone-miracast`): WiFi Direct on `p2p0`
+  with a patched wpa_supplicant (`install-miracast.sh`), RTSP, and the stream into `amplay --tv`.
 
 ## 5. Apps and system
 

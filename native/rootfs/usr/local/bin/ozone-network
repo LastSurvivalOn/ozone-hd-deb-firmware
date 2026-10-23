@@ -3,7 +3,8 @@
 
   ozone-network           the menu: the cable (automatic, a fixed address, PPPoE), WiFi (the
                           networks, WPS, its address), the WiFi hotspot, VPN, a proxy, the phone
-                          remote, receiving videos from a phone (DLNA)
+                          remote, receiving videos from a phone (DLNA), a phone's screen
+                          (Miracast)
   ozone-network status    the addresses, for scripts
   ozone-network set       (root) JSON on stdin merged into /etc/ozone/network.json and applied
 
@@ -209,7 +210,8 @@ def menu():
                  'VPN: %s' % tool_state('ozone-vpn'),
                  'Proxy: %s' % ((s.get('proxy') or {}).get('url') or 'none'),
                  'Remote control on the phone…',
-                 'Receive videos from a phone (DLNA): %s' % tool_state('ozone-dlna')]
+                 'Receive videos from a phone (DLNA): %s' % tool_state('ozone-dlna'),
+                 'Show a phone\'s screen (Miracast)…']
         i = rofi(ICON + '  Network', items, message='   '.join(status()))
         if i is None:
             return 0
@@ -229,6 +231,8 @@ def menu():
             subprocess.call(['ozone-phone', 'show'])
         elif i == 7:
             subprocess.call(['ozone-dlna', 'menu'])
+        elif i == 8:
+            return os.execvp('ozone-miracast', ['ozone-miracast'])
 
 
 def root_get():

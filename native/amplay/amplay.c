@@ -16,7 +16,8 @@
  *   amplay [--audio URL] [--start SECONDS] [--title TEXT] [--program N] URL
  *                                                  URL: a file or anything FFmpeg opens; N: the
  *                                                  service of a broadcast TS (a recording)
- *   amplay --tv [--banner SECONDS]                 the TV player, see "TV" below
+ *   amplay --tv [--banner SECONDS] [--rate FPS]    the TV player, see "TV" below (FPS: the
+ *                                                  frame rate to match, 25 by default)
  *   amplay --control ... URL                       a file or stream played for another program (the
  *                                                  DLNA renderer): commands on stdin, one per line,
  *                                                  "pause", "play", "seek SECONDS", "quit"; once a
@@ -2702,6 +2703,8 @@ static void tv_info_extra(void)
     osd_info_extra(t);
 }
 
+static double tv_rate = 25;
+
 static int tv_main(void)
 {
     signal(SIGINT, on_signal);
@@ -2726,7 +2729,7 @@ static int tv_main(void)
     if (ttx_init() < 0)
         logmsg("no teletext decoder");
     mixer_open();
-    match_rate(25);   /* the broadcasts here are all 25 fps */
+    match_rate(tv_rate);   /* the broadcasts here are all 25 fps; screen mirroring has its own */
     display_on();
     sysfs_write(SYS "video/disable_video", "1");
     fcntl(0, F_SETFL, O_NONBLOCK);
@@ -3288,7 +3291,7 @@ static void usage(void)
 {
     fputs("usage: amplay [-v] [--audio URL] [--start SECONDS] [--title TEXT] [--program N]\n"
           "              [--aid N] [--sid N] [--repeat 0|1|2] [--report] [--control] URL\n"
-          "       amplay --tv [--banner SECONDS]\n"
+          "       amplay --tv [--banner SECONDS] [--rate FPS]\n"
           "       amplay --probe URL                (what it is, as JSON in ffprobe's shape)\n"
           "       amplay --reset\n", stderr);
     exit(2);
@@ -3311,13 +3314,14 @@ int main(int argc, char **argv)
         { "report", no_argument, NULL, 'P' },
         { "probe", required_argument, NULL, 'Q' },
         { "control", no_argument, NULL, 'C' },
+        { "rate", required_argument, NULL, 'F' },
         { 0 }
     };
     const char *audio_url = NULL;
     double start = 0;
     int c, banner = 0, aid = -1, sid = -1;
     P.program = -1;
-    while ((c = getopt_long(argc, argv, "a:s:rt:vTb:p:A:S:R:PQ:C", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "a:s:rt:vTb:p:A:S:R:PQ:CF:", opts, NULL)) != -1) {
         switch (c) {
         case 'a': audio_url = optarg; break;
         case 's': start = atof(optarg); break;
@@ -3327,6 +3331,7 @@ int main(int argc, char **argv)
         case 'R': P.repeat = atoi(optarg) % 3; break;
         case 'P': P.report = 1; break;
         case 'C': P.control = 1; break;
+        case 'F': tv_rate = atof(optarg); break;
         case 'Q': av_log_set_level(AV_LOG_QUIET); return probe(optarg);
         case 't': P.title = optarg; break;
         case 'T': P.tv = 1; break;

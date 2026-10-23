@@ -1,0 +1,887 @@
+#!/usr/bin/python3
+"""ozone-miracast: a phone's or a computer's screen on the TV (Miracast, Wi-Fi Display).
+
+  ozone-miracast                 the window: waits for a phone, shows its screen, then waits for
+                                 the next one until closed (exit)
+  ozone-miracast --source IP[:PORT]   the same from a source on the home network, without WiFi
+                                 Direct (for testing: a Wi-Fi Display source's RTSP port)
+  ozone-miracast start | stop | event ...   (root) WiFi Direct on p2p0, and its event script
+
+Miracast is WiFi Direct (P2P) plus RTSP plus an MPEG-TS over RTP. WiFi Direct: a wpa_supplicant of
+its own on p2p0 (the 8189ES's second interface; the box's WiFi stays on wlan0), with the Wi-Fi
+Display information element that says "a screen, RTSP on 7236". It only listens (on a social
+channel, in short turns all the time) rather than searching too: a search scans every channel for
+2 s at a time, and the box could be found only in the moments between. The phone finds "Ozone TV" and asks
+to connect (a button press, or a PIN shown here); the two make a group, one of them its owner, which
+gives out addresses (dnsmasq here, the phone's DHCP the other way). Then this box connects to the
+phone's RTSP port, they agree on the formats (H.264, AAC), and the phone sends its screen as an
+MPEG-TS over RTP. That goes into segment files, as live TV does, which `amplay --tv` plays with the
+hardware decoder: given the stream's PAT and PMT, from the next keyframe (asked for at once).
+
+Logs: ~/.cache/ozone-miracast.log (the session), /var/log/miracast.log (the WiFi Direct side).
+"""
+import os
+import re
+import select
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+RUN = '/run/ozone-miracast'
+CTRL = RUN + '/ctrl'
+IFACE = 'p2p0'
+LOG = os.path.expanduser('~/.cache/ozone-miracast.log')
+ROOT_LOG = '/var/log/miracast.log'
+GO_NET = '192.168.49'
+RTP_PORT = 1028
+RTSP_PORT = 7236
+CHANNEL = 1   # 2.4 GHz, a P2P social channel (the one sources pick for the group)
+SEG_BYTES = 8 << 20   # as amplay's
+SEG_KEEP = 3
+NAME = 'Ozone TV'
+WPA_CLI = '/sbin/wpa_cli'
+# Debian's, patched for the 8189ES (native/miracast/build-wpa.sh): the plain one never ends its
+# first listen and gets no probe requests to answer, so no phone would find the box
+WPA_SUPPLICANT = '/usr/local/sbin/wpa_supplicant-p2p'
+DHCP_SCRIPT = '/usr/local/lib/ozone/miracast-dhcp'
+
+# Wi-Fi Display device information: a primary sink, available for a session, RTSP on 7236, 50 Mbit/s
+WFD_DEVICE_INFO = '000600111c440032'
+# CEA modes we take: 640x480p60 (required), 720p30/60, 1080p30/60, 720p25/50, 1080p25/50, 720p24, 1080p24
+CEA = sum(1 << b for b in (0, 5, 6, 7, 8, 10, 11, 12, 13, 15, 16))
+# native 1280x720p30 (CEA index 5); H.264 constrained baseline (every source has it), level 4.2
+VIDEO_FORMATS = '28 00 01 10 %08x 00000000 00000000 00 0000 0000 00 none none' % CEA
+# AAC 48 kHz stereo only: the LPCM of Wi-Fi Display (stream type 0x83) is nothing FFmpeg reads
+AUDIO_CODECS = 'AAC 00000001 00'
+
+
+def log(text, path=None):
+    path = path or LOG
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'a') as f:
+            f.write('%s %s\n' % (time.strftime('%F %T'), text))
+    except OSError:
+        pass
+
+
+def sh(*args):
+    return subprocess.call(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ---- root: WiFi Direct ---------------------------------------------------------------------------
+
+def root_start(group):
+    if os.path.exists('/run/ozone-hotspot/iface'):
+        print('The WiFi hotspot is on: turn it off first (Network menu)', file=sys.stderr)
+        return 1
+    root_stop()
+    os.makedirs(RUN, exist_ok=True)
+    os.chmod(RUN, 0o755)
+    conf = RUN + '/p2p.conf'
+    with open(conf, 'w') as f:
+        f.write('ctrl_interface=DIR=%s GROUP=%s\nupdate_config=0\ndevice_name=%s\nmanufacturer=ozone\n'
+                'model_name=%s\nmodel_number=1\ndevice_type=7-0050F204-1\nconfig_methods=pbc display keypad\n'
+                # the group's owner (Android's sources ask for 0; 14 leaves 15 to a source that
+                # insists): joining a phone's group as a client failed one time in two, the phone
+                # refusing the association after WPS, while the box's own groups always worked
+                # (with patches/wpa-rtw-p2p.patch: the phone was told "leaving" right after WPS)
+                'p2p_go_intent=14\npersistent_reconnect=0\ndisable_scan_offload=1\n'
+                # listening and a group of ours on the same channel: the driver never says when a
+                # listen ends, and a group started elsewhere could find the radio still there
+                'p2p_listen_reg_class=81\np2p_listen_channel=%d\np2p_oper_reg_class=81\np2p_oper_channel=%d\n'
+                % (CTRL, group, NAME, NAME, CHANNEL, CHANNEL))
+    if not os.path.exists(WPA_SUPPLICANT):
+        print('Screen mirroring needs %s (install-miracast.sh)' % WPA_SUPPLICANT, file=sys.stderr)
+        return 1
+    sh('ip', 'link', 'set', IFACE, 'up')
+    debug = ['-dd', '-t'] if os.path.exists('/run/ozone-miracast-debug') else []   # touch it to see more
+    if sh(WPA_SUPPLICANT, '-B', '-i', IFACE, '-D', 'nl80211', '-c', conf, '-P', RUN + '/wpa.pid',
+          '-f', ROOT_LOG, *debug):
+        print('WiFi Direct did not start (see %s)' % ROOT_LOG, file=sys.stderr)
+        return 1
+    for _ in range(20):
+        if os.path.exists(os.path.join(CTRL, IFACE)):
+            break
+        time.sleep(0.2)
+    w = [WPA_CLI, '-p', CTRL, '-i', IFACE]
+    sh(*w, 'set', 'wifi_display', '1')
+    sh(*w, 'wfd_subelem_set', '0', WFD_DEVICE_INFO)
+    # the addresses of a group, as it starts and ends
+    sh(*w, '-a', '/usr/local/bin/ozone-miracast', '-B', '-P', RUN + '/wpa_cli.pid')
+    log('WiFi Direct on %s' % IFACE, ROOT_LOG)
+    return 0
+
+
+def kill_pidfile(path):
+    try:
+        with open(path) as f:
+            os.kill(int(f.read().split()[0]), 15)
+    except (OSError, ValueError):
+        pass
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def group_down(iface=None):
+    kill_pidfile(RUN + '/dnsmasq.pid')
+    kill_pidfile(RUN + '/dhclient.pid')
+    for n in ('peer', 'leases', 'group', 'dhclient.leases'):   # a stale lease slows DHCP down
+        try:
+            os.unlink(os.path.join(RUN, n))
+        except OSError:
+            pass
+    if iface:
+        sh('ip', '-4', 'addr', 'flush', 'dev', iface)
+
+
+def root_stop():
+    try:
+        with open(RUN + '/group') as f:
+            iface = f.read().split()[0]
+    except (OSError, IndexError):
+        iface = None
+    group_down(iface)
+    kill_pidfile(RUN + '/wpa_cli.pid')
+    kill_pidfile(RUN + '/wpa.pid')
+    for _ in range(20):
+        if not os.path.exists(os.path.join(CTRL, IFACE)):
+            break
+        time.sleep(0.1)
+    sh('ip', '-4', 'addr', 'flush', 'dev', IFACE)
+    return 0
+
+
+def root_event(args):
+    """wpa_cli's action script: IFNAME EVENT [the event's words]"""
+    if len(args) < 2:
+        return 0
+    event, rest = args[1], args[2:]
+    if event == 'P2P-GROUP-STARTED' and len(rest) >= 2:
+        iface, role = rest[0], rest[1]
+        group_down()
+        with open(RUN + '/group', 'w') as f:
+            f.write('%s %s\n' % (iface, role))
+        sh('ip', 'link', 'set', iface, 'up')
+        if role == 'GO':   # the box gives the addresses
+            sh('ip', '-4', 'addr', 'flush', 'dev', iface)
+            sh('ip', 'addr', 'add', GO_NET + '.1/24', 'dev', iface)
+            # no DNS (port 0), only DHCP; a group of aid_inet: only that group may open sockets
+            sh('dnsmasq', '--interface=' + iface, '--bind-interfaces', '--except-interface=lo', '--port=0',
+               '--dhcp-range=%s.10,%s.99,1h' % (GO_NET, GO_NET), '--dhcp-authoritative',
+               '--pid-file=' + RUN + '/dnsmasq.pid', '--dhcp-leasefile=' + RUN + '/leases',
+               '--user=nobody', '--group=aid_inet', '--log-facility=' + ROOT_LOG)
+        else:   # the phone does; no routes from it, only the address
+            sh('dhclient', '-4', '-nw', '-sf', DHCP_SCRIPT, '-pf', RUN + '/dhclient.pid',
+               '-lf', RUN + '/dhclient.leases', iface)
+        log('group on %s, %s' % (iface, role), ROOT_LOG)
+    elif event == 'P2P-GROUP-REMOVED' and rest:
+        group_down(rest[0])
+        log('group off %s' % rest[0], ROOT_LOG)
+    return 0
+
+
+# ---- wpa_supplicant's control socket (as the user) -----------------------------------------------
+
+class Wpa:
+    def __init__(self, attach=False):
+        self.path = '/tmp/ozone-miracast-%d-%d-%d' % (os.getuid(), os.getpid(), attach)
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+        self.s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.s.bind(self.path)
+        self.s.connect(os.path.join(CTRL, IFACE))
+        if attach and self.request('ATTACH') != 'OK':
+            raise OSError('ATTACH refused')
+
+    def request(self, cmd, timeout=5):
+        self.s.send(cmd.encode())
+        end = time.time() + timeout
+        while time.time() < end:
+            if not select.select([self.s], [], [], max(0, end - time.time()))[0]:
+                break
+            data = self.s.recv(65536).decode(errors='replace')
+            if not data.startswith('<'):   # not an event
+                return data.strip()
+        return ''
+
+    def event(self, timeout):
+        """The next event's text (without its <level>), or None"""
+        if not select.select([self.s], [], [], timeout)[0]:
+            return None
+        data = self.s.recv(65536).decode(errors='replace')
+        return re.sub(r'^<\d>', '', data).strip()
+
+    def close(self):
+        self.s.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+
+# ---- the stream: RTP in, segment files out --------------------------------------------------------
+
+def ts_sections(packets, pid):
+    """The first whole PSI section on a PID, from 188-byte TS packets"""
+    buf = b''
+    for i in range(0, len(packets) - 187, 188):
+        p = packets[i:i + 188]
+        if p[0] != 0x47 or ((p[1] & 0x1f) << 8 | p[2]) != pid:
+            continue
+        start = p[1] & 0x40
+        afc = p[3] >> 4 & 3
+        off = 4 + (1 + p[4] if afc & 2 else 0)
+        if not afc & 1 or off >= 188:
+            continue
+        payload = p[off:]
+        if start:
+            buf = payload[1 + payload[0]:]
+        elif buf:
+            buf += payload
+        if len(buf) >= 3:
+            n = 3 + ((buf[1] & 0x0f) << 8 | buf[2])
+            if len(buf) >= n:
+                return buf[:n]
+    return None
+
+
+class Stream:
+    """RTP on a UDP port, its TS into segment files that amplay reads behind the writer"""
+
+    def __init__(self, port):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(('0.0.0.0', port))
+        self.prefix = '/dev/shm/ozone-miracast-%d-' % os.getpid()
+        self.offset = 0
+        self.low = 0
+        self.f = None
+        self.head = b''   # the start, for the PAT and PMT
+        self.psi = None
+        self.running = True
+        self.last = time.time()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def run(self):
+        while self.running:
+            if not select.select([self.sock], [], [], 0.5)[0]:
+                continue
+            try:
+                data = self.sock.recv(65536)
+            except OSError:
+                break
+            if len(data) < 12 or data[0] >> 6 != 2:
+                continue
+            n = 12 + 4 * (data[0] & 0x0f)
+            if data[0] & 0x10 and len(data) >= n + 4:   # a header extension
+                n += 4 + 4 * struct.unpack('>H', data[n + 2:n + 4])[0]
+            ts = data[n:]
+            ts = ts[:len(ts) - len(ts) % 188]
+            if not ts:
+                continue
+            self.last = time.time()
+            self.write(ts)
+            if self.psi is None and len(self.head) < 4 << 20:
+                self.head += ts
+                self.find_psi()
+
+    def write(self, data):
+        while data:
+            seg, pos = divmod(self.offset, SEG_BYTES)
+            if self.f is None or pos == 0:
+                if self.f:
+                    self.f.close()
+                self.f = open('%s%06d.ts' % (self.prefix, seg), 'wb')
+                old = seg - SEG_KEEP
+                if old >= 0:
+                    try:
+                        os.unlink('%s%06d.ts' % (self.prefix, old))
+                    except OSError:
+                        pass
+                    self.low = (old + 1) * SEG_BYTES
+            n = min(len(data), SEG_BYTES - pos)
+            self.f.write(data[:n])
+            self.f.flush()
+            self.offset += n
+            data = data[n:]
+
+    def find_psi(self):
+        pat = ts_sections(self.head, 0)
+        if not pat or len(pat) < 16:
+            return
+        pmt_pid = None
+        for i in range(8, len(pat) - 4, 4):
+            prog, pid = struct.unpack('>HH', pat[i:i + 4])
+            if prog:
+                pmt_pid = pid & 0x1fff
+                break
+        pmt = ts_sections(self.head, pmt_pid) if pmt_pid else None
+        if not pmt or len(pmt) < 16:
+            return
+        info = (pmt[10] & 0x0f) << 8 | pmt[11]
+        i, end = 12 + info, len(pmt) - 4
+        video, audio = 0, []
+        while i + 5 <= end:
+            st, pid, es = pmt[i], (pmt[i + 1] & 0x1f) << 8 | pmt[i + 2], (pmt[i + 3] & 0x0f) << 8 | pmt[i + 4]
+            if st in (0x1b, 0x24) and not video:
+                video = pid
+            elif st in (0x0f, 0x11, 0x03, 0x04, 0x81, 0x83):
+                audio.append((pid, st))
+            i += 5 + es
+        self.psi = {'pat': pat.hex(), 'pmt': pmt.hex(), 'pmt_pid': pmt_pid, 'video': video, 'audio': audio}
+        log('stream: PMT %d, video %d, audio %s' % (pmt_pid, video, audio))
+
+    def close(self):
+        self.running = False
+        self.sock.close()
+        if self.f:
+            self.f.close()
+        seg = self.offset // SEG_BYTES
+        for s in range(max(0, seg - SEG_KEEP - 1), seg + 1):
+            try:
+                os.unlink('%s%06d.ts' % (self.prefix, s))
+            except OSError:
+                pass
+
+
+# ---- RTSP: the sink's side of the Wi-Fi Display session ------------------------------------------
+
+class Session:
+    """One mirroring: RTSP with the source (M1-M7, keep-alives, teardown), the stream, the player"""
+
+    def __init__(self, ip, port, name, on_status, stop=None):
+        self.ip, self.port, self.name = ip, port, name
+        self.stop = stop or threading.Event()   # set: the window is closing
+        self.status = on_status
+        self.sock = None
+        self.buf = b''
+        self.cseq = 0
+        self.pending = {}   # our CSeq -> method
+        self.url = 'rtsp://%s/wfd1.0/streamid=0' % ip
+        self.session = None
+        self.stream = None
+        self.player = None
+        self.ended = False
+        self.started = False
+
+    # the connection
+
+    def send(self, text):
+        self.sock.sendall(text.encode())
+
+    def request(self, method, url, headers=None, body=''):
+        self.cseq += 1
+        self.pending[self.cseq] = method
+        h = 'CSeq: %d\r\n' % self.cseq + ''.join('%s: %s\r\n' % kv for kv in (headers or {}).items())
+        if body:
+            h += 'Content-Type: text/parameters\r\nContent-Length: %d\r\n' % len(body.encode())
+        self.send('%s %s RTSP/1.0\r\n%s\r\n%s' % (method, url, h, body))
+
+    def reply(self, cseq, headers=None, body=''):
+        h = 'CSeq: %s\r\n' % cseq + ''.join('%s: %s\r\n' % kv for kv in (headers or {}).items())
+        if body:
+            h += 'Content-Type: text/parameters\r\nContent-Length: %d\r\n' % len(body.encode())
+        self.send('RTSP/1.0 200 OK\r\n%s\r\n%s' % (h, body))
+
+    def message(self, timeout):
+        """(start line, headers, body) of the next message, or None on a timeout"""
+        while True:
+            end = self.buf.find(b'\r\n\r\n')
+            if end >= 0:
+                head = self.buf[:end].decode(errors='replace').split('\r\n')
+                headers = {}
+                for line in head[1:]:
+                    k, _s, v = line.partition(':')
+                    headers[k.strip().lower()] = v.strip()
+                n = int(headers.get('content-length', '0') or 0)
+                if len(self.buf) >= end + 4 + n:
+                    body = self.buf[end + 4:end + 4 + n].decode(errors='replace')
+                    self.buf = self.buf[end + 4 + n:]
+                    return head[0], headers, body
+            if not select.select([self.sock], [], [], timeout)[0]:
+                return None
+            data = self.sock.recv(65536)
+            if not data:
+                raise ConnectionError('the source closed the connection')
+            self.buf += data
+
+    # the exchange
+
+    def parameters(self, names):
+        values = {
+            'wfd_video_formats': VIDEO_FORMATS,
+            'wfd_audio_codecs': AUDIO_CODECS,
+            'wfd_client_rtp_ports': 'RTP/AVP/UDP;unicast %d 0 mode=play' % RTP_PORT,
+            'wfd_content_protection': 'none',
+            'wfd_display_edid': 'none',
+            'wfd_coupled_sink': 'none',
+            'wfd_uibc_capability': 'none',
+            'wfd_standby_resume_capability': 'none',
+            'wfd_connector_type': '05',
+            'wfd_I2C': 'none',
+        }
+        return ''.join('%s: %s\r\n' % (n, values.get(n, 'none')) for n in names)
+
+    def handle(self, start, headers, body):
+        cseq = headers.get('cseq', '0')
+        if start.startswith('RTSP/'):   # a reply to us
+            method = self.pending.pop(int(cseq) if cseq.isdigit() else -1, None)
+            code = start.split()[1] if len(start.split()) > 1 else '?'
+            if code != '200':
+                log('%s: %s' % (method, start))
+                if method in ('SETUP', 'PLAY'):
+                    raise ConnectionError('%s refused: %s' % (method, start))
+                return
+            if method == 'SETUP':
+                self.session = headers.get('session', '').split(';')[0]
+                m = re.search(r'timeout=(\d+)', headers.get('session', ''))
+                self.timeout = int(m.group(1)) if m else 60
+                self.request('PLAY', self.url, {'Session': self.session})
+            elif method == 'PLAY':
+                log('playing')
+                self.started = True
+                self.status('playing')
+            return
+        method = start.split()[0]
+        if method == 'OPTIONS':   # M1, then ours (M2)
+            self.reply(cseq, {'Public': 'org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER'})
+            self.request('OPTIONS', '*', {'Require': 'org.wfa.wfd1.0'})
+        elif method == 'GET_PARAMETER':   # M3 (what the screen can do), or a keep-alive
+            names = [l.strip() for l in body.splitlines() if l.strip()]
+            self.reply(cseq, body=self.parameters(names) if names else '')
+        elif method == 'SET_PARAMETER':
+            params = dict((k.strip(), v.strip()) for k, _s, v in (l.partition(':') for l in body.splitlines()) if k)
+            self.reply(cseq)
+            trigger = params.get('wfd_trigger_method', '').upper()
+            if 'wfd_presentation_URL' in params:   # M4: the formats it chose
+                self.url = params['wfd_presentation_URL'].split()[0]
+                log('formats: video %s, audio %s' % (params.get('wfd_video_formats'), params.get('wfd_audio_codecs')))
+            if trigger == 'SETUP':   # M5, then SETUP (M6) and PLAY (M7)
+                self.stream = Stream(RTP_PORT)
+                self.request('SETUP', self.url, {'Transport': 'RTP/AVP/UDP;unicast;client_port=%d' % RTP_PORT})
+            elif trigger == 'TEARDOWN':
+                self.request('TEARDOWN', self.url, {'Session': self.session or ''})
+                self.ended = True
+            elif trigger in ('PAUSE', 'PLAY'):
+                self.request(trigger, self.url, {'Session': self.session or ''})
+        else:
+            self.send('RTSP/1.0 501 Not Implemented\r\nCSeq: %s\r\n\r\n' % cseq)
+
+    def idr(self):
+        """A keyframe now, for the player to start from"""
+        if self.session:
+            self.request('SET_PARAMETER', 'rtsp://localhost/wfd1.0', {'Session': self.session}, 'wfd_idr_request\r\n')
+
+    # the player
+
+    def start_player(self):
+        s = self.stream.psi
+        if not s['video']:
+            raise ConnectionError('no video in the stream')
+        rate = 30
+        self.player = subprocess.Popen(['amplay', '--tv', '--banner', '3', '--rate', str(rate)],
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(LOG, 'a'),
+                                       text=True, bufsize=1)
+        self.events = []
+        threading.Thread(target=self.read_player, args=(self.player,), daemon=True).start()
+        audio = ','.join('%d:-' % pid for pid, st in s['audio'] if st != 0x83)
+        self.player_send('play', 'src=' + self.stream.prefix, 'off=%d' % self.stream.low, 'pmt=%d' % s['pmt_pid'],
+                         'psi=%s,%s' % (s['pat'], s['pmt']), 'v=%d' % s['video'], 'a=' + audio, 'asel=0',
+                         'amode=0', 's=', 'ssel=-1', 'ttx=0', 'ttxregion=0', 'title=' + self.name.replace('\t', ' '),
+                         'now=Screen mirroring')
+        log('player on: %s' % s)
+
+    def player_send(self, *fields):
+        try:
+            self.player.stdin.write('\t'.join(fields) + '\n')
+            self.player.stdin.flush()
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def read_player(self, p):
+        for line in p.stdout:
+            self.events.append(line.strip())
+
+    def stop_player(self):
+        p, self.player = self.player, None
+        if p and p.poll() is None:
+            try:
+                p.stdin.write('quit\n')
+                p.stdin.flush()
+                p.wait(5)
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                p.kill()
+                subprocess.call(['amplay', '--reset'])
+
+    # the whole of it
+
+    def run(self):
+        """Until the source ends it, the viewer does (exit), or the stream stops; the reason"""
+        self.status('connecting')
+        end = time.time() + 20   # the source's RTSP server may still be starting
+        while True:
+            try:
+                self.sock = socket.create_connection((self.ip, self.port), timeout=5)
+                break
+            except OSError as e:
+                if time.time() > end:
+                    log('RTSP to %s:%d: %s' % (self.ip, self.port, e))
+                    return 'No answer from %s: %s' % (self.ip, e)
+                time.sleep(1)
+        log('RTSP to %s:%d' % (self.ip, self.port))
+        reason = 'The phone stopped'
+        keepalive = time.time()
+        if self.stop.is_set():
+            reason = None
+        low = 0
+        try:
+            while not self.ended and not self.stop.is_set():
+                m = self.message(0.2)
+                if m:
+                    self.handle(*m)
+                    keepalive = time.time()
+                if self.stream and self.stream.psi and not self.player:
+                    self.start_player()
+                    self.idr()
+                if self.player:
+                    if self.player.poll() is not None or 'quit' in self.events:
+                        reason = None   # the viewer closed it
+                        break
+                    if self.stream.low != low:   # the oldest data still in the segments
+                        low = self.stream.low
+                        self.player_send('buffer', str(low))
+                if self.started and self.stream and time.time() - self.stream.last > 10:
+                    reason = 'The picture stopped coming'
+                    break
+                if time.time() - keepalive > 90:
+                    reason = 'The phone stopped answering'
+                    break
+        except (OSError, ConnectionError) as e:
+            reason = str(e)
+            log('session: %s' % e)
+        if reason is None or not self.ended:
+            try:
+                if self.session:
+                    self.request('TEARDOWN', self.url, {'Session': self.session})
+            except OSError:
+                pass
+        self.stop_player()
+        if self.stream:
+            self.stream.close()
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        log('session over: %s' % (reason or 'closed here'))
+        return reason
+
+
+# ---- the window ----------------------------------------------------------------------------------
+
+CSS = b"""
+* { font-family: "DejaVu Sans"; color: #cdd6f4; }
+window { background: #11111b; }
+.title { font-size: 30px; font-weight: bold; }
+.name { font-family: "JetBrains Mono"; font-size: 34px; color: #cba6f7; }
+.hint { font-size: 18px; color: #a6adc8; }
+.status { font-size: 22px; color: #f9e2af; }
+.pin { font-family: "JetBrains Mono"; font-size: 60px; color: #a6e3a1; }
+"""
+
+HINT = ('On an Android phone: Settings → Connected devices (or the quick settings) → Cast, Smart View,\n'
+        'Screen mirroring or Wireless display, then choose "%s".\n'
+        'On Windows: Win+K, then "%s". The phone and the box find each other over WiFi Direct.' % (NAME, NAME))
+
+
+class App:
+    def __init__(self, source=None):
+        import gi
+        gi.require_version('Gtk', '3.0')
+        gi.require_version('Gdk', '3.0')
+        from gi.repository import Gdk, GLib, Gtk
+        self.Gtk, self.GLib = Gtk, GLib
+        self.source = source
+        self.quit = threading.Event()
+        try:
+            Gtk.CssProvider().load_from_data(b'* { padding: 0px; }')   # see yt: the first number of the
+        except GLib.Error:                                             # first stylesheet fails to parse
+            pass
+        css = Gtk.CssProvider()
+        css.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        GLib.set_prgname('ozone-miracast')
+        self.win = Gtk.Window(title='Screen mirroring')
+        self.win.set_default_size(1280, 720)
+        self.win.connect('destroy', lambda w: self.close())
+        self.win.connect('key-press-event', self.on_key)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=22, valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER)
+        for text, cls in (('Screen mirroring (Miracast)', 'title'), (NAME, 'name')):
+            lb = Gtk.Label(label=text)
+            lb.get_style_context().add_class(cls)
+            box.pack_start(lb, False, False, 0)
+        self.pin = Gtk.Label(label='', no_show_all=True)
+        self.pin.get_style_context().add_class('pin')
+        box.pack_start(self.pin, False, False, 0)
+        self.state = Gtk.Label(label='Starting…')
+        self.state.get_style_context().add_class('status')
+        box.pack_start(self.state, False, False, 0)
+        hint = Gtk.Label(label=HINT + '\n\nexit closes this.', justify=Gtk.Justification.CENTER)
+        hint.get_style_context().add_class('hint')
+        box.pack_start(hint, False, False, 0)
+        self.win.add(box)
+        self.win.show_all()
+        self.win.fullscreen()
+        # killed (a new session, the power menu): WiFi Direct off all the same
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, lambda *a: (self.close(), False)[1])
+        threading.Thread(target=self.work, daemon=True).start()
+
+    def on_key(self, w, e):
+        from gi.repository import Gdk
+        if Gdk.keyval_name(e.keyval) in ('Escape', 'BackSpace'):
+            self.close()
+            return True
+        return False
+
+    def close(self):
+        self.quit.set()
+        self.win.hide()
+        self.GLib.timeout_add(200, self.wait_close)
+
+    def wait_close(self):
+        if getattr(self, 'done', False):
+            self.Gtk.main_quit()
+            return False
+        return True
+
+    def say(self, text, pin=None):
+        def show():
+            self.state.set_text(text)
+            self.pin.set_text(pin or '')
+            self.pin.set_visible(bool(pin))
+            return False
+        self.GLib.idle_add(show)
+
+    def show_window(self, on):
+        def do():
+            if on:
+                self.win.show()
+                self.win.present()
+            else:
+                self.win.hide()
+            return False
+        if not self.quit.is_set():
+            self.GLib.idle_add(do)
+
+    def mirror(self, ip, port, name):
+        self.say('Connecting to %s…' % name)
+
+        def status(what):
+            if what == 'playing':
+                self.show_window(False)
+                subprocess.call(['ozone-notify', 'Screen mirroring: %s' % name])
+        s = Session(ip, port, name, status, self.quit)
+        reason = s.run()
+        self.show_window(True)
+        return reason
+
+    def work(self):
+        try:
+            if self.source:
+                ip, _s, port = self.source.partition(':')
+                reason = self.mirror(ip, int(port or RTSP_PORT), ip)
+                self.say(reason or 'Over')
+            else:
+                self.p2p()
+        except Exception as e:   # noqa: BLE001 (shown, not lost in a thread)
+            log('error: %r' % e)
+            self.say('Error: %s' % e)
+            time.sleep(5)
+        finally:
+            if not self.source:
+                subprocess.call(['sudo', '-n', '/usr/local/bin/ozone-miracast', 'stop'])
+            self.done = True
+            if self.source and not self.quit.is_set():
+                self.quit.wait()
+
+    # WiFi Direct, as the user (wpa_supplicant's socket is for the user's group)
+
+    def p2p(self):
+        r = subprocess.run(['sudo', '-n', '/usr/local/bin/ozone-miracast', 'start'], capture_output=True, text=True)
+        if r.returncode:
+            self.say(r.stderr.strip() or 'WiFi Direct did not start')
+            self.quit.wait()
+            return
+        ev = Wpa(attach=True)
+        ctl = Wpa()
+        peers = {}   # address -> (name, RTSP port)
+        try:
+            while not self.quit.is_set():
+                self.say('Waiting for a phone or a computer…')
+                self.listen(ctl)
+                group = self.wait_group(ev, ctl, peers)
+                if not group:
+                    continue
+                iface, role, peer = group
+                name, port = peers.get(peer, (peer or 'the phone', RTSP_PORT))
+                ip = self.peer_address(role)
+                log('group %s (%s) with %s: its address %s, RTSP port %d' % (iface, role, name, ip, port))
+                if not ip:
+                    self.say('No address from %s' % name)
+                    time.sleep(3)
+                else:
+                    reason = self.mirror(ip, port, name)
+                    self.say(reason or 'Over')
+                ctl.request('P2P_GROUP_REMOVE ' + iface)
+                time.sleep(2)
+        finally:
+            ctl.request('P2P_EXT_LISTEN')   # off
+            ctl.request('P2P_STOP_FIND')
+            ev.close()
+            ctl.close()
+
+    def peer_info(self, ctl, addr, peers):
+        info = ctl.request('P2P_PEER ' + addr)
+        name = re.search(r'^device_name=(.*)$', info, re.M)
+        wfd = re.search(r'^wfd_subelems=([0-9a-fA-F]+)$', info, re.M)
+        port = RTSP_PORT
+        if wfd and len(wfd.group(1)) >= 12:   # subelement 0: id, length (2), info (2), port (2)
+            port = int(wfd.group(1)[10:14], 16) or RTSP_PORT
+        peers[addr] = (name.group(1) if name else addr, port)
+        return peers[addr]
+
+    def listen(self, ctl):
+        """Findable: listening in short turns, 300 ms of every 400 (Extended Listen Timing). One long
+        listen (P2P_LISTEN, 5 s) kept the radio on it after a phone had connected in the middle of
+        it, and the group then started too late for the phone"""
+        ctl.request('P2P_STOP_FIND')
+        ctl.request('P2P_EXT_LISTEN 300 400')
+
+    def connect(self, ctl, addr, how):
+        """Once per peer and attempt: a GO negotiation request can follow a provision discovery"""
+        if self.connecting == addr and time.time() - self.connecting_at < 30:
+            return
+        self.connecting, self.connecting_at = addr, time.time()
+        # no more listening meanwhile: its turns on the radio held up the group (the scan for the
+        # phone's group was put off by 5 s, its own group's beacons came too late)
+        ctl.request('P2P_EXT_LISTEN')
+        ctl.request('P2P_STOP_FIND')
+        r = ctl.request('P2P_CONNECT %s %s' % (addr, how), timeout=10)
+        log('connect %s %s: %s' % (addr, how.split()[-1], r))
+
+    def wait_group(self, ev, ctl, peers):
+        """Phones asking to connect, until a group starts: (iface, role, the peer's device address)"""
+        find_at = time.time()
+        self.connecting, self.connecting_at = None, 0
+        while not self.quit.is_set():
+            e = ev.event(1)
+            if time.time() - find_at > 120:   # the listen times out by itself now and then
+                self.listen(ctl)
+                find_at = time.time()
+            if not e:
+                continue
+            f = e.split()
+            what = f[0]
+            addr = f[1] if len(f) > 1 and re.match(r'([0-9a-f]{2}:){5}[0-9a-f]{2}$', f[1]) else None
+            if what not in ('P2P-DEVICE-FOUND', 'P2P-DEVICE-LOST', 'CTRL-EVENT-SCAN-STARTED',
+                            'CTRL-EVENT-SCAN-RESULTS', 'P2P-FIND-STOPPED'):
+                log('p2p: %s' % e)
+            if what == 'P2P-FIND-STOPPED' and not self.connecting:   # stay findable (a listen ends so too)
+                self.listen(ctl)
+                find_at = time.time()
+            elif what == 'P2P-DEVICE-FOUND' and addr:
+                self.peer_info(ctl, addr, peers)
+            elif what in ('P2P-PROV-DISC-PBC-REQ', 'P2P-GO-NEG-REQUEST') and addr:
+                name, _p = peers.get(addr) or self.peer_info(ctl, addr, peers)
+                m = re.search(r'dev_passwd_id=(\d+)', e)
+                if what == 'P2P-GO-NEG-REQUEST' and m and m.group(1) == '1':
+                    continue   # a PIN that we show: P2P-PROV-DISC-SHOW-PIN says which
+                self.say('Connecting to %s…' % name)
+                self.connect(ctl, addr, 'pbc')
+            elif what == 'P2P-PROV-DISC-SHOW-PIN' and addr and len(f) > 2:
+                name, _p = peers.get(addr) or self.peer_info(ctl, addr, peers)
+                self.say('Type this PIN on %s:' % name, pin=f[2])
+                self.connect(ctl, addr, '%s display' % f[2])
+            elif what == 'P2P-PROV-DISC-ENTER-PIN' and addr:
+                name, _p = peers.get(addr) or self.peer_info(ctl, addr, peers)
+                pin = self.ask_pin(name)
+                if pin:
+                    self.connect(ctl, addr, '%s keypad' % pin)
+            elif what in ('P2P-GO-NEG-FAILURE', 'P2P-GROUP-FORMATION-FAILURE', 'WPS-FAIL'):
+                self.say('Connecting failed: try again on the phone')
+                self.connecting = None
+                self.listen(ctl)
+            elif what == 'P2P-GROUP-STARTED' and len(f) >= 3:
+                m = re.search(r'go_dev_addr=(\S+)', e)
+                # its owner is the phone, or this box: then the phone is the one it was connecting to
+                peer = m.group(1) if f[2] == 'client' and m else self.connecting
+                self.say('Connected')
+                return f[1], f[2], peer
+        return None
+
+    def peer_address(self, role):
+        """The source's IP address: its lease (we own the group), or the group owner's (it does)"""
+        for _ in range(60):
+            if self.quit.is_set():
+                return None
+            try:
+                if role == 'GO':
+                    with open(RUN + '/leases') as f:
+                        line = f.read().split('\n')[0].split()
+                    if len(line) > 2:
+                        return line[2]
+                else:
+                    with open(RUN + '/peer') as f:
+                        ip = f.read().strip()
+                    if ip:
+                        return ip
+            except OSError:
+                pass
+            time.sleep(0.5)
+        return None
+
+    def ask_pin(self, name):
+        r = subprocess.run(['rofi', '-dmenu', '-p', 'PIN', '-mesg', 'The PIN %s shows' % name,
+                            '-theme-str', 'listview { lines: 0; }'], input='', capture_output=True, text=True)
+        pin = r.stdout.strip()
+        return pin if re.match(r'^\d{4,8}$', pin) else None
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ''
+    if cmd in ('start', 'stop'):
+        if os.geteuid() != 0:
+            sys.exit('as root')
+        if cmd == 'stop':
+            return root_stop()
+        group = os.environ.get('SUDO_GID')
+        try:
+            import grp
+            group = grp.getgrgid(int(group)).gr_name if group else 'root'
+        except (KeyError, ValueError):
+            group = 'root'
+        return root_start(group)
+    if len(argv) > 2 and argv[2].startswith(('P2P-', 'CONNECTED', 'DISCONNECTED')):   # wpa_cli -a
+        if os.geteuid() == 0:
+            return root_event(argv[1:])
+        return 0
+    if cmd in ('', '--source'):
+        app = App(source=argv[2] if cmd == '--source' and len(argv) > 2 else None)
+        app.Gtk.main()
+        return 0
+    sys.exit(__doc__)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
