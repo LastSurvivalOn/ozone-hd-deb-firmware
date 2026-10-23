@@ -73,6 +73,7 @@
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
 #include <libavutil/time.h>
 #include <libswresample/swresample.h>
 
@@ -3144,11 +3145,105 @@ static void file_info_extra(void)
     osd_info_extra(t);
 }
 
+/* --probe: what a file is, as JSON in ffprobe's shape (the box has no ffprobe; Files shows it) */
+static void json_str(const char *v)
+{
+    putchar('"');
+    for (const unsigned char *c = (const unsigned char *)(v ? v : ""); *c; c++) {
+        if (*c == '"' || *c == '\\')
+            printf("\\%c", *c);
+        else if (*c < 0x20)
+            printf("\\u%04x", *c);
+        else
+            putchar(*c);
+    }
+    putchar('"');
+}
+
+static void json_tags(AVDictionary *d)
+{
+    AVDictionaryEntry *e = NULL;
+    int first = 1;
+    printf("{");
+    while ((e = av_dict_get(d, "", e, AV_DICT_IGNORE_SUFFIX))) {
+        printf("%s", first ? "" : ",");
+        json_str(e->key);
+        putchar(':');
+        json_str(e->value);
+        first = 0;
+    }
+    printf("}");
+}
+
+static int probe(const char *url)
+{
+    AVFormatContext *f = NULL;
+    if (avformat_open_input(&f, url, NULL, NULL) < 0 || avformat_find_stream_info(f, NULL) < 0) {
+        printf("{}\n");
+        return 1;
+    }
+    printf("{\"format\":{\"format_name\":");
+    json_str(f->iformat->name);
+    printf(",\"format_long_name\":");
+    json_str(f->iformat->long_name);
+    printf(",\"duration\":\"%.3f\",\"bit_rate\":\"%" PRId64 "\",\"tags\":", f->duration > 0 ? f->duration / (double)AV_TIME_BASE : 0,
+           f->bit_rate);
+    json_tags(f->metadata);
+    printf("},\"streams\":[");
+    for (unsigned i = 0; i < f->nb_streams; i++) {
+        AVStream *st = f->streams[i];
+        AVCodecParameters *c = st->codecpar;
+        const AVCodecDescriptor *d = avcodec_descriptor_get(c->codec_id);
+        printf("%s{\"index\":%u,\"codec_type\":", i ? "," : "", i);
+        json_str(av_get_media_type_string(c->codec_type));
+        printf(",\"codec_name\":");
+        json_str(avcodec_get_name(c->codec_id));
+        printf(",\"codec_long_name\":");
+        json_str(d ? d->long_name : NULL);
+        const char *prof = avcodec_profile_name(c->codec_id, c->profile);
+        printf(",\"profile\":");
+        json_str(prof);
+        if (c->bit_rate > 0)
+            printf(",\"bit_rate\":\"%" PRId64 "\"", c->bit_rate);
+        if (c->codec_type == AVMEDIA_TYPE_VIDEO) {
+            AVRational fr = av_guess_frame_rate(f, st, NULL);
+            AVRational sar = av_guess_sample_aspect_ratio(f, st, NULL);
+            int dw = c->width, dh = c->height;
+            if (sar.num && sar.den)
+                av_reduce(&dw, &dh, (int64_t)c->width * sar.num, (int64_t)c->height * sar.den, 1 << 20);
+            else
+                av_reduce(&dw, &dh, c->width, c->height, 1 << 20);
+            printf(",\"width\":%d,\"height\":%d,\"avg_frame_rate\":\"%d/%d\",\"display_aspect_ratio\":\"%d:%d\",\"pix_fmt\":",
+                   c->width, c->height, fr.num, fr.den ? fr.den : 1, dw, dh);
+            json_str(av_get_pix_fmt_name(c->format));
+        } else if (c->codec_type == AVMEDIA_TYPE_AUDIO) {
+            char layout[64] = "";
+            av_channel_layout_describe(&c->ch_layout, layout, sizeof layout);
+            printf(",\"sample_rate\":\"%d\",\"channels\":%d,\"channel_layout\":", c->sample_rate, c->ch_layout.nb_channels);
+            json_str(layout);
+        }
+        printf(",\"tags\":");
+        json_tags(st->metadata);
+        printf("}");
+    }
+    printf("],\"chapters\":[");
+    for (unsigned i = 0; i < f->nb_chapters; i++) {
+        AVChapter *ch = f->chapters[i];
+        printf("%s{\"start_time\":\"%.3f\",\"tags\":", i ? "," : "", ch->start * av_q2d(ch->time_base));
+        json_tags(ch->metadata);
+        printf("}");
+    }
+    printf("]}\n");
+    avformat_close_input(&f);
+    return 0;
+}
+
 static void usage(void)
 {
     fputs("usage: amplay [-v] [--audio URL] [--start SECONDS] [--title TEXT] [--program N]\n"
           "              [--aid N] [--sid N] [--repeat 0|1|2] [--report] URL\n"
           "       amplay --tv [--banner SECONDS]\n"
+          "       amplay --probe URL                (what it is, as JSON in ffprobe's shape)\n"
           "       amplay --reset\n", stderr);
     exit(2);
 }
@@ -3168,13 +3263,14 @@ int main(int argc, char **argv)
         { "sid", required_argument, NULL, 'S' },
         { "repeat", required_argument, NULL, 'R' },
         { "report", no_argument, NULL, 'P' },
+        { "probe", required_argument, NULL, 'Q' },
         { 0 }
     };
     const char *audio_url = NULL;
     double start = 0;
     int c, banner = 0, aid = -1, sid = -1;
     P.program = -1;
-    while ((c = getopt_long(argc, argv, "a:s:rt:vTb:p:A:S:R:P", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "a:s:rt:vTb:p:A:S:R:PQ:", opts, NULL)) != -1) {
         switch (c) {
         case 'a': audio_url = optarg; break;
         case 's': start = atof(optarg); break;
@@ -3183,6 +3279,7 @@ int main(int argc, char **argv)
         case 'S': sid = atoi(optarg); break;
         case 'R': P.repeat = atoi(optarg) % 3; break;
         case 'P': P.report = 1; break;
+        case 'Q': av_log_set_level(AV_LOG_QUIET); return probe(optarg);
         case 't': P.title = optarg; break;
         case 'T': P.tv = 1; break;
         case 'b': banner = (int)(atof(optarg) * 1000); break;

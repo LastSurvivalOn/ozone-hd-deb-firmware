@@ -410,6 +410,14 @@ hang on a lock while quitting (SDL's audio thread). Photos: GdkPixbuf scaled whi
 loaded in a thread; shown in a Gtk.Image (cairo from Python needs python3-gi-cairo, which isn't
 installed).
 
+Copy and paste: marked paths (or the one chosen, and a video's subtitle files) go to a clipboard;
+pasting runs a `Copier` thread (1 MB chunks, fsync, progress every 0.4 s at the top, a move on the
+same drive is a rename, a stopped file is deleted, `copystat` failures on FAT / exFAT / network
+folders ignored). Info: `amplay --probe FILE` (ffprobe's JSON from amplay's own libavformat: the box
+has no ffprobe) for videos and music, GdkPixbuf and a small EXIF reader (IFD0, the Exif and GPS
+sub-IFDs) for photos. ozone-remote passes **exit** to Files as Esc (it closed the window before) and
+**info** to it as its own key.
+
 `ozone-screensaver` (started by bspwmrc) reads X's idle time from the MIT-SCREEN-SAVER extension
 (libXss through ctypes) every 15 s and starts `ozone-files --screensaver` after the minutes set,
 unless amplay, mpv or RetroArch runs or the box is in standby. The saver grabs the keyboard and

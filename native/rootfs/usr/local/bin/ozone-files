@@ -8,6 +8,9 @@ for the remote.
 
 Videos play in amplay (the hardware decoder; mpv for what it can't decode), from where they were
 left, with the audio track and subtitles chosen last time; a .srt next to a video is shown too.
+Files and folders can be marked, copied or cut and pasted (in a thread, with the progress at the
+top), renamed, deleted, and new folders made; info shows what a file is (ffprobe for videos and
+music, the EXIF of photos).
 Music plays here, in the background of the window (mpv without video, ao=sdl: see CLAUDE.md), the
 whole folder from the track chosen. Photos open full-screen: one at a time, or a slideshow.
 
@@ -85,11 +88,16 @@ button.close:hover { background: #f38ba8; color: #11111b; }
 progressbar trough { min-height: 4px; background: #313244; border: none; border-radius: 2px; }
 progressbar progress { min-height: 4px; background: #a6e3a1; border: none; border-radius: 2px; }
 menu, .menu { background: #1e1e2e; border: 1px solid #45475a; padding: 4px 0; }
+messagedialog, .message-dialog, .message-dialog box { background: #11111b; }
 menuitem { padding: 6px 16px; }
 menuitem:hover { background: #313244; }
 entry, spinbutton { background: #1e1e2e; border: 1px solid #313244; border-radius: 6px; padding: 4px 8px; }
 switch { background: #313244; border-radius: 12px; }
 switch:checked { background: #cba6f7; }
+.mark { font-family: "FontAwesome"; font-size: 16px; color: #a6e3a1; }
+.marked .name { color: #a6e3a1; }
+.status { color: #f9e2af; }
+.infotext { font-family: "JetBrains Mono"; font-size: 13px; }
 .viewer { background: #000000; }
 .caption { background: rgba(17, 17, 27, 0.85); padding: 8px 16px; font-size: 15px; }
 .clock { font-size: 96px; font-weight: bold; color: #cdd6f4; }
@@ -454,6 +462,356 @@ def screensaver():
     return 0
 
 
+# ---- copying, and what a file is ---------------------------------------------------------------------
+
+def subtitle_files(video):
+    """FILM.srt, FILM.ukr.srt... next to FILM.mkv"""
+    folder, name = os.path.split(video)
+    base = os.path.splitext(name)[0] + '.'
+    try:
+        return [os.path.join(folder, n) for n in sorted(os.listdir(folder))
+                if n.startswith(base) and kind(n) == 'subs']
+    except OSError:
+        return []
+
+
+def free_name(folder, name, is_dir=False):
+    """name in folder, or "name (2).ext" ("name (2)" for a folder) if it is taken"""
+    path = os.path.join(folder, name)
+    base, ext = (name, '') if is_dir else os.path.splitext(name)
+    n = 2
+    while os.path.lexists(path):
+        path = os.path.join(folder, '%s (%d)%s' % (base, n, ext))
+        n += 1
+    return path
+
+
+class Copier:
+    """Copies (or moves) paths into dest in a thread; progress(text) and done(self) in GTK's"""
+
+    CHUNK = 1 << 20
+
+    def __init__(self, paths, dest, move, progress, done):
+        self.paths, self.dest, self.move = paths, dest, move
+        self.progress_cb, self.done_cb = progress, done
+        self.stop = threading.Event()
+        self.cancelled = False
+        self.error = None
+        self.done = 0
+        self.last = None
+        self.copied = self.total = 0
+        self.shown = 0
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def cancel(self):
+        self.stop.set()
+
+    def tell(self, text):
+        GLib.idle_add(self.progress_cb, text)
+
+    def size(self, p):
+        if os.path.isdir(p) and not os.path.islink(p):
+            return sum(os.path.getsize(os.path.join(r, f)) for r, _d, fs in os.walk(p) for f in fs
+                       if not os.path.islink(os.path.join(r, f)))
+        return os.path.getsize(p) if not os.path.islink(p) else 0
+
+    def run(self):
+        try:
+            self.tell('Counting…')
+            # a move on the same drive is a rename: nothing to copy
+            same = [p for p in self.paths if self.move and os.stat(p).st_dev == os.stat(self.dest).st_dev]
+            self.total = sum(self.size(p) for p in self.paths if p not in same)
+            for n, p in enumerate(self.paths, 1):
+                if self.stop.is_set():
+                    break
+                target = free_name(self.dest, os.path.basename(p), os.path.isdir(p))
+                self.current = '%d/%d %s' % (n, len(self.paths), os.path.basename(p))
+                if p in same:
+                    os.rename(p, target)
+                elif os.path.isdir(p) and not os.path.islink(p):
+                    self.copy_tree(p, target)
+                    if self.move and not self.stop.is_set():
+                        shutil.rmtree(p)
+                else:
+                    self.copy_file(p, target)
+                    if self.move and not self.stop.is_set():
+                        os.unlink(p)
+                if self.stop.is_set():
+                    break
+                self.done += 1
+                if kind(target) != 'subs':   # what the list can show
+                    self.last = target
+        except OSError as e:
+            self.error = 'Paste stopped: %s%s' % (e.strerror or e, ': %s' % os.path.basename(e.filename) if e.filename else '')
+        self.cancelled = self.stop.is_set()
+        GLib.idle_add(self.progress_cb, '')
+        GLib.idle_add(self.done_cb, self)
+
+    def copy_tree(self, src, dst):
+        os.mkdir(dst)
+        for name in sorted(os.listdir(src)):
+            if self.stop.is_set():
+                return
+            s, d = os.path.join(src, name), os.path.join(dst, name)
+            if os.path.islink(s):
+                continue
+            if os.path.isdir(s):
+                self.copy_tree(s, d)
+            else:
+                self.copy_file(s, d)
+
+    def copy_file(self, src, dst):
+        """In chunks, telling the progress; a file stopped halfway goes"""
+        try:
+            with open(src, 'rb') as fi, open(dst, 'wb') as fo:
+                while True:
+                    if self.stop.is_set():
+                        raise InterruptedError
+                    chunk = fi.read(self.CHUNK)
+                    if not chunk:
+                        break
+                    fo.write(chunk)
+                    self.copied += len(chunk)
+                    now = time.monotonic()
+                    if now - self.shown > 0.4:
+                        self.shown = now
+                        pct = self.copied * 100 // self.total if self.total else 100
+                        self.tell('%s %s: %d %%  (%s of %s)   exit: stop' % (
+                            'Moving' if self.move else 'Copying', self.current, pct, human_size(self.copied),
+                            human_size(self.total)))
+                fo.flush()
+                os.fsync(fo.fileno())
+        except InterruptedError:
+            os.unlink(dst)
+            return
+        except OSError:
+            try:
+                os.unlink(dst)
+            except OSError:
+                pass
+            raise
+        try:   # times and modes: FAT, exFAT and network folders may refuse them
+            shutil.copystat(src, dst)
+        except OSError:
+            pass
+
+
+def exif(path):
+    """The EXIF tags of a JPEG (or TIFF) worth showing: [(name, value)]"""
+    names = {0x010f: 'Camera make', 0x0110: 'Camera model', 0x0112: 'Orientation', 0x0131: 'Software',
+             0x0132: 'Changed', 0x9003: 'Taken', 0x829a: 'Exposure', 0x829d: 'F-number', 0x8827: 'ISO',
+             0x920a: 'Focal length', 0x9209: 'Flash', 0xa434: 'Lens', 0xa002: 'Width (camera)',
+             0xa003: 'Height (camera)'}
+    try:
+        with open(path, 'rb') as f:
+            data = f.read(256 * 1024)
+    except OSError:
+        return []
+    if data[:2] == b'\xff\xd8':   # JPEG: the APP1 segment with "Exif"
+        i = 2
+        tiff = None
+        while i + 4 < len(data) and data[i] == 0xff:
+            marker, n = data[i + 1], int.from_bytes(data[i + 2:i + 4], 'big')
+            if marker == 0xe1 and data[i + 4:i + 10] == b'Exif\0\0':
+                tiff = data[i + 10:i + 2 + n]
+                break
+            if marker == 0xda:
+                break
+            i += 2 + n
+        if tiff is None:
+            return []
+    elif data[:4] in (b'II*\0', b'MM\0*'):
+        tiff = data
+    else:
+        return []
+    order = 'little' if tiff[:2] == b'II' else 'big'
+
+    def u(off, n):
+        return int.from_bytes(tiff[off:off + n], order)
+    sizes = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1, 9: 4, 10: 8}
+    out, gps = {}, {}
+
+    def value(typ, count, off):
+        size = sizes.get(typ, 1) * count
+        at = off + 8 if size <= 4 else u(off + 8, 4)
+        if typ == 2:
+            return tiff[at:at + count].split(b'\0')[0].decode('latin-1', 'replace').strip()
+        if typ in (3, 4):
+            vals = [u(at + k * sizes[typ], sizes[typ]) for k in range(min(count, 4))]
+            return vals[0] if count == 1 else vals
+        if typ in (5, 10):
+            vals = []
+            for k in range(min(count, 3)):
+                num, den = u(at + 8 * k, 4), u(at + 8 * k + 4, 4)
+                if typ == 10:
+                    num = num - (1 << 32) if num >= 1 << 31 else num
+                vals.append((num, den))
+            return vals[0] if count == 1 else vals
+        return None
+
+    def ifd(off, into, depth=0):
+        if off <= 0 or off + 2 > len(tiff) or depth > 2:
+            return
+        for k in range(u(off, 2)):
+            e = off + 2 + 12 * k
+            if e + 12 > len(tiff):
+                return
+            tag, typ, count = u(e, 2), u(e + 2, 2), u(e + 4, 4)
+            if tag in (0x8769, 0x8825):   # the Exif and GPS sub-IFDs
+                ifd(u(e + 8, 4), into if tag == 0x8769 else gps, depth + 1)
+            else:
+                try:
+                    into[tag] = value(typ, count, e)
+                except (IndexError, ZeroDivisionError):
+                    pass
+    try:
+        ifd(u(4, 4), out)
+    except IndexError:
+        return []
+
+    def ratio(r):
+        return r[0] / r[1] if isinstance(r, tuple) and r[1] else None
+    rows = []
+    for tag, name in names.items():
+        v = out.get(tag)
+        if v is None or v == '':
+            continue
+        if tag == 0x829a and isinstance(v, tuple) and v[1]:
+            v = '1/%d s' % round(v[1] / v[0]) if v[0] and v[0] < v[1] else '%.1f s' % ratio(v)
+        elif tag == 0x829d and ratio(v):
+            v = 'f/%.1f' % ratio(v)
+        elif tag == 0x920a and ratio(v):
+            v = '%.0f mm' % ratio(v)
+        elif tag == 0x9209 and isinstance(v, int):
+            v = 'fired' if v & 1 else 'did not fire'
+        elif tag in (0x9003, 0x0132) and isinstance(v, str) and re.match(r'\d{4}:\d\d:\d\d \d', v):
+            v = '%s.%s.%s %s' % (v[8:10], v[5:7], v[0:4], v[11:])
+        elif tag == 0x0112:
+            v = {1: 'normal', 3: 'upside down', 6: 'turned right', 8: 'turned left'}.get(v, v)
+        rows.append((name, v))
+    if 2 in gps and 4 in gps:
+        try:
+            def deg(v):
+                return sum(ratio(x) / 60 ** i for i, x in enumerate(v))
+            lat = deg(gps[2]) * (-1 if gps.get(1) == 'S' else 1)
+            lon = deg(gps[4]) * (-1 if gps.get(3) == 'W' else 1)
+            rows.append(('Place', '%.5f, %.5f' % (lat, lon)))
+        except (TypeError, ZeroDivisionError):
+            pass
+    return rows
+
+
+def describe(path, k, resume=None):
+    """What a file or folder is, as text for the info dialog"""
+    lines = []
+
+    def add(name, value):
+        if value not in (None, '', 'N/A'):
+            lines.append('%-16s %s' % (name, value))
+    try:
+        st = os.lstat(path)
+    except OSError as e:
+        return 'Can\'t read it: %s' % e.strerror
+    add('Name', os.path.basename(path))
+    add('Folder', os.path.dirname(path))
+    if k == 'folder':
+        count = size = 0
+        for r, _d, fs in os.walk(path):
+            for f in fs:
+                count += 1
+                try:
+                    size += os.lstat(os.path.join(r, f)).st_size
+                except OSError:
+                    pass
+            if count > 50000:
+                break
+        add('Holds', '%d files, %s' % (count, human_size(size)))
+    else:
+        add('Size', '%s (%d bytes)' % (human_size(st.st_size), st.st_size))
+    add('Changed', time.strftime('%d.%m.%Y %H:%M:%S', time.localtime(st.st_mtime)))
+    add('Opened', time.strftime('%d.%m.%Y %H:%M:%S', time.localtime(st.st_atime)))
+    import stat as stat_
+    import pwd
+    try:
+        owner = pwd.getpwuid(st.st_uid).pw_name
+    except KeyError:
+        owner = str(st.st_uid)
+    add('Permissions', '%s, %s' % (stat_.filemode(st.st_mode), owner))
+    try:
+        vfs = os.statvfs(path if k == 'folder' else os.path.dirname(path))
+        add('Free on drive', human_size(vfs.f_bavail * vfs.f_frsize))
+    except OSError:
+        pass
+    if k in ('video', 'audio'):
+        try:   # ffprobe's JSON, from amplay (the box has no ffprobe)
+            r = subprocess.run(['amplay', '--probe', path], capture_output=True, text=True, timeout=20,
+                               errors='replace')
+            info = json.loads(r.stdout or '{}')
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            info = {}
+        fmt = info.get('format', {})
+        lines.append('')
+        add('Format', fmt.get('format_long_name'))
+        try:
+            if float(fmt.get('duration') or 0) > 0:
+                add('Length', clock(float(fmt['duration'])))
+            add('Bit rate', '%.2f Mbit/s' % (int(fmt['bit_rate']) / 1e6) if int(fmt.get('bit_rate') or 0) > 0 else None)
+        except ValueError:
+            pass
+        tags = {kk.lower(): v for kk, v in (fmt.get('tags') or {}).items()}
+        for t in ('title', 'artist', 'album_artist', 'album', 'track', 'disc', 'date', 'genre', 'composer',
+                  'comment', 'encoder', 'creation_time'):
+            add(t.replace('_', ' ').capitalize(), tags.get(t))
+        for s_ in info.get('streams', []):
+            lines.append('')
+            t = s_.get('codec_type', '')
+            st_tags = s_.get('tags') or {}
+            head = '%s %d' % (t.capitalize(), s_.get('index', 0))
+            desc = s_.get('codec_long_name') or s_.get('codec_name')
+            if s_.get('profile'):
+                desc += ', ' + s_['profile']
+            add(head, desc)
+            if t == 'video':
+                fr = s_.get('avg_frame_rate') or s_.get('r_frame_rate') or '0/1'
+                try:
+                    num, den = (int(x) for x in fr.split('/'))
+                    fps = num / den if den else 0
+                except ValueError:
+                    fps = 0
+                add('  picture', '%sx%s%s%s' % (s_.get('width'), s_.get('height'), ', %.3g fps' % fps if fps else '',
+                                                 ', %s' % s_['pix_fmt'] if s_.get('pix_fmt') else ''))
+                if s_.get('display_aspect_ratio'):
+                    add('  shape', s_['display_aspect_ratio'])
+            elif t == 'audio':
+                add('  sound', '%s Hz, %s' % (s_.get('sample_rate'), s_.get('channel_layout') or
+                                             '%s channels' % s_.get('channels')))
+            if s_.get('bit_rate'):
+                add('  bit rate', '%d kbit/s' % (int(s_['bit_rate']) // 1000))
+            add('  language', st_tags.get('language'))
+            add('  title', st_tags.get('title'))
+        chapters = info.get('chapters', [])
+        if chapters:
+            lines.append('')
+            add('Chapters', len(chapters))
+            for c in chapters[:30]:
+                add('  ' + clock(float(c.get('start_time', 0))), (c.get('tags') or {}).get('title', ''))
+        if resume and resume.get('position', 0) > RESUME_MIN:
+            lines.append('')
+            add('Stopped at', '%s of %s' % (clock(resume['position']), clock(resume.get('duration'))))
+    elif k == 'image':
+        lines.append('')
+        try:
+            fmt, w, h = GdkPixbuf.Pixbuf.get_file_info(path)
+            if fmt:
+                add('Format', fmt.get_description())
+                add('Picture', '%dx%d (%.1f megapixels)' % (w, h, w * h / 1e6))
+        except (GLib.Error, TypeError):
+            pass
+        for name, v in exif(path):
+            add(name, v if not isinstance(v, list) else ' '.join(str(x) for x in v))
+    return '\n'.join(lines)
+
+
 # ---- the window -----------------------------------------------------------------------------------
 
 class Window:
@@ -464,6 +822,9 @@ class Window:
         self.viewer = None
         self.busy = False
         self.typed = ''
+        self.marked = set()       # paths marked (green) for copy, cut, delete
+        self.clip = None          # (paths, 'copy' or 'cut') to paste
+        self.copier = None        # a paste running
         self.win = Gtk.Window(title='Files')
         self.win.set_default_size(1280, 720)
         self.win.connect('destroy', self.quit)
@@ -475,6 +836,8 @@ class Window:
         header.pack_start(prepare_label('Files', 'heading'), False, False, 0)
         self.path_label = prepare_label('', 'path', ellipsize=Pango.EllipsizeMode.START)
         header.pack_start(self.path_label, True, True, 0)
+        self.status = prepare_label('', 'status', ellipsize=Pango.EllipsizeMode.MIDDLE, max_width_chars=60)
+        header.pack_start(self.status, False, False, 0)
         settings = Gtk.Button(label='Screensaver')
         settings.connect('clicked', lambda w: GLib.idle_add(lambda: self.saver_dialog() and False))
         header.pack_start(settings, False, False, 0)
@@ -527,8 +890,8 @@ class Window:
         for w in [info] + self.buttons:
             w.show_all()
         top.pack_start(self.bar, False, False, 0)
-        self.hint = prepare_label('OK: open   ← →: places / files   blue (Menu): the file\'s menu   pause: the music   '
-                                  'exit: up a folder, close', 'hint', margin_start=16, margin_bottom=6)
+        self.hint = prepare_label('OK open   blue: menu   green: mark   red: copy   yellow: paste   info: about it   '
+                                  'pause: music   exit: up, close', 'hint', margin_start=16, margin_bottom=6)
         top.pack_start(self.hint, False, False, 0)
         self.win.add(top)
         self.fill_places()
@@ -566,6 +929,8 @@ class Window:
     def open_folder(self, path, focus=False, select=None):
         if path == self.folder and not focus and select is None:
             return
+        if path != self.folder:
+            self.marked.clear()   # marks are of one folder
         self.folder = path
         self.state['last'] = path
         self.path_label.set_text(path)
@@ -593,6 +958,9 @@ class Window:
         if not entries and names is not None and not self.rows:
             self.empty('Nothing here')
         self.list.show_all()
+        for r in self.rows:
+            if r.path in self.marked:
+                r.check.show()
         index = next((i for i, r in enumerate(self.rows) if r.path == select), 0)
         if self.rows:
             self.list.select_row(self.rows[index])
@@ -611,6 +979,7 @@ class Window:
         box = Gtk.Box(spacing=12)
         icon = prepare_label(ICONS.get(k, ICONS['file']), 'icon ' + k)
         box.pack_start(icon, False, False, 0)
+        row.check = prepare_label('\uf00c', 'mark', no_show_all=True)
         info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         info.pack_start(prepare_label(name, 'name', ellipsize=Pango.EllipsizeMode.MIDDLE), False, False, 0)
         if detail is None and k != 'folder':
@@ -626,9 +995,12 @@ class Window:
             info.pack_start(prepare_label('Stopped at %s of %s' % (clock(r['position']), clock(r.get('duration'))),
                                           'resume'), False, False, 0)
         box.pack_start(info, True, True, 0)
+        box.pack_start(row.check, False, False, 0)
         row.add(box)
         self.list.add(row)
         self.rows.append(row)
+        if path in self.marked:
+            self.show_mark(row, True)
 
     def files_of(self, k):
         return [r.path for r in self.rows if r.kind == k]
@@ -752,20 +1124,41 @@ class Window:
             return True
         return False
 
-    def menu(self, row):
+    def menu(self, row=None):
+        """The file's menu (blue), or the folder's when nothing is chosen"""
         items = []
-        if row.kind == 'video':
+        kind_ = getattr(row, 'kind', None)
+        if kind_ == 'video':
             items += [('Play', lambda: self.activate(row)), ('Play from the start', lambda: self.activate(row, True))]
-        elif row.kind == 'audio':
+        elif kind_ == 'audio':
             items += [('Play from here (the whole folder)', lambda: self.activate(row))]
-        elif row.kind == 'image':
+        elif kind_ == 'image':
             items += [('View', lambda: self.activate(row)), ('Slideshow from here', lambda: self.view_photos(row.path, True)),
                       ('Use this folder for the screensaver', lambda: self.saver_folder(os.path.dirname(row.path)))]
-        elif row.kind == 'folder':
+        elif kind_ == 'folder':
             items += [('Open', lambda: self.activate(row)),
                       ('Use for the screensaver\'s photos', lambda: self.saver_folder(row.path))]
-        if row.kind != 'up':
-            items += [None, ('Delete…', lambda: self.delete(row))]
+        if items:
+            items.append(None)
+        if kind_ and kind_ != 'up':
+            n = len(self.chosen(row))
+            what = '%d marked' % n if self.marked else 'it'
+            items += [('Info  (info)', lambda: self.info(row)),
+                      ('Mark  (green)' if row.path not in self.marked else 'Unmark  (green)', lambda: self.toggle_mark(row)),
+                      ('Copy %s  (red)' % what, lambda: self.copy(row, 'copy')),
+                      ('Cut %s, to move' % what, lambda: self.copy(row, 'cut')),
+                      ('Rename…', lambda: self.rename(row))]
+        if self.clip:
+            items.append(('Paste %d here  (yellow)' % len(self.clip[0]), self.paste))
+        items.append(('New folder…', self.new_folder))
+        if self.marked:
+            items += [('Mark none', self.unmark_all)]
+        else:
+            items += [('Mark all', self.mark_all)]
+        if kind_ and kind_ != 'up':
+            items += [None, ('Delete %s…' % ('%d marked' % len(self.marked) if self.marked else 'it'),
+                             lambda: self.delete(row))]
+        items += [None, ('Screensaver…', self.saver_dialog)]
         m = Gtk.Menu()
         for item in items:
             if item is None:
@@ -778,8 +1171,227 @@ class Window:
         m.show_all()
         self._menu = m
         m.attach_to_widget(self.win)
-        m.popup_at_widget(row, Gdk.Gravity.SOUTH_WEST, Gdk.Gravity.NORTH_WEST, None)
+        if row is not None:
+            m.popup_at_widget(row, Gdk.Gravity.SOUTH_WEST, Gdk.Gravity.NORTH_WEST, None)
+        else:
+            m.popup_at_widget(self.scroll, Gdk.Gravity.NORTH_WEST, Gdk.Gravity.NORTH_WEST, None)
         m.select_first(False)
+
+    # marks, copy and paste, rename, new folder
+
+    def chosen(self, row, with_subs=False):
+        """What an operation is about: the marked files, else the one chosen; with_subs, a video's
+        subtitle files too (the list doesn't show them)"""
+        if self.marked:
+            paths = [r.path for r in self.rows if r.path in self.marked]
+        else:
+            paths = [row.path] if row is not None and getattr(row, 'kind', 'up') != 'up' else []
+        if with_subs:
+            for p in list(paths):
+                if kind(p) == 'video':
+                    paths += [s_ for s_ in subtitle_files(p) if s_ not in paths]
+        return paths
+
+    def current(self):
+        row = self.list.get_selected_row()
+        return row if row is not None and hasattr(row, 'kind') else None
+
+    def show_mark(self, row, on):
+        row.check.set_visible(on)
+        (row.get_style_context().add_class if on else row.get_style_context().remove_class)('marked')
+
+    def toggle_mark(self, row, step=False):
+        if row is None or row.kind == 'up':
+            return
+        on = row.path not in self.marked
+        (self.marked.add if on else self.marked.discard)(row.path)
+        self.show_mark(row, on)
+        self.say('%d marked' % len(self.marked) if self.marked else 'None marked')
+        if step:   # on to the next, as with the remote's green over a list
+            i = self.rows.index(row)
+            if i + 1 < len(self.rows):
+                self.list.select_row(self.rows[i + 1])
+                self.rows[i + 1].grab_focus()
+
+    def mark_all(self):
+        for r in self.rows:
+            if r.kind != 'up':
+                self.marked.add(r.path)
+                self.show_mark(r, True)
+        self.say('%d marked' % len(self.marked))
+
+    def unmark_all(self):
+        for r in self.rows:
+            self.show_mark(r, False)
+        self.marked.clear()
+        self.say('None marked')
+
+    def copy(self, row, mode):
+        paths = self.chosen(row, with_subs=True)
+        if not paths:
+            return
+        self.clip = (paths, mode)
+        n = len([p for p in paths if kind(p) != 'subs'])
+        self.unmark_all()
+        self.say('%s %d: open another folder and paste (yellow)' % ('Copied' if mode == 'copy' else 'Cut', n))
+
+    def paste(self):
+        if not self.clip:
+            self.say('Nothing to paste: copy (red) first')
+            return
+        if self.copier:
+            self.say('Still pasting the last ones')
+            return
+        paths, mode = self.clip
+        dest = self.folder
+        for p in paths:
+            if os.path.isdir(p) and (dest == p or dest.startswith(p.rstrip('/') + '/')):
+                self.say('A folder can\'t go into itself')
+                return
+        if mode == 'cut':
+            self.clip = None   # moved: the originals are gone
+        self.copier = Copier(paths, dest, mode == 'cut', self.paste_progress, self.paste_done)
+
+    def paste_progress(self, text):
+        self.status.set_text(text)
+        return False
+
+    def paste_done(self, copier):
+        self.copier = None
+        if copier.error:
+            self.say(copier.error, 8)
+        elif copier.cancelled:
+            self.say('Stopped: %d of %d done' % (copier.done, len(copier.paths)), 6)
+        else:
+            n = sum(1 for p in copier.paths[:copier.done] if kind(p) != 'subs')   # not the subtitles that went along
+            self.say('%s %d' % ('Moved' if copier.move else 'Pasted', n))
+        if self.folder == copier.dest or any(os.path.dirname(p) == self.folder for p in copier.paths):
+            # the list again, the cursor where it was (it may have moved on since): on what was
+            # pasted only if it was still on ".."
+            row = self.current()
+            keep = row.path if row is not None and row.kind != 'up' and os.path.exists(row.path) else None
+            self.open_folder(self.folder, focus=True, select=keep or copier.last)
+        return False
+
+    def ask(self, title, prompt, text=''):
+        """A name from the viewer (the remote's text key brings the on-screen keyboard), or None"""
+        d = Gtk.Dialog(title=title, transient_for=self.win, modal=True)
+        d.add_buttons('Cancel', Gtk.ResponseType.CANCEL, 'OK', Gtk.ResponseType.OK)
+        d.set_default_response(Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        box.add(prepare_label(prompt))
+        e = Gtk.Entry(text=text, activates_default=True, width_chars=50)
+        box.add(e)
+        box.add(prepare_label('text on the remote: the on-screen keyboard   OK: done   exit: cancel', 'hint'))
+        d.show_all()
+        # the name without its extension chosen, so typing replaces just that
+        base, ext = os.path.splitext(text)
+        e.select_region(0, len(base) if ext and len(ext) <= 6 else -1)
+        r = d.run()
+        value = e.get_text().strip()
+        d.destroy()
+        return value if r == Gtk.ResponseType.OK and value else None
+
+    def bad_name(self, name):
+        return name in ('.', '..') or '/' in name or '\0' in name
+
+    def new_folder(self):
+        name = self.ask('New folder', 'The new folder\'s name, in %s:' % self.folder, 'New folder')
+        if not name:
+            return
+        if self.bad_name(name):
+            self.say('A name can\'t have "/" in it')
+            return
+        path = os.path.join(self.folder, name)
+        try:
+            os.mkdir(path)
+        except OSError as e:
+            self.say('No folder made: %s' % e.strerror)
+            return
+        self.open_folder(self.folder, focus=True, select=path)
+
+    def rename(self, row):
+        if row is None or row.kind == 'up':
+            return
+        old = row.path
+        name = self.ask('Rename', 'The new name of %s:' % os.path.basename(old), os.path.basename(old))
+        if not name or name == os.path.basename(old):
+            return
+        if self.bad_name(name):
+            self.say('A name can\'t have "/" in it')
+            return
+        new = os.path.join(os.path.dirname(old), name)
+        if os.path.exists(new):
+            self.say('There is a "%s" already' % name)
+            return
+        try:
+            os.rename(old, new)
+        except OSError as e:
+            self.say('Not renamed: %s' % e.strerror)
+            return
+        if row.kind == 'video':   # its subtitles and a TV recording's description go along
+            ob, nb = os.path.splitext(old)[0], os.path.splitext(new)[0]
+            for side in subtitle_files(old) + [p_ for p_ in [ob + '.json'] if os.path.exists(p_)]:
+                try:
+                    os.rename(side, nb + side[len(ob):])
+                except OSError:
+                    pass
+        if old in self.state['resume']:
+            self.state['resume'][new] = self.state['resume'].pop(old)
+            save_json(STATE, self.state)
+        self.marked.discard(old)
+        self.open_folder(self.folder, focus=True, select=new)
+
+    def say(self, text, seconds=4):
+        self.status.set_text(text)
+        if getattr(self, 'say_timer', None):
+            GLib.source_remove(self.say_timer)
+        self.say_timer = GLib.timeout_add_seconds(seconds, self.say_done)
+
+    def say_done(self):
+        self.say_timer = None
+        if not self.copier:
+            self.status.set_text('')
+        return False
+
+    # info
+
+    def info(self, row):
+        if row is None or row.kind == 'up':
+            return
+        path = row.path
+        self.say('Reading %s…' % os.path.basename(path))
+
+        def work():
+            text = describe(path, row.kind, self.state['resume'].get(path))
+            GLib.idle_add(self.show_info, os.path.basename(path), text)
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_info(self, name, text):
+        self.status.set_text('')
+        d = Gtk.Dialog(title=name, transient_for=self.win, modal=True)
+        d.add_buttons('Close', Gtk.ResponseType.CLOSE)
+        d.set_default_size(900, 600)
+        sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        lb = prepare_label(text, 'infotext', wrap=True, selectable=False, yalign=0, margin=16)
+        sw.add(lb)
+        d.get_content_area().pack_start(sw, True, True, 0)
+
+        def keys(w, ev):   # the arrows and page+ / page- scroll
+            k = Gdk.keyval_name(ev.keyval) or ''
+            adj = sw.get_vadjustment()
+            step = {'Up': -40, 'Down': 40, 'Page_Up': -adj.get_page_size(), 'Page_Down': adj.get_page_size()}.get(k)
+            if step is None:
+                return False
+            adj.set_value(adj.get_value() + step)
+            return True
+        d.connect('key-press-event', keys)
+        d.show_all()
+        d.run()
+        d.destroy()
+        return False
 
     def confirm(self, text):
         d = Gtk.MessageDialog(transient_for=self.win, modal=True, message_type=Gtk.MessageType.QUESTION,
@@ -789,23 +1401,38 @@ class Window:
         return r == Gtk.ResponseType.OK
 
     def delete(self, row):
-        name = os.path.basename(row.path)
-        what = 'the folder "%s" and everything in it' % name if row.kind == 'folder' else '"%s"' % name
+        paths = self.chosen(row)
+        subs = self.chosen(row, with_subs=True)[len(paths):]
+        if not paths:
+            return
+        if len(paths) == 1:
+            name = os.path.basename(paths[0])
+            what = 'the folder "%s" and everything in it' % name if os.path.isdir(paths[0]) else '"%s"' % name
+        else:
+            what = 'these %d (folders with everything in them)' % len(paths)
         if not self.confirm('Delete %s?' % what):
             return
-        try:
-            if row.kind == 'folder':
-                shutil.rmtree(row.path)
-            else:
-                os.unlink(row.path)
-                base = os.path.splitext(row.path)[0]
-                for ext in ('.srt', '.ass', '.json'):   # its subtitles, a TV recording's description
-                    if os.path.exists(base + ext):
-                        os.unlink(base + ext)
-            self.state['resume'].pop(row.path, None)
-            save_json(STATE, self.state)
-        except OSError as e:
-            self.flash('Not deleted: %s' % e.strerror)
+        errors = []
+        for p in paths:
+            try:
+                if os.path.isdir(p) and not os.path.islink(p):
+                    shutil.rmtree(p)
+                else:
+                    os.unlink(p)
+                    if kind(p) == 'video' and os.path.exists(os.path.splitext(p)[0] + '.json'):
+                        os.unlink(os.path.splitext(p)[0] + '.json')   # a TV recording's description
+                self.state['resume'].pop(p, None)
+            except OSError as e:
+                errors.append('%s: %s' % (os.path.basename(p), e.strerror))
+        for p in subs:   # the video's subtitles go with it
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        save_json(STATE, self.state)
+        self.marked.clear()
+        if errors:
+            self.say('Not deleted: ' + '; '.join(errors), 8)
         self.open_folder(self.folder, focus=True)
 
     def saver_folder(self, path):
@@ -850,11 +1477,16 @@ class Window:
     # keys
 
     def on_key(self, w, ev):
+        """The remote has everything: the arrows, OK, exit, page+ / page-, and the colored keys"""
         k = Gdk.keyval_name(ev.keyval) or ''
+        ctrl = ev.state & Gdk.ModifierType.CONTROL_MASK
+        shift = ev.state & Gdk.ModifierType.SHIFT_MASK
         focus = self.win.get_focus()
         in_list = focus is not None and focus.get_parent() is self.list
         in_places = focus is not None and focus.get_parent() is self.places
-        if k in ('AudioPlay', 'AudioPause', 'space') and self.music.running() and not isinstance(focus, Gtk.Button):
+        in_bar = focus in self.buttons
+        row = focus if in_list and hasattr(focus, 'kind') else self.current()
+        if k in ('AudioPlay', 'AudioPause', 'space') and self.music.running() and not in_bar:
             self.music.cmd('cycle', 'pause')
             self.update_music()
             return True
@@ -864,8 +1496,35 @@ class Window:
         if k == 'AudioRewind' and self.music.running():
             self.music.cmd('seek', -10)
             return True
-        if k in ('Menu', 'F2', 'Launch4') and in_list:
-            self.menu(focus)
+        if k in ('Menu', 'F10', 'Launch4'):   # blue
+            self.menu(row if in_list or not in_places else None)
+            return True
+        if k in ('Launch2', 'Insert'):   # green
+            self.toggle_mark(row, step=True)
+            return True
+        if k == 'Launch1' or (ctrl and k in ('c', 'C')):   # red
+            self.copy(row, 'copy')
+            return True
+        if ctrl and k in ('x', 'X'):
+            self.copy(row, 'cut')
+            return True
+        if k == 'Launch3' or (ctrl and k in ('v', 'V')):   # yellow
+            self.paste()
+            return True
+        if k in ('Tools', 'i') or (k == 'Return' and ev.state & Gdk.ModifierType.MOD1_MASK):   # info
+            self.info(row)
+            return True
+        if k == 'F2':
+            self.rename(row)
+            return True
+        if k == 'Delete':
+            self.delete(row)
+            return True
+        if ctrl and shift and k in ('n', 'N'):
+            self.new_folder()
+            return True
+        if ctrl and k in ('a', 'A'):
+            self.mark_all()
             return True
         if k == 'Right' and in_places:
             row = self.list.get_selected_row() or (self.rows[0] if self.rows else None)
@@ -876,7 +1535,22 @@ class Window:
             row = self.places.get_selected_row()
             (row or self.places).grab_focus()
             return True
-        if k in ('Escape', 'BackSpace'):   # exit: up a folder, then the places, then close
+        # the music's buttons: down from the end of the list, up or exit back into it
+        if k == 'Down' and in_list and self.bar.get_visible() and self.rows and focus is self.rows[-1]:
+            self.buttons[2].grab_focus()
+            return True
+        if k in ('Up', 'Escape', 'BackSpace') and in_bar:
+            target = self.list.get_selected_row() or (self.rows[-1] if self.rows else self.places)
+            target.grab_focus()
+            return True
+        if k in ('Escape', 'BackSpace'):   # exit: stop pasting, unmark, up a folder, the places, close
+            if self.copier:
+                if self.confirm('Stop pasting?'):
+                    self.copier.cancel()
+                return True
+            if self.marked:
+                self.unmark_all()
+                return True
             parent = os.path.dirname(self.folder.rstrip('/'))
             if in_list and self.folder not in [p[1] for p in self.place_list] and parent:
                 self.open_folder(parent, focus=True, select=self.folder)
@@ -888,6 +1562,8 @@ class Window:
         return False
 
     def quit(self, w):
+        if self.copier:
+            self.copier.cancel()
         self.music.stop()
         save_json(STATE, self.state)
         Gtk.main_quit()

@@ -13,7 +13,7 @@ which kbd-merge merges into X's keyboard like any other. On the way it adds:
   exit     back: closes menus, the on-screen keyboard, the channel list, stops the player and
            closes the TV window (Esc); any other window it closes.
   info     the panel, over a fullscreen window too (ozone-panel); in mouse mode the right button.
-           In the player: the video's info (TV: the channel's, and the signal).
+           In the player: the video's info (TV: the channel's, and the signal); in Files a file's.
   Power    sleep (ozone-standby) when let go; any button wakes the box (ozone-standby can't see
            the remote, which is held here, so this wakes it). Held for 2 s: power off (the box's
            deep sleep, red LED; Power turns it on again).
@@ -333,7 +333,8 @@ DIGITS = {E.KEY_1: 1, E.KEY_2: 2, E.KEY_3: 3, E.KEY_4: 4, E.KEY_5: 5, E.KEY_6: 6
           E.KEY_9: 9, E.KEY_0: 0}
 ARROWS = (E.KEY_UP, E.KEY_DOWN, E.KEY_LEFT, E.KEY_RIGHT)
 # windows where exit means Esc (they handle it); other windows it closes
-ESC_CLASSES = ('ozone-tv', 'ozone-screen')
+ESC_CLASSES = ('ozone-tv', 'ozone-screen', 'ozone-files', 'ozone-equalizer')
+INFO_CLASSES = ('ozone-files',)   # info is their own key (a file's details), not the panel
 
 
 class Remote:
@@ -476,7 +477,7 @@ class Remote:
                 self.back()
             return
         # here, not in sxhkd: the player grabs X's keyboard
-        if code == INFO_KEY and not self.running('amplay'):
+        if code == INFO_KEY and not self.running('amplay') and not self.focused_is(INFO_CLASSES):
             if press:
                 subprocess.Popen(['ozone-panel', 'peek'])
             return
@@ -563,6 +564,15 @@ class Remote:
     @staticmethod
     def running(name):
         return subprocess.call(['pgrep', '-x', name], stdout=subprocess.DEVNULL) == 0
+
+    @staticmethod
+    def focused_is(classes):
+        """The focused window is one of these programs (WM_CLASS)"""
+        node = subprocess.run(['bspc', 'query', '-N', '-n', 'focused.window'], capture_output=True, text=True).stdout.strip()
+        if not node:
+            return False
+        cls = subprocess.run(['xprop', '-id', node, 'WM_CLASS'], capture_output=True, text=True).stdout
+        return any('"%s"' % c in cls for c in classes)
 
     @staticmethod
     def tv_player():

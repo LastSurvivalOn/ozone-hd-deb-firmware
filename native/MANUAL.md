@@ -256,7 +256,7 @@ video (MPEG-4 ASP / DivX, VP9, AV1…) goes to the software player, which manage
 | ⏪ ⏯ ⏩ buttons | back 10 s / pause / forward 10 s |
 | click on the volume | mute |
 | wheel | volume |
-| ✕ at the top right | quit |
+| ✕ at the top right (it turns red under the pointer) | quit |
 
 **Loading…** in place of the time means the player is waiting for data from the network. It
 continues by itself once a few seconds are buffered. Multimedia keys (play, pause, next…) on a
@@ -586,22 +586,38 @@ on the left (Videos, Music, Photos and Downloads in the box, TV recordings, ever
 card and network folder, Home) and a folder's files on the right: folders first, then videos 🎬,
 music 🎵 and photos 🖼, with their size and date. A video that was stopped says where.
 
+Everything works with the remote:
+
 | Remote | Keys | Action |
 |---|---|---|
-| **↑ / ↓** | | choose |
+| **↑ / ↓**, **page+ / page−** | | choose, a page at a time |
 | **← / →** | | between the places and the files |
 | **OK** | **Enter** | open: a folder, a video, a piece of music, a photo |
-| **blue** | **Menu**, **F2**, a right click | the file's menu: play from the start, a slideshow, use for the screensaver, delete |
+| **exit** | **Esc** | unmark, up a folder, then the places, then close |
+| **blue** | **Menu**, a right click | the menu: play from the start, a slideshow, info, mark, copy, cut, rename, paste, new folder, mark all, delete, the screensaver |
+| **green** | **Insert** | mark / unmark, and on to the next: for copying, moving or deleting several |
+| **red** | **Ctrl+C** | copy the marked files (or the one chosen); **Ctrl+X** cuts them, to move |
+| **yellow** | **Ctrl+V** | paste them into the folder open now |
+| **info** | **I** | about the file: size, dates, the drive's free space; for videos and music the format, length, tracks, tags (title, artist, album…) and chapters; for photos the size in pixels and the camera's details (camera, date taken, exposure, place) |
+| | **F2**, **Delete**, **Ctrl+Shift+N**, **Ctrl+A** | rename, delete, new folder, mark all |
 | **pause** | **Space** | pause / play the music |
 | **stop** | | stop the music |
 | **<<** | | the music 10 s back |
-| **exit** | **Esc** | up a folder, then the places, then close |
+
+**Copying**: mark what you want with **green** (a ✓ appears; or none, for the file the cursor is
+on), **red** to copy it, go to another folder or drive and press **yellow**. The progress shows
+at the top right ("Copying 1/3 film.mkv: 45 %"); **exit** stops it. To move rather than copy, choose
+**Cut** in the menu. A video's subtitle files go with it, and a name that is taken gets "(2)".
+
+**Rename** and **New folder** ask for the name: press **text** on the remote for the on-screen
+keyboard, **OK** when it is typed. Renaming a video renames its subtitles too.
 
 **Videos** play in the video player (section 5), from where they were left.
 
 **Music** plays in the window: **OK** on a song plays it and the songs after it in that folder.
-The bar at the bottom shows the song, the artist and the time, with buttons (go down to them with
-the arrows): previous, 10 s back, pause, 10 s forward, next, stop. The music stops when the window
+The bar at the bottom shows the song, the artist and the time, with buttons: **↓** from the last
+file goes down to them, **← / →** between them, **OK** presses one, **↑** or **exit** goes back
+to the files. They are previous, 10 s back, pause, 10 s forward, next, stop. The music stops when the window
 is closed.
 
 **Photos** open full screen: **← / →** the previous / next one, **OK** a slideshow (again: stop),
