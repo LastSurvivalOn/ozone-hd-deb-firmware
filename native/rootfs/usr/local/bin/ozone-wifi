@@ -3,7 +3,7 @@
 
 The networks around, strongest first, with the signal, a lock for those with a password, and the
 connected and saved ones marked. A saved network connects again by itself after a reboot. The
-menu also has Rescan, Disconnect and Forget. Behind it: wpa_supplicant on wlan0, started by
+menu also has Rescan, WPS (the router's button, or a PIN for the router), Disconnect and Forget. Behind it: wpa_supplicant on wlan0, started by
 /etc/init.d/ozone-wifi, through wpa_cli as root (passwords live in /etc/wpa_supplicant/ozone.conf,
 which is root's). Messages go to the panel.
 
@@ -151,6 +151,40 @@ def connect(net, known):
     notify('Could not connect to %s%s' % (ssid, ': wrong password?' if result == 'password' else ''))
 
 
+def wps(pin):
+    """WPS: the router's button pressed within two minutes, or a PIN shown here typed into the
+    router's page. wpa_supplicant saves the network it gets (update_config)"""
+    before = set(saved())
+    if pin:
+        code = cli('wps_pin', 'any')
+        if not code or not code.strip().isdigit():
+            notify('WPS is not available')
+            return
+        notify('WPS PIN %s: type it into the router\'s WPS page (2 min)' % code.strip())
+        subprocess.Popen(['rofi', '-e', 'Type this PIN into the router\'s WPS page:   %s\n\nWaiting up to 2 minutes…'
+                          % code.strip()])
+    else:
+        if cli('wps_pbc') != 'OK':
+            notify('WPS is not available')
+            return
+        notify('WPS: press the WPS button on the router now (2 min)')
+    end = time.monotonic() + 125
+    while time.monotonic() < end:
+        s = status()
+        if s.get('wpa_state') == 'COMPLETED' and s.get('ssid'):
+            cli('save_config')
+            new = set(saved()) - before
+            notify('WiFi by WPS: %s%s' % (unescape(s['ssid']), ', %s' % s['ip_address'] if s.get('ip_address') else ''))
+            if pin:
+                subprocess.call(['pkill', '-x', 'rofi'])
+            return new
+        time.sleep(2)
+    cli('wps_cancel')
+    if pin:
+        subprocess.call(['pkill', '-x', 'rofi'])
+    notify('WPS: no router answered in 2 minutes')
+
+
 def menu():
     if cli('ping') != 'PONG':
         notify('WiFi is not running (sudo /etc/init.d/ozone-wifi start)')
@@ -165,7 +199,7 @@ def menu():
         for n in nets:
             mark = '  ✓ connected' if n['ssid'] == current else '  saved' if n['ssid'] in known else ''
             lines.append('%s  %s%s%s' % (bars(n['signal']), n['ssid'], '  ' if n['secure'] else '', mark))
-        extra = ['⟳  Rescan']
+        extra = ['⟳  Rescan', '⚡  WPS: the router\'s button', '⚡  WPS: a PIN to type into the router']
         if current:
             extra.append('✕  Disconnect from %s' % current)
         if known:
@@ -180,6 +214,9 @@ def menu():
         action = extra[i - len(nets)]
         if action.startswith('⟳'):
             continue
+        if action.startswith('⚡'):
+            wps('PIN' in action)
+            return 0
         if action.startswith('✕'):
             cli('disconnect')
             notify('WiFi: disconnected')

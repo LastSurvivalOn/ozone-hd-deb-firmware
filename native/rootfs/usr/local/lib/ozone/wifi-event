@@ -1,18 +1,11 @@
 #!/bin/sh
 # wpa_cli action script (ozone-wifi): $1 the interface, $2 CONNECTED or DISCONNECTED.
-# An address by DHCP while associated, none when not.
-PF=/run/dhclient.$1.pid
+# An address while associated (DHCP or the static one of the Network menu: net-apply), none when
+# not. net-apply gives WiFi's default route metric 600: with the cable plugged in as well, the cable
+# stays the way out. Without an address on disconnect: with the cable on the same subnet, WiFi's
+# route would take the replies to what comes in over the cable (netwatch turns WiFi off for the
+# cable).
 case "$2" in
-CONNECTED)
-    dhclient -x -pf $PF $1 2> /dev/null
-    # metric 600: with the cable plugged in as well, the cable stays the way out
-    dhclient -nw -e IF_METRIC=600 -pf $PF -lf /var/lib/dhcp/dhclient.$1.leases $1
-    ;;
-DISCONNECTED)
-    dhclient -x -pf $PF $1 2> /dev/null
-    # dhclient -x can leave the address. With the cable on the same subnet, its route would then
-    # take the replies to what comes in over the cable (netwatch turns WiFi off for the cable).
-    ip route flush dev $1
-    ip -4 addr flush dev $1
-    ;;
+CONNECTED) /usr/local/lib/ozone/net-apply $1 ;;
+DISCONNECTED) /usr/local/lib/ozone/net-apply $1 down ;;
 esac

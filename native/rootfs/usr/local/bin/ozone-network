@@ -1,0 +1,294 @@
+#!/usr/bin/python3
+"""ozone-network: the network settings, in a menu for the remote (rofi).
+
+  ozone-network           the menu: the cable (automatic, a fixed address, PPPoE), WiFi (the
+                          networks, WPS, its address), the WiFi hotspot, VPN, a proxy, the phone
+                          remote, receiving videos from a phone (DLNA)
+  ozone-network status    the addresses, for scripts
+  ozone-network set       (root) JSON on stdin merged into /etc/ozone/network.json and applied
+
+The settings are applied by /usr/local/lib/ozone/net-apply (see it for the file's shape).
+"""
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import sys
+
+CONF = '/etc/ozone/network.json'
+NET_APPLY = '/usr/local/lib/ozone/net-apply'
+ICON = ''   # FontAwesome sitemap
+
+
+def notify(text):
+    subprocess.call(['ozone-notify', text], stderr=subprocess.DEVNULL)
+
+
+def rofi(prompt, items, selected=0, message=None):
+    cmd = ['rofi', '-dmenu', '-i', '-format', 'i', '-p', prompt, '-selected-row', str(selected),
+           '-theme-str', 'listview { lines: %d; }' % max(1, min(len(items), 12))]
+    if message:
+        cmd += ['-mesg', message]
+    r = subprocess.run(cmd, input='\n'.join(items), capture_output=True, text=True)
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        return None
+
+
+def ask(prompt, text='', password=False, message=None):
+    """A line typed in (the remote's text key: the on-screen keyboard), or None"""
+    cmd = ['rofi', '-dmenu', '-p', prompt, '-filter', text, '-theme-str', 'listview { lines: 0; }']
+    if password:
+        cmd.insert(2, '-password')
+    if message:
+        cmd += ['-mesg', message]
+    r = subprocess.run(cmd, input='', capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def load():
+    """The settings, without what only root may read (the menu runs as the user)"""
+    r = subprocess.run(['sudo', '-n', sys.argv[0], 'get'], capture_output=True, text=True)
+    try:
+        return json.loads(r.stdout or '{}')
+    except ValueError:
+        return {}
+
+
+def save(part):
+    """part merged in and applied, as root"""
+    r = subprocess.run(['sudo', '-n', sys.argv[0], 'set'], input=json.dumps(part), capture_output=True, text=True)
+    if r.returncode:
+        notify('Network: %s' % (r.stderr.strip() or 'not saved'))
+    return r.returncode == 0
+
+
+def addresses():
+    """iface -> 'a.b.c.d/nn' (the first IPv4 one)"""
+    out = {}
+    r = subprocess.run(['ip', '-4', '-o', 'addr'], capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        f = line.split()
+        if len(f) > 3 and f[2] == 'inet':
+            out.setdefault(f[1], f[3])
+    return out
+
+
+def gateway():
+    r = subprocess.run(['ip', 'route', 'show', 'default'], capture_output=True, text=True)
+    m = re.search(r'via (\S+) dev (\S+)', r.stdout)
+    return m.groups() if m else (None, None)
+
+
+def dns():
+    try:
+        with open('/etc/resolv.conf') as f:
+            return [l.split()[1] for l in f if l.startswith('nameserver')]
+    except OSError:
+        return []
+
+
+def status():
+    a = addresses()
+    gw, dev = gateway()
+    lines = []
+    for iface, name in (('eth0', 'Cable'), ('ppp0', 'PPPoE'), ('wlan0', 'WiFi'), ('tun0', 'VPN'), ('wg0', 'VPN')):
+        if iface in a:
+            lines.append('%s: %s' % (name, a[iface]))
+    lines.append('Way out: %s (%s)' % (gw or '-', dev or '-'))
+    lines.append('DNS: %s' % (' '.join(dns()) or '-'))
+    return lines
+
+
+def mode_label(c):
+    m = c.get('mode', 'dhcp')
+    if m == 'static':
+        return 'fixed %s' % c.get('address', '?')
+    if m == 'pppoe':
+        return 'PPPoE (%s)' % c.get('user', '')
+    return 'automatic (DHCP)'
+
+
+def fixed_address(iface, c):
+    """The address, gateway and DNS asked one after the other; the current ones offered"""
+    a = addresses().get(iface) or c.get('address') or ''
+    addr = ask('Address/prefix', c.get('address') or a, message='For example 192.168.1.50/24 (24 is a 255.255.255.0 mask)')
+    if not addr:
+        return None
+    try:
+        net = ipaddress.ip_interface(addr if '/' in addr else addr + '/24')
+    except ValueError:
+        notify('Not an address: %s' % addr)
+        return None
+    guess = c.get('gateway') or str(next(net.network.hosts()))
+    gw = ask('Gateway (the router)', guess)
+    if gw is None:
+        return None
+    try:
+        if gw:
+            ipaddress.ip_address(gw)
+    except ValueError:
+        notify('Not an address: %s' % gw)
+        return None
+    servers = ask('DNS servers', ' '.join(c.get('dns') or [gw or '1.1.1.1']),
+                  message='One or more, with spaces: the router, 1.1.1.1, 8.8.8.8…')
+    if servers is None:
+        return None
+    try:
+        servers = [str(ipaddress.ip_address(s)) for s in servers.replace(',', ' ').split()]
+    except ValueError:
+        notify('DNS: addresses, with spaces')
+        return None
+    return {'mode': 'static', 'address': str(net), 'gateway': gw, 'dns': servers}
+
+
+def cable_menu(s):
+    c = s.get('eth0', {})
+    items = ['Automatic (DHCP): the router gives the address', 'Fixed address…', 'PPPoE: a login from the provider…']
+    i = rofi('Cable: %s' % mode_label(c), items, {'dhcp': 0, 'static': 1, 'pppoe': 2}.get(c.get('mode', 'dhcp'), 0))
+    if i == 0:
+        save({'eth0': {'mode': 'dhcp'}}) and notify('Cable: automatic address')
+    elif i == 1:
+        new = fixed_address('eth0', c)
+        if new:
+            save({'eth0': new}) and notify('Cable: %s' % new['address'])
+    elif i == 2:
+        user = ask('PPPoE user', c.get('user', ''), message='The login and password from the provider\'s contract')
+        if not user:
+            return
+        password = ask('PPPoE password', password=True)
+        if password is None:
+            return
+        save({'eth0': {'mode': 'pppoe', 'user': user, 'password': password}}) and \
+            notify('PPPoE: connecting as %s…' % user)
+
+
+def wifi_address_menu(s):
+    c = s.get('wlan0', {})
+    i = rofi('WiFi address: %s' % mode_label(c), ['Automatic (DHCP)', 'Fixed address…'],
+             1 if c.get('mode') == 'static' else 0)
+    if i == 0:
+        save({'wlan0': {'mode': 'dhcp'}}) and notify('WiFi: automatic address')
+    elif i == 1:
+        new = fixed_address('wlan0', c)
+        if new:
+            save({'wlan0': new}) and notify('WiFi: %s from the next connection' % new['address'])
+
+
+def proxy_menu(s):
+    p = s.get('proxy') or {}
+    i = rofi('Proxy: %s' % (p.get('url') or 'none'), ['No proxy', 'A proxy server…'], 1 if p.get('url') else 0,
+             message='For the browser, YouTube and the player at once; for the rest from the next start')
+    if i == 0:
+        save({'proxy': {}}) and notify('No proxy')
+    elif i == 1:
+        url = ask('Proxy', p.get('url') or 'http://', message='http://host:port, or http://user:password@host:port')
+        if not url or url == 'http://':
+            return
+        no = ask('Not through it', p.get('no_proxy') or 'localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8',
+                 message='Addresses that go straight, with commas')
+        if no is None:
+            return
+        save({'proxy': {'url': url, 'no_proxy': no}}) and notify('Proxy: %s' % url)
+
+
+def tool_state(cmd):
+    r = subprocess.run([cmd, 'status'], capture_output=True, text=True)
+    return r.stdout.strip().split('\n')[0] if r.returncode == 0 and r.stdout.strip() else 'off'
+
+
+def menu():
+    while True:
+        s = load()
+        items = ['Cable: %s' % mode_label(s.get('eth0', {})),
+                 'WiFi networks (and WPS)…',
+                 'WiFi address: %s' % mode_label(s.get('wlan0', {})),
+                 'WiFi hotspot: %s' % tool_state('ozone-hotspot'),
+                 'VPN: %s' % tool_state('ozone-vpn'),
+                 'Proxy: %s' % ((s.get('proxy') or {}).get('url') or 'none'),
+                 'Remote control on the phone…',
+                 'Receive videos from a phone (DLNA): %s' % tool_state('ozone-dlna')]
+        i = rofi(ICON + '  Network', items, message='   '.join(status()))
+        if i is None:
+            return 0
+        if i == 0:
+            cable_menu(s)
+        elif i == 1:
+            return os.execvp('ozone-wifi', ['ozone-wifi'])
+        elif i == 2:
+            wifi_address_menu(s)
+        elif i == 3:
+            subprocess.call(['ozone-hotspot', 'menu'])
+        elif i == 4:
+            subprocess.call(['ozone-vpn', 'menu'])
+        elif i == 5:
+            proxy_menu(s)
+        elif i == 6:
+            subprocess.call(['ozone-phone', 'show'])
+        elif i == 7:
+            subprocess.call(['ozone-dlna', 'menu'])
+
+
+def root_get():
+    try:
+        with open(CONF) as f:
+            s = json.load(f)
+    except (OSError, ValueError):
+        s = {}
+    for c in s.values():   # the menu needs no passwords
+        if isinstance(c, dict) and 'password' in c:
+            c['password'] = ''
+    print(json.dumps(s))
+    return 0
+
+
+def root_set():
+    part = json.load(sys.stdin)
+    try:
+        with open(CONF) as f:
+            s = json.load(f)
+    except (OSError, ValueError):
+        s = {}
+    for k, v in part.items():
+        if k not in ('eth0', 'wlan0', 'proxy'):
+            sys.exit('unknown part %s' % k)
+        old = s.get(k, {})
+        if v.get('mode') == 'pppoe' and not v.get('password') and old.get('user') == v.get('user'):
+            v['password'] = old.get('password', '')   # the same login: the password kept
+        s[k] = v
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    fd = os.open(CONF + '.tmp', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(s, f, indent=1)
+    os.replace(CONF + '.tmp', CONF)
+    for k in part:
+        if k == 'proxy':
+            subprocess.call([NET_APPLY, 'proxy'])
+        elif k == 'eth0' or addresses_any('wlan0'):
+            subprocess.call([NET_APPLY, k])
+    return 0
+
+
+def addresses_any(iface):
+    """WiFi is associated: its address can change now"""
+    r = subprocess.run(['wpa_cli', '-i', iface, 'status'], capture_output=True, text=True)
+    return 'wpa_state=COMPLETED' in r.stdout
+
+
+def main(argv):
+    if argv[1:2] in (['get'], ['set']):
+        if os.geteuid() != 0:
+            sys.exit('as root')
+        return root_get() if argv[1] == 'get' else root_set()
+    if argv[1:] == ['status']:
+        print('\n'.join(status()))
+        return 0
+    if argv[1:]:
+        sys.exit(__doc__)
+    return menu()
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

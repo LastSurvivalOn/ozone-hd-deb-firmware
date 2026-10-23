@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Network
+Comment=Cable, WiFi and WPS, a fixed address, PPPoE, the hotspot, VPN, proxy, phone remote, DLNA
+Exec=ozone-network
+Icon=network-wired
+Terminal=false
+Categories=Settings;Network;

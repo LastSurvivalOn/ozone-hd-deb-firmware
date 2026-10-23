@@ -1,0 +1,196 @@
+#!/usr/bin/python3
+"""net-apply: the addresses of the cable and WiFi, as chosen in the Network menu (ozone-network).
+
+/etc/ozone/network.json (root only: it holds the PPPoE password):
+  {"eth0":  {"mode": "dhcp" | "static" | "pppoe", "address": "192.168.1.50/24", "gateway": "...",
+             "dns": ["1.1.1.1", ...], "user": "...", "password": "..."},
+   "wlan0": {"mode": "dhcp" | "static", "address": ..., "gateway": ..., "dns": [...]},
+   "proxy": {"url": "http://host:3128", "no_proxy": "localhost,127.0.0.1,192.168.0.0/16"}}
+
+  net-apply eth0        the cable as set (netwatch: at start and when the cable comes in)
+  net-apply eth0 down   the cable out: its addresses and routes go, PPPoE stops
+  net-apply wlan0 [down]   WiFi associated or not (wifi-event)
+  net-apply proxy       the proxy for programs: /etc/ozone/proxy, /etc/environment, apt
+
+PPPoE is the user-space pppoe program under pppd: the kernel has PPP but no PPPoE.
+The cable's default route has metric 100 and WiFi's 600, so the cable stays the way out.
+"""
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+CONF = '/etc/ozone/network.json'
+PROXY = '/etc/ozone/proxy'
+ENVIRONMENT = '/etc/environment'
+APT_PROXY = '/etc/apt/apt.conf.d/80ozone-proxy'
+LOG = '/var/log/net-apply.log'
+METRIC = {'eth0': 100, 'wlan0': 600}
+PPP_PID = '/run/ppp-ozone.pid'
+
+
+def log(text):
+    try:
+        with open(LOG, 'a') as f:
+            f.write('%s %s\n' % (time.strftime('%F %T'), text))
+    except OSError:
+        pass
+
+
+def load():
+    try:
+        with open(CONF) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def sh(*args):
+    return subprocess.call(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def dhclient_stop(iface):
+    sh('dhclient', '-x', '-pf', '/run/dhclient.%s.pid' % iface, iface)
+
+
+def dhclient_start(iface):
+    dhclient_stop(iface)
+    sh('dhclient', '-4', '-nw', '-e', 'IF_METRIC=%d' % METRIC[iface], '-pf', '/run/dhclient.%s.pid' % iface,
+       '-lf', '/var/lib/dhcp/dhclient.%s.leases' % iface, iface)
+
+
+def flush(iface):
+    sh('ip', 'route', 'flush', 'dev', iface)
+    sh('ip', '-4', 'addr', 'flush', 'dev', iface)
+
+
+def write_resolv(dns):
+    if not dns:
+        return
+    tmp = '/etc/resolv.conf.ozone'
+    with open(tmp, 'w') as f:
+        f.write('# net-apply (Network menu)\n' + ''.join('nameserver %s\n' % d for d in dns))
+    os.replace(tmp, '/etc/resolv.conf')
+
+
+def static(iface, c):
+    flush(iface)
+    net = ipaddress.ip_interface(c['address'])
+    sh('ip', 'addr', 'add', str(net), 'dev', iface)
+    sh('ip', 'link', 'set', iface, 'up')
+    if c.get('gateway'):
+        sh('ip', 'route', 'add', 'default', 'via', c['gateway'], 'dev', iface, 'metric', str(METRIC[iface]))
+    write_resolv(c.get('dns'))
+    log('%s: static %s via %s, dns %s' % (iface, net, c.get('gateway'), c.get('dns')))
+
+
+def ppp_stop():
+    try:
+        with open(PPP_PID) as f:
+            pid = int(f.read().split()[0])
+        os.kill(pid, 15)
+    except (OSError, ValueError):
+        pass
+    for _ in range(20):
+        if not os.path.exists('/sys/class/net/ppp0'):
+            break
+        time.sleep(0.25)
+
+
+def ppp_start(c):
+    """pppd with pppoe as its pty; it keeps the line up by itself (persist)"""
+    ppp_stop()
+    flush('eth0')
+    sh('ip', 'link', 'set', 'eth0', 'up')
+    # the password goes to pppd through the secrets files, not its command line
+    secret = '"%s" * "%s" *\n' % (c.get('user', '').replace('"', ''), c.get('password', '').replace('"', ''))
+    for path in ('/etc/ppp/pap-secrets', '/etc/ppp/chap-secrets'):
+        with open(path, 'w') as f:
+            f.write('# net-apply (Network menu)\n' + secret)
+        os.chmod(path, 0o600)
+    args = ['pppd', 'pty', '/usr/sbin/pppoe -I eth0 -T 80 -m 1452', 'user', c.get('user', ''), 'noauth',
+            'defaultroute', 'replacedefaultroute', 'usepeerdns', 'persist', 'maxfail', '0', 'holdoff', '10',
+            'noipdefault', 'hide-password', 'mtu', '1492', 'mru', '1492', 'lcp-echo-interval', '20',
+            'lcp-echo-failure', '3', 'unit', '0', 'linkname', 'ozone', 'logfile', '/var/log/pppoe.log',
+            'noaccomp', 'default-asyncmap', 'nopcomp', 'novj', 'novjccomp', 'nodeflate', 'nobsdcomp']
+    subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log('eth0: PPPoE as %s' % c.get('user'))
+
+
+def apply(iface, up=True):
+    c = load().get(iface, {})
+    mode = c.get('mode', 'dhcp')
+    if not up:
+        dhclient_stop(iface)
+        if iface == 'eth0':
+            ppp_stop()
+        flush(iface)
+        log('%s: down' % iface)
+        return
+    if iface == 'eth0' and mode != 'pppoe':
+        ppp_stop()
+    if mode == 'static' and c.get('address'):
+        dhclient_stop(iface)
+        static(iface, c)
+    elif mode == 'pppoe' and iface == 'eth0':
+        dhclient_stop(iface)
+        ppp_start(c)
+    else:
+        # a fixed address from before goes (DHCP's own are "dynamic"), with its routes
+        r = subprocess.run(['ip', '-4', '-o', 'addr', 'show', 'dev', iface], capture_output=True, text=True)
+        if any(' inet ' in l and 'dynamic' not in l for l in r.stdout.splitlines()):
+            flush(iface)
+        dhclient_start(iface)
+        log('%s: DHCP' % iface)
+
+
+def apply_proxy():
+    """For what starts from now on: GTK programs here read /etc/ozone/proxy themselves (yt,
+    ozone-web, amplay through them), the rest of the session /etc/environment from the next
+    start of the desktop, apt its own file"""
+    p = load().get('proxy') or {}
+    url = (p.get('url') or '').strip()
+    no = (p.get('no_proxy') or 'localhost,127.0.0.1,::1').strip()
+    if url and not re.match(r'^[a-z0-9]+://', url):
+        url = 'http://' + url
+    keys = ('http_proxy', 'https_proxy', 'ftp_proxy', 'no_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY')
+    try:
+        with open(ENVIRONMENT) as f:
+            lines = [l for l in f if l.split('=', 1)[0].strip() not in keys]
+    except OSError:
+        lines = []
+    if url:
+        lines += ['%s=%s\n' % (k, url) for k in ('http_proxy', 'https_proxy', 'ftp_proxy', 'HTTP_PROXY', 'HTTPS_PROXY')]
+        lines += ['%s=%s\n' % (k, no) for k in ('no_proxy', 'NO_PROXY')]
+    with open(ENVIRONMENT + '.tmp', 'w') as f:
+        f.writelines(lines)
+    os.replace(ENVIRONMENT + '.tmp', ENVIRONMENT)
+    with open(PROXY + '.tmp', 'w') as f:
+        f.write(('%s\n%s\n' % (url, no)) if url else '')
+    os.chmod(PROXY + '.tmp', 0o644)
+    os.replace(PROXY + '.tmp', PROXY)
+    if url:
+        with open(APT_PROXY, 'w') as f:
+            f.write('Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' % (url, url))
+    elif os.path.exists(APT_PROXY):
+        os.unlink(APT_PROXY)
+    log('proxy: %s' % (url or 'none'))
+
+
+def main(argv):
+    if len(argv) < 2:
+        sys.exit(__doc__)
+    if argv[1] == 'proxy':
+        apply_proxy()
+    elif argv[1] in METRIC:
+        apply(argv[1], up=argv[2:3] != ['down'])
+    else:
+        sys.exit(__doc__)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

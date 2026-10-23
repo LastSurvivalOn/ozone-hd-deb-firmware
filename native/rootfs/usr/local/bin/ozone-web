@@ -318,6 +318,10 @@ class Browser(Gtk.ApplicationWindow):
         manager = WebKit2.WebsiteDataManager(base_data_directory=DATA, base_cache_directory=CACHE)
         manager.get_cookie_manager().set_persistent_storage(os.path.join(DATA, 'cookies.sqlite'),
                                                             WebKit2.CookiePersistentStorage.SQLITE)
+        proxy = use_proxy()
+        if proxy:   # WebKit's network process goes its own way: told here
+            manager.set_network_proxy_settings(WebKit2.NetworkProxyMode.CUSTOM,
+                                               WebKit2.NetworkProxySettings.new(proxy[0], proxy[1]))
         self.context = WebKit2.WebContext(website_data_manager=manager, memory_pressure_settings=pressure)
         self.context.set_cache_model(WebKit2.CacheModel.WEB_BROWSER)
         self.context.set_spell_checking_enabled(False)
@@ -802,6 +806,24 @@ class App(Gtk.Application):
         w, _shown = self.get_window(restore=False)
         for f in files:
             w.new_tab(f.get_uri())
+
+
+def use_proxy():
+    """The Network menu's proxy (/etc/ozone/proxy: the URL, then what goes straight) for this
+    program and what it starts (yt-dlp, amplay, urllib); (url, [hosts]) or None"""
+    try:
+        with open('/etc/ozone/proxy') as f:
+            lines = f.read().split('\n')
+    except OSError:
+        return None
+    url = lines[0].strip()
+    if not url:
+        return None
+    no = lines[1].strip() if len(lines) > 1 else ''
+    for k in ('http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY'):
+        os.environ[k] = url
+    os.environ['no_proxy'] = os.environ['NO_PROXY'] = no
+    return url, [h.strip() for h in no.split(',') if h.strip()]
 
 
 def main():

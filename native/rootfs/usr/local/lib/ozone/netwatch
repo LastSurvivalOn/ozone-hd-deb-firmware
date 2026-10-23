@@ -10,15 +10,15 @@
 #   one from the WiFi window.
 LOG=/var/log/netwatch.log
 PAUSED=/run/ozone-wifi-paused
-PF=/run/dhclient.eth0.pid
 
 carrier() {
     cat /sys/class/net/eth0/carrier 2> /dev/null || echo 0
 }
 
-# the cable is in use: plugged in, with an address from DHCP
+# the cable is in use: plugged in, with an address (DHCP or static), or PPPoE up over it
 wired() {
-    [ "$(carrier)" = 1 ] && ip -4 addr show dev eth0 | grep -q ' inet ' && echo 1 || echo 0
+    [ "$(carrier)" = 1 ] && { ip -4 addr show dev eth0 | grep -q ' inet ' ||
+                              ip -4 addr show dev ppp0 2> /dev/null | grep -q ' inet '; } && echo 1 || echo 0
 }
 
 log() {
@@ -26,18 +26,20 @@ log() {
 }
 
 rm -f $PAUSED
+# a static address or PPPoE instead of the DHCP ifupdown started at boot
+grep -qE '"eth0": *\{[^}]*"mode": *"(static|pppoe)"' /etc/ozone/network.json 2> /dev/null &&
+    /usr/local/lib/ozone/net-apply eth0
 last=$(carrier) wifi_off=0 seen=0
 while true; do
     now=$(carrier)
     if [ "$now" != "$last" ]; then
         if [ "$now" = 1 ]; then
             log "cable in"
-            # ifupdown's dhclient, started again
-            { dhclient -x -pf $PF eth0; dhclient -4 -nw -pf $PF -lf /var/lib/dhcp/dhclient.eth0.leases eth0; } > /dev/null 2>&1
+            # DHCP, the static address or PPPoE, as set in the Network menu
+            /usr/local/lib/ozone/net-apply eth0
         else
             log "cable out"
-            ip route flush dev eth0
-            ip -4 addr flush dev eth0
+            /usr/local/lib/ozone/net-apply eth0 down
         fi
         last=$now
     fi
