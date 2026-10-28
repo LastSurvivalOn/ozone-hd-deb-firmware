@@ -539,10 +539,25 @@ receiver has to detect the bursts itself, which most do.
 folder's files. Videos go to `amplay --report` (mpv if it exits 3) with what was saved in
 `~/.local/share/ozone-files/state.json`; music to one `/usr/bin/mpv --no-video --ao=sdl` with a JSON
 IPC socket, the folder's songs as its playlist. The mpv has PR_SET_PDEATHSIG to SIGKILL: SIGTERM made it
-hang on a lock while quitting (SDL's audio thread). Photos: GdkPixbuf scaled while loading (a
-4000x3000 JPEG fits 1280x720 without decoding it whole), EXIF orientation applied, the next one
-loaded in a thread; shown in a Gtk.Image (cairo from Python needs python3-gi-cairo, which isn't
-installed).
+hang on a lock while quitting (SDL's audio thread). Photos go to `ozone-photos`.
+
+`ozone-photos` (GTK, cairo through python3-gi-cairo; WebP through webp-pixbuf-loader; also the
+default for images, `~/.config/mimeapps.list`) draws in a DrawingArea:
+- A photo comes in a thread scaled to the screen while it is decoded (0.36 s for a 4000x3000 JPEG),
+  with its EXIF orientation; its neighbours are loaded next. Zooming in decodes it in full (at most
+  3000 pixels, 1.6 s) and draws from that. A GIF that moves plays from its PixbufAnimation, its
+  frames scaled with `FILTER_FAST`. GdkPixbuf's `new_from_file_at_scale` fails on those
+  ("Not all frames of the GIF image were loaded"): their stills come from the animation.
+- Every picture is copied into the X server once (`create_similar_surface`, 16 bit like the
+  screen): painted from client memory, Xorg spent 86 % of a core on a playing GIF, 17 % now; a
+  1.1 s fade takes Xorg to about 18 % while it runs, a still photo nothing.
+- The thumbnails are a grid drawn by hand (only the rows on the screen), made by two threads, the
+  ones on the screen first, kept as JPEGs in `~/.cache/ozone-photos` by path, size and time.
+- bspwm mapped the window floating, a small square, though it asks for full screen: bspwmrc has
+  `bspc rule -a Ozone-photos state=fullscreen` (the class, not the instance).
+- `--screensaver` is the screensaver (`ozone-screensaver` starts it; `ozone-files --screensaver`
+  runs it): shuffled photos fading into one another, or a moving clock; the first key, click or
+  move ends it. ozone-remote treats its window as Files': exit is Esc, info its own key.
 
 Copy and paste: marked paths (or the one chosen, and a video's subtitle files) go to a clipboard;
 pasting runs a `Copier` thread (1 MB chunks, fsync, progress every 0.4 s at the top, a move on the
@@ -566,7 +581,7 @@ type, a drive in use, the GPT way) and on a USB stick (exFAT and back to FAT32, 
 1-2 s for 16 GB.
 
 `ozone-screensaver` (started by bspwmrc) reads X's idle time from the MIT-SCREEN-SAVER extension
-(libXss through ctypes) every 15 s and starts `ozone-files --screensaver` after the minutes set,
+(libXss through ctypes) every 15 s and starts `ozone-photos --screensaver` after the minutes set,
 unless amplay, mpv or RetroArch runs or the box is in standby. The saver grabs the keyboard and
 pointer once it is mapped, so the first key ends it wherever the focus was.
 

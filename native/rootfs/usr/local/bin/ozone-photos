@@ -1,0 +1,957 @@
+#!/usr/bin/python3
+"""ozone-photos: photos full screen, for the remote: zoom, thumbnails, a slideshow, GIFs that move.
+
+  ozone-photos [FILE|FOLDER]       the photo, with the others of its folder (a folder: its first;
+                                   nothing: the thumbnails of Pictures, as from the apps menu)
+  ozone-photos --gallery FILE|FOLDER   the folder's thumbnails, the photo chosen
+  ozone-photos --slideshow FILE|FOLDER a slideshow from there
+  ozone-photos --screensaver       the screensaver (ozone-screensaver): the photos of its folder
+                                   shuffled, fading into one another, or a clock that moves about
+                                   if there are none, until a key, a click or the mouse moves
+
+A photo: <- / -> the previous / next one, up / down turn it, page+ / page- (+ / -, the mouse wheel)
+zoom in and out, and zoomed in the arrows (or dragging with the mouse) move about it; 0 fits it
+again, 1 shows its pixels 1:1 (a double click switches the two). OK (or play) a slideshow, info its
+name, size, date and the camera's details, blue (or G) the thumbnails, exit back: from zoomed in
+to the whole photo, then to the thumbnails if they were open, then closed. A click on the left or
+right edge is the previous / next one, a right click the thumbnails.
+The thumbnails: the arrows and page+ / page- choose, OK opens, play starts a slideshow there,
+exit closes. They are kept in ~/.cache/ozone-photos.
+
+The photo first comes scaled to the screen (JPEG scales while it is decoded: fast); zooming in
+decodes it in full (up to 3000 pixels) in a thread. Photos change with a short fade, the
+slideshow's are longer; the slideshow's interval is the screensaver's (the Files window's
+Screensaver settings: ~/.config/ozone/screensaver.json).
+"""
+import collections
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import random
+import re
+import sys
+import threading
+import time
+
+import cairo
+import gi
+gi.require_version('Gtk', '3.0')
+gi.require_version('Gdk', '3.0')
+gi.require_version('GdkPixbuf', '2.0')
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango  # noqa: E402
+
+HOME = os.path.expanduser('~')
+CACHE = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.join(HOME, '.cache'), 'ozone-photos')
+SAVER_CONF = os.path.join(HOME, '.config/ozone/screensaver.json')
+SAVER_DEFAULTS = {'enabled': True, 'minutes': 10, 'folder': os.path.join(HOME, 'Pictures'), 'seconds': 8}
+IMAGE = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp'}
+FULL_MAX = 3000          # pixels: a photo decoded in full for zooming, at most this on its long side
+ZOOM_STEP = 1.5
+ZOOM_MAX = 4             # times its pixels 1:1
+FADE_MS, SLIDE_FADE_MS = 220, 1100
+THUMB_W, THUMB_H = 216, 152   # the thumbnail inside its cell
+CELL_W, CELL_H, GAP = 232, 168, 14
+HEAD_H, FOOT_H = 64, 40
+BG = (0x11 / 255, 0x11 / 255, 0x1b / 255)
+CELL_BG = (0x1e / 255, 0x1e / 255, 0x2e / 255)
+SELECTED = (0xcb / 255, 0xa6 / 255, 0xf7 / 255)
+
+CSS = b"""
+* { font-family: "DejaVu Sans"; font-size: 13px; color: #cdd6f4; }
+window { background: #000000; }
+.heading { font-size: 18px; font-weight: bold; }
+.logo { font-family: "FontAwesome"; font-size: 24px; color: #cba6f7; }
+.path { color: #7f849c; }
+.hint { color: #7f849c; font-size: 12px; }
+.bar { background: rgba(17, 17, 27, 0.92); padding: 10px 20px; }
+.caption { background: rgba(17, 17, 27, 0.85); padding: 8px 16px; font-size: 15px; }
+.info { background: rgba(17, 17, 27, 0.92); padding: 14px 20px; font-family: "JetBrains Mono"; font-size: 13px; }
+.clock { font-size: 96px; font-weight: bold; color: #cdd6f4; }
+.date { font-size: 28px; color: #a6adc8; }
+"""
+
+
+def natural(name):
+    return [int(t) if t.isdigit() else t.casefold() for t in re.split(r'(\d+)', name)]
+
+
+def is_image(path):
+    name = os.path.basename(path)
+    return '.' in name and name.rsplit('.', 1)[-1].lower() in IMAGE and not name.startswith('.')
+
+
+def folder_photos(folder):
+    """The photos of a folder, in Files' order"""
+    try:
+        names = [n for n in os.listdir(folder) if is_image(n) and os.path.isfile(os.path.join(folder, n))]
+    except OSError:
+        names = []
+    return [os.path.join(folder, n) for n in sorted(names, key=natural)]
+
+
+def photos_under(folder, limit=2000):
+    """The photos under folder, a few levels down (the screensaver's)"""
+    out = []
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        if root[len(folder):].count(os.sep) > 4:
+            dirs[:] = []
+        out += [os.path.join(root, f) for f in files if is_image(f)]
+        if len(out) >= limit:
+            break
+    return out
+
+
+def saver_settings():
+    s = dict(SAVER_DEFAULTS)
+    try:
+        with open(SAVER_CONF) as f:
+            s.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    return s
+
+
+def human_size(n):
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if n < 1024 or unit == 'GB':
+            return ('%d %s' if unit == 'B' else '%.1f %s') % (n, unit)
+        n /= 1024
+
+
+def label(text='', cls=None, **kw):
+    kw.setdefault('xalign', 0)
+    w = Gtk.Label(label=text, **kw)
+    for c in (cls or '').split():
+        w.get_style_context().add_class(c)
+    return w
+
+
+def surface(pb):
+    return Gdk.cairo_surface_create_from_pixbuf(pb, 1, None) if pb else None
+
+
+def read_scaled(path, w, h):
+    """The picture in w x h at most. A GIF that moves is read whole for its first frame:
+    new_from_file_at_scale fails on those ("Not all frames of the GIF image were loaded")"""
+    if path.lower().endswith('.gif'):
+        pb = GdkPixbuf.PixbufAnimation.new_from_file(path).get_static_image()
+        s = min(w / pb.get_width(), h / pb.get_height())
+        if s < 1:
+            pb = pb.scale_simple(max(1, int(pb.get_width() * s)), max(1, int(pb.get_height() * s)),
+                                 GdkPixbuf.InterpType.BILINEAR)
+        return pb
+    return GdkPixbuf.Pixbuf.new_from_file_at_scale(path, w, h, True)
+
+
+def oriented(pb, turn):
+    pb = pb.apply_embedded_orientation() or pb
+    return pb.rotate_simple(turn) if turn else pb
+
+
+class Loader:
+    """Decoding in threads, newest wish first (the photo looked at now, the thumbnails on the screen
+    now); results come back in GTK's thread"""
+
+    def __init__(self, threads=1):
+        self.jobs = collections.deque()
+        self.wanted = set()
+        self.cond = threading.Condition()
+        for _ in range(threads):
+            threading.Thread(target=self.run, daemon=True).start()
+
+    def want(self, key, work, done):
+        with self.cond:
+            if key in self.wanted:
+                return
+            self.wanted.add(key)
+            self.jobs.appendleft((key, work, done))
+            self.cond.notify()
+
+    def forget(self, keep):
+        """Drops the wishes that keep(key) says are no longer of use (scrolled past)"""
+        with self.cond:
+            stale = [j for j in self.jobs if not keep(j[0])]
+            for j in stale:
+                self.jobs.remove(j)
+                self.wanted.discard(j[0])
+
+    def run(self):
+        while True:
+            with self.cond:
+                while not self.jobs:
+                    self.cond.wait()
+                key, work, done = self.jobs.popleft()
+            try:
+                result = work()
+            except Exception as e:   # a broken file: nothing to show, never a dead thread
+                print('%s: %s' % (key, e), file=sys.stderr)
+                result = None
+            with self.cond:
+                self.wanted.discard(key)
+            # done bound now: the loop takes the next job before GTK runs this
+            GLib.idle_add(lambda k=key, r=result, d=done: d(k, r) and False)
+
+
+class Photo:
+    """One file: the screen-sized picture (or a GIF's frames), and the full one once zoomed into"""
+
+    def __init__(self, path):
+        self.path = path
+        self.fit = None          # cairo surface, at most the screen's size
+        self.full = None         # cairo surface, up to FULL_MAX
+        self.anim = None         # GdkPixbuf.PixbufAnimation of a GIF that moves
+        self.size = (0, 0)       # its pixels, turned as shown
+        self.failed = False
+        self.turn = 0
+
+
+def load_fit(path, w, h, turn):
+    """(surface fitted in w x h or an animation, its pixels as shown)"""
+    if path.lower().endswith('.gif'):
+        anim = GdkPixbuf.PixbufAnimation.new_from_file(path)
+        if not anim.is_static_image():
+            return anim, (anim.get_width(), anim.get_height())
+    _fmt, ow, oh = GdkPixbuf.Pixbuf.get_file_info(path)
+    pb = oriented(read_scaled(path, w, h), turn)
+    if pb.get_width() > pb.get_height() and ow < oh or pb.get_width() < pb.get_height() and ow > oh:
+        ow, oh = oh, ow   # turned by its EXIF or by us
+    return surface(pb), (ow, oh)
+
+
+def load_full(path, turn):
+    pb = oriented(read_scaled(path, FULL_MAX, FULL_MAX), turn)
+    return surface(pb)
+
+
+def thumb_file(path):
+    st = os.stat(path)
+    key = '%s|%d|%d' % (path, st.st_mtime_ns, st.st_size)
+    return os.path.join(CACHE, hashlib.sha1(key.encode()).hexdigest() + '.jpg')
+
+
+def load_thumb(path):
+    """The thumbnail, from the cache or made (and kept) now"""
+    cached = thumb_file(path)
+    if os.path.exists(cached):
+        return surface(GdkPixbuf.Pixbuf.new_from_file(cached))
+    pb = read_scaled(path, THUMB_W, THUMB_H)
+    pb = pb.apply_embedded_orientation() or pb
+    if pb.get_width() > THUMB_W or pb.get_height() > THUMB_H:
+        s = min(THUMB_W / pb.get_width(), THUMB_H / pb.get_height())
+        pb = pb.scale_simple(max(1, int(pb.get_width() * s)), max(1, int(pb.get_height() * s)),
+                             GdkPixbuf.InterpType.BILINEAR)
+    if pb.get_has_alpha():   # on the cell's colour: JPEG has no transparency
+        c = 0x1e1e2e
+        pb = pb.composite_color_simple(pb.get_width(), pb.get_height(), GdkPixbuf.InterpType.NEAREST,
+                                       255, 8, c, c)
+    os.makedirs(CACHE, exist_ok=True)
+    try:
+        pb.savev(cached + '.tmp', 'jpeg', ['quality'], ['85'])
+        os.replace(cached + '.tmp', cached)
+    except GLib.Error:
+        pass
+    return surface(pb)
+
+
+class App:
+    def __init__(self, files, index, mode, slideshow=False, screensaver=False):
+        self.files, self.index = files, index
+        self.screensaver = screensaver
+        self.from_gallery = mode == 'gallery'
+        self.mode = mode
+        self.photos = {}                       # path -> Photo, the ones near the current
+        self.thumbs = collections.OrderedDict()   # path -> surface (or None: no picture), the newest last
+        self.loader = Loader(1)
+        self.thumb_loader = Loader(2)
+        self.zoom, self.cx, self.cy = 1.0, 0.5, 0.5
+        self.fade = None                      # (old surface and its rectangle, start time, duration)
+        self.slide_timer = None
+        self.anim_iter = self.anim_timer = None
+        self.caption_timer = None
+        self.drag = None
+        self.top = 0                          # the gallery's first row on the screen
+        self.sel = index
+        self.cursor_timer = None
+        self.moved_from = None
+
+        self.win = Gtk.Window(title='Photos')
+        self.win.fullscreen()
+        self.win.connect('destroy', lambda w: Gtk.main_quit())
+        self.win.connect('key-press-event', self.on_key)
+        overlay = Gtk.Overlay()
+        self.area = Gtk.DrawingArea(can_focus=True)
+        self.area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK |
+                             Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.SCROLL_MASK |
+                             Gdk.EventMask.SMOOTH_SCROLL_MASK)
+        self.area.connect('draw', self.on_draw)
+        self.area.connect('button-press-event', self.on_button)
+        self.area.connect('button-release-event', self.on_release)
+        self.area.connect('motion-notify-event', self.on_motion)
+        self.area.connect('scroll-event', self.on_scroll)
+        overlay.add(self.area)
+        # the thumbnails' header and footer
+        self.head = Gtk.Box(spacing=12, valign=Gtk.Align.START)
+        self.head.get_style_context().add_class('bar')
+        self.head.pack_start(label('', 'logo'), False, False, 0)
+        self.head.pack_start(label('Photos', 'heading'), False, False, 0)
+        self.head_path = label('', 'path', ellipsize=Pango.EllipsizeMode.MIDDLE)
+        self.head.pack_start(self.head_path, True, True, 0)
+        self.foot = Gtk.Box(spacing=20, valign=Gtk.Align.END)
+        self.foot.get_style_context().add_class('bar')
+        self.foot_name = label('', ellipsize=Pango.EllipsizeMode.MIDDLE)
+        self.foot.pack_start(self.foot_name, True, True, 0)
+        self.foot.pack_end(label('OK open   play: slideshow   exit: close', 'hint'), False, False, 0)
+        for w in (self.head, self.foot):
+            overlay.add_overlay(w)
+        self.caption = label('', 'caption', halign=Gtk.Align.CENTER, valign=Gtk.Align.END, margin_bottom=24,
+                             ellipsize=Pango.EllipsizeMode.MIDDLE)
+        self.info = label('', 'info', halign=Gtk.Align.START, valign=Gtk.Align.START, margin_start=24,
+                          margin_top=24, selectable=False)
+        for w in (self.caption, self.info):
+            w.set_no_show_all(True)
+            overlay.add_overlay(w)
+        self.clock = None
+        if screensaver:
+            self.win.connect('map-event', self.grab)
+            if not files:
+                self.clock = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, halign=Gtk.Align.START,
+                                     valign=Gtk.Align.START)
+                self.time_label, self.date_label = label('', 'clock'), label('', 'date')
+                self.clock.pack_start(self.time_label, False, False, 0)
+                self.clock.pack_start(self.date_label, False, False, 0)
+                overlay.add_overlay(self.clock)
+                GLib.timeout_add_seconds(1, self.tick_clock)
+                GLib.idle_add(lambda: self.tick_clock() and False)
+        self.win.add(overlay)
+        self.win.show_all()
+        self.head.hide()   # the thumbnails' bars (no_show_all would keep show_all from them later)
+        self.foot.hide()
+        self.area.grab_focus()
+        self.hide_cursor()
+        if not files:
+            if not screensaver:
+                self.say('No photos here')
+            return
+        if mode == 'gallery':
+            self.open_gallery()
+        else:
+            self.show(index)
+            if slideshow or screensaver:
+                self.slideshow(announce=not screensaver)
+
+    # -- common
+
+    @staticmethod
+    def size():
+        """The screen's: the window is full screen, but its allocation is 1x1 until it is mapped, and
+        the first photo is loaded for this size before that"""
+        g = Gdk.Display.get_default().get_monitor(0).get_geometry()
+        return g.width, g.height
+
+    def current(self):
+        return self.photos.setdefault(self.files[self.index], Photo(self.files[self.index]))
+
+    def say(self, text, seconds=3):
+        self.caption.set_text(text)
+        self.caption.show()
+        if self.caption_timer:
+            GLib.source_remove(self.caption_timer)
+        self.caption_timer = GLib.timeout_add_seconds(seconds, self.caption_off)
+
+    def caption_off(self):
+        self.caption_timer = None
+        self.caption.hide()
+        return False
+
+    def to_screen(self, img, bg=(0, 0, 0)):
+        """img copied into the X server once: painting it again (a fade, zooming, moving about) is
+        then a copy in there, not the whole picture sent each time (Xorg took 86 % of a core)"""
+        win = self.area.get_window()
+        if img is None or win is None:
+            return img
+        out = win.create_similar_surface(cairo.CONTENT_COLOR, img.get_width(), img.get_height())
+        cr = cairo.Context(out)
+        cr.set_source_rgb(*bg)
+        cr.paint()
+        cr.set_source_surface(img, 0, 0)
+        cr.paint()
+        return out
+
+    def hide_cursor(self):
+        w = self.win.get_window()
+        if w:
+            w.set_cursor(Gdk.Cursor.new_from_name(Gdk.Display.get_default(), 'none'))
+        self.cursor_timer = None
+        return False
+
+    def grab(self, w, ev):
+        seat = Gdk.Display.get_default().get_default_seat()
+        seat.grab(self.win.get_window(), Gdk.SeatCapabilities.ALL, True, None, None, None, None)
+        return False
+
+    def tick_clock(self):
+        self.time_label.set_text(time.strftime('%H:%M'))
+        self.date_label.set_text(time.strftime('%A, %d %B'))
+        if int(time.time()) % 30 == 0 or not self.clock.get_margin_start():
+            w, h = self.size()
+            self.clock.set_margin_start(random.randint(40, max(41, w - 520)))
+            self.clock.set_margin_top(random.randint(40, max(41, h - 220)))
+        return True
+
+    # -- one photo
+
+    def show(self, i, fade_ms=FADE_MS):
+        if not self.files:
+            return
+        old = self.visible_picture() if self.mode == 'photo' else None
+        self.mode = 'photo'
+        self.head.hide()
+        self.foot.hide()
+        self.info.hide()
+        self.index = i % len(self.files)
+        self.zoom, self.cx, self.cy = 1.0, 0.5, 0.5
+        self.stop_anim()
+        p = self.current()
+        self.fade = (old, time.monotonic(), fade_ms) if old and fade_ms else None
+        self.want_fit(p)
+        # the neighbours ready for the next press; the far ones go
+        near = {self.files[(self.index + d) % len(self.files)] for d in (-1, 0, 1, 2)}
+        for path in list(self.photos):
+            if path not in near:
+                del self.photos[path]
+        for d in (1, -1):
+            self.want_fit(self.photos.setdefault(self.files[(self.index + d) % len(self.files)],
+                                                 Photo(self.files[(self.index + d) % len(self.files)])))
+        if p.anim:
+            self.start_anim(p)
+        if not self.screensaver:
+            self.say('%d / %d   %s' % (self.index + 1, len(self.files), os.path.basename(p.path)))
+        self.tick_fade()
+
+    def want_fit(self, p):
+        if p.fit or p.anim or p.failed:
+            return
+        w, h = self.size()
+        self.loader.want(('fit', p.path, p.turn), lambda: load_fit(p.path, w, h, p.turn),
+                         lambda key, r: self.got_fit(p, key, r))
+
+    def got_fit(self, p, key, result):
+        if key[2] != p.turn:
+            return
+        if result is None:
+            p.failed = True
+            if self.mode == 'photo' and p is self.current():
+                self.say('%s: not a picture this can show' % os.path.basename(p.path))
+        elif isinstance(result[0], GdkPixbuf.PixbufAnimation):
+            p.anim, p.size = result
+            if self.mode == 'photo' and p is self.current():
+                self.start_anim(p)
+        else:
+            p.fit, p.size = self.to_screen(result[0]), result[1]
+        if self.mode == 'photo' and p is self.current():
+            if self.fade:   # the fade starts now that there is something to fade to
+                self.fade = (self.fade[0], time.monotonic(), self.fade[2])
+                self.tick_fade()
+            self.area.queue_draw()
+
+    def want_full(self, p):
+        if p.full or p.anim or p.failed:
+            return
+        self.loader.want(('full', p.path, p.turn), lambda: load_full(p.path, p.turn),
+                         lambda key, r: self.got_full(p, key, r))
+        self.say('Loading the whole photo…', 2)
+
+    def got_full(self, p, key, result):
+        if key[2] == p.turn and result is not None:
+            p.full = self.to_screen(result)
+            if p is self.current():
+                self.caption_off()
+                self.area.queue_draw()
+
+    def start_anim(self, p):
+        self.stop_anim()
+        self.anim_iter = p.anim.get_iter(None)
+        self.anim_frame = surface(self.anim_iter.get_pixbuf())
+        self.next_frame()
+
+    def next_frame(self):
+        delay = self.anim_iter.get_delay_time()
+        if delay >= 0:
+            self.anim_timer = GLib.timeout_add(max(20, delay), self.advance_frame)
+        self.area.queue_draw()
+
+    def advance_frame(self):
+        self.anim_timer = None
+        if self.anim_iter.advance(None):
+            self.anim_frame = surface(self.anim_iter.get_pixbuf())
+        self.next_frame()
+        return False
+
+    def stop_anim(self):
+        if self.anim_timer:
+            GLib.source_remove(self.anim_timer)
+        self.anim_timer = self.anim_iter = None
+
+    def fit_scale(self, p):
+        w, h = self.size()
+        ow, oh = p.size
+        return min(w / ow, h / oh) if ow and oh else 1
+
+    def visible_picture(self):
+        """(surface, x, y, scale) of what is on the screen now, for fading from it"""
+        p = self.photos.get(self.files[self.index]) if self.files else None
+        if not p:
+            return None
+        src = self.anim_frame if p.anim and self.anim_iter else (p.full if self.zoom > 1 and p.full else p.fit)
+        if src is None:
+            return None
+        return self.placement(p, src)
+
+    def placement(self, p, src):
+        """Where src (a surface of p) goes: (surface, x, y, scale)"""
+        w, h = self.size()
+        sw, sh = src.get_width(), src.get_height()
+        ow, oh = p.size if p.size[0] else (sw, sh)
+        s = self.fit_scale(p) * self.zoom * ow / sw   # screen pixels per source pixel
+        vw, vh = sw * s, sh * s
+        # zoomed: the point (cx, cy) of the photo in the middle, but no empty side while it is wider
+        x = w / 2 - self.cx * vw if vw > w else (w - vw) / 2
+        y = h / 2 - self.cy * vh if vh > h else (h - vh) / 2
+        if vw > w:
+            x = min(0, max(w - vw, x))
+        if vh > h:
+            y = min(0, max(h - vh, y))
+        return src, x, y, s
+
+    def paint(self, cr, pic, alpha=1.0):
+        src, x, y, s = pic
+        cr.save()
+        cr.translate(x, y)
+        cr.scale(s, s)
+        cr.set_source_surface(src, 0, 0)
+        # a GIF's frames, a new one each time, scaled the cheap way (their pixels are big anyway)
+        smooth = abs(s - 1) > 0.01 and not (self.anim_iter and src is getattr(self, 'anim_frame', None))
+        cr.get_source().set_filter(cairo.FILTER_GOOD if smooth else cairo.FILTER_FAST)
+        cr.paint_with_alpha(alpha) if alpha < 1 else cr.paint()
+        cr.restore()
+
+    def draw_photo(self, cr):
+        cr.set_source_rgb(0, 0, 0)
+        cr.paint()
+        pic = self.visible_picture()
+        if self.fade:
+            old, start, ms = self.fade
+            t = (time.monotonic() - start) * 1000 / ms
+            if pic is None or t < 1:
+                self.paint(cr, old)
+                if pic is not None:
+                    self.paint(cr, pic, max(0.0, t))
+                return
+            self.fade = None
+        if pic is not None:
+            self.paint(cr, pic)
+
+    def tick_fade(self):
+        self.area.queue_draw()
+        if self.fade and self.visible_picture() is not None:
+            GLib.timeout_add(30, self.fade_step)
+
+    def fade_step(self):
+        self.area.queue_draw()
+        return self.fade is not None
+
+    def set_zoom(self, z, at=None):
+        p = self.current()
+        if not p.size[0]:
+            return
+        w, h = self.size()
+        top = max(1.0, ZOOM_MAX / self.fit_scale(p))   # ZOOM_MAX times its pixels
+        z = min(top, max(1.0, z))
+        if at is not None and z != self.zoom and (p.fit or (p.anim and self.anim_iter)):
+            # the point under the mouse stays under it
+            src, x, y, s = self.placement(p, self.anim_frame if p.anim else p.fit)
+            px, py = (at[0] - x) / (src.get_width() * s), (at[1] - y) / (src.get_height() * s)
+            ratio = self.zoom / z
+            self.cx = px + (self.cx - px) * ratio
+            self.cy = py + (self.cy - py) * ratio
+        self.zoom = z
+        if z <= 1:
+            self.cx = self.cy = 0.5
+        else:
+            self.want_full(p)
+            self.say('%d %%' % round(100 * z * self.fit_scale(p)), 1)
+        self.clamp()
+        self.area.queue_draw()
+
+    def clamp(self):
+        """The middle kept where the photo still covers the screen"""
+        p = self.current()
+        w, h = self.size()
+        vw, vh = p.size[0] * self.fit_scale(p) * self.zoom, p.size[1] * self.fit_scale(p) * self.zoom
+        self.cx = min(1 - w / 2 / vw, max(w / 2 / vw, self.cx)) if vw > w else 0.5
+        self.cy = min(1 - h / 2 / vh, max(h / 2 / vh, self.cy)) if vh > h else 0.5
+
+    def pan(self, dx, dy):
+        """dx, dy in screens"""
+        p = self.current()
+        w, h = self.size()
+        s = self.fit_scale(p) * self.zoom
+        self.cx += dx * w / (p.size[0] * s)
+        self.cy += dy * h / (p.size[1] * s)
+        self.clamp()
+        self.area.queue_draw()
+
+    def turn(self, clockwise):
+        p = self.current()
+        if p.anim:
+            return
+        p.turn = (p.turn + (270 if clockwise else 90)) % 360
+        p.fit = p.full = None
+        p.size = (p.size[1], p.size[0])
+        self.zoom, self.cx, self.cy = 1.0, 0.5, 0.5
+        self.want_fit(p)
+        self.area.queue_draw()
+
+    def slideshow(self, announce=True):
+        if self.slide_timer:
+            GLib.source_remove(self.slide_timer)
+            self.slide_timer = None
+            self.say('Slideshow stopped')
+            return
+        seconds = max(2, int(saver_settings().get('seconds', 8)))
+        self.slide_timer = GLib.timeout_add_seconds(seconds, self.next_slide)
+        if announce:
+            self.say('Slideshow: a photo every %d s   (OK stops it)' % seconds)
+
+    def next_slide(self):
+        if self.mode != 'photo':
+            return True
+        if self.screensaver and len(self.files) > 1:
+            i = random.randrange(len(self.files) - 1)
+            self.show(i if i < self.index else i + 1, SLIDE_FADE_MS)
+        else:
+            self.show(self.index + 1, SLIDE_FADE_MS)
+        return True
+
+    def show_info(self):
+        if self.info.get_visible():
+            self.info.hide()
+            return
+        path = self.files[self.index]
+        p = self.current()
+        try:
+            st = os.stat(path)
+        except OSError:
+            return
+        lines = [os.path.basename(path), '%d / %d in %s' % (self.index + 1, len(self.files), os.path.dirname(path)), '',
+                 'Picture    %d x %d (%.1f megapixels)' % (p.size[0], p.size[1], p.size[0] * p.size[1] / 1e6),
+                 'File       %s' % human_size(st.st_size),
+                 'Changed    %s' % time.strftime('%d.%m.%Y %H:%M', time.localtime(st.st_mtime))]
+        if p.anim:
+            lines.append('Moving     a GIF animation')
+        try:   # the camera's details: Files' EXIF reader
+            loader = importlib.machinery.SourceFileLoader('ozone_files', '/usr/local/bin/ozone-files')
+            spec = importlib.util.spec_from_loader('ozone_files', loader)
+            files = importlib.util.module_from_spec(spec)
+            loader.exec_module(files)
+            exif = files.exif(path)
+        except Exception:
+            exif = []
+        if exif:
+            lines.append('')
+            lines += ['%-10s %s' % (n, v if not isinstance(v, list) else ' '.join(str(x) for x in v)) for n, v in exif]
+        self.info.set_text('\n'.join(lines))
+        self.info.show()
+
+    # -- the thumbnails
+
+    def open_gallery(self):
+        self.stop_anim()
+        if self.slide_timer:
+            GLib.source_remove(self.slide_timer)
+            self.slide_timer = None
+        self.mode = 'gallery'
+        self.from_gallery = True
+        self.fade = None
+        self.info.hide()
+        self.caption_off()
+        self.sel = self.index
+        self.head_path.set_text('%s   (%d)' % (os.path.dirname(self.files[0]), len(self.files)))
+        self.head.show_all()
+        self.foot.show_all()
+        self.update_foot()
+        self.scroll_to_sel()
+        self.area.queue_draw()
+
+    def grid(self):
+        w, h = self.size()
+        cols = max(1, (w - 2 * GAP + GAP) // (CELL_W + GAP))
+        rows = max(1, (h - HEAD_H - FOOT_H - GAP) // (CELL_H + GAP))
+        left = (w - cols * (CELL_W + GAP) + GAP) // 2
+        return cols, rows, left
+
+    def scroll_to_sel(self):
+        cols, rows, _ = self.grid()
+        row = self.sel // cols
+        if row < self.top:
+            self.top = row
+        elif row >= self.top + rows:
+            self.top = row - rows + 1
+
+    def update_foot(self):
+        self.foot_name.set_text('%s   %d / %d' % (os.path.basename(self.files[self.sel]), self.sel + 1, len(self.files)))
+
+    def draw_gallery(self, cr):
+        cr.set_source_rgb(*BG)
+        cr.paint()
+        cols, rows, left = self.grid()
+        first, last = self.top * cols, min(len(self.files), (self.top + rows + 1) * cols)
+        shown = set(self.files[first:last])
+        # what scrolled away needn't be made first
+        self.thumb_loader.forget(lambda key: key in shown)
+        for i in range(first, last):
+            path = self.files[i]
+            r, c = divmod(i - first, cols)
+            x, y = left + c * (CELL_W + GAP), HEAD_H + GAP + r * (CELL_H + GAP)
+            if i == self.sel:
+                cr.set_source_rgb(*SELECTED)
+                self.rounded(cr, x - 4, y - 4, CELL_W + 8, CELL_H + 8, 10)
+                cr.fill()
+            cr.set_source_rgb(*CELL_BG)
+            self.rounded(cr, x, y, CELL_W, CELL_H, 8)
+            cr.fill()
+            if path in self.thumbs:
+                t = self.thumbs[path]
+                self.thumbs.move_to_end(path)
+                if t is not None:
+                    cr.set_source_surface(t, x + (CELL_W - t.get_width()) // 2, y + (CELL_H - t.get_height()) // 2)
+                    cr.paint()
+            else:
+                self.thumb_loader.want(path, lambda p=path: load_thumb(p), self.got_thumb)
+        while len(self.thumbs) > 240:   # some 40 MB of them at most
+            self.thumbs.popitem(last=False)
+
+    @staticmethod
+    def rounded(cr, x, y, w, h, r):
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -1.5708, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, 1.5708)
+        cr.arc(x + r, y + h - r, r, 1.5708, 3.1416)
+        cr.arc(x + r, y + r, r, 3.1416, 4.7124)
+        cr.close_path()
+
+    def got_thumb(self, path, result):
+        self.thumbs[path] = self.to_screen(result, CELL_BG)
+        if self.mode == 'gallery':
+            self.area.queue_draw()
+
+    def move_sel(self, d):
+        self.sel = min(len(self.files) - 1, max(0, self.sel + d))
+        self.scroll_to_sel()
+        self.update_foot()
+        self.area.queue_draw()
+
+    def gallery_at(self, x, y):
+        cols, rows, left = self.grid()
+        c, r = (x - left) // (CELL_W + GAP), (y - HEAD_H - GAP) // (CELL_H + GAP)
+        if 0 <= c < cols and 0 <= r <= rows:
+            i = int((self.top + r) * cols + c)
+            return i if i < len(self.files) else None
+        return None
+
+    # -- input
+
+    def on_draw(self, w, cr):
+        if not self.files:
+            cr.set_source_rgb(0, 0, 0)
+            cr.paint()
+        elif self.mode == 'gallery':
+            self.draw_gallery(cr)
+        else:
+            self.draw_photo(cr)
+        return True
+
+    def on_key(self, w, ev):
+        if self.screensaver:   # any key: back to what was there
+            self.win.destroy()
+            return True
+        k = Gdk.keyval_name(ev.keyval) or ''
+        if not self.files:
+            if k in ('Escape', 'BackSpace', 'q'):
+                self.win.destroy()
+            return True
+        if self.mode == 'gallery':
+            cols, rows, _ = self.grid()
+            moves = {'Left': -1, 'Right': 1, 'Up': -cols, 'Down': cols, 'Page_Up': -cols * rows,
+                     'Page_Down': cols * rows, 'Home': -len(self.files), 'End': len(self.files)}
+            if k in moves:
+                self.move_sel(moves[k])
+            elif k in ('Return', 'KP_Enter'):
+                self.show(self.sel, 0)
+            elif k in ('AudioPlay', 'AudioPause', 'space'):
+                self.show(self.sel, 0)
+                self.slideshow()
+            elif k in ('Escape', 'BackSpace', 'q'):
+                self.win.destroy()
+            return True
+        zoomed = self.zoom > 1
+        if k in ('Escape', 'BackSpace', 'q'):
+            if self.info.get_visible():
+                self.info.hide()
+            elif zoomed:
+                self.set_zoom(1)
+            elif self.from_gallery:
+                self.open_gallery()
+            else:
+                self.win.destroy()
+        elif zoomed and k in ('Left', 'Right', 'Up', 'Down'):
+            self.pan({'Left': -0.2, 'Right': 0.2}.get(k, 0), {'Up': -0.2, 'Down': 0.2}.get(k, 0))
+        elif k in ('Right', 'AudioNext'):
+            self.show(self.index + 1)
+        elif k in ('Left', 'AudioPrev', 'AudioRewind'):
+            self.show(self.index - 1)
+        elif k in ('Page_Up', 'plus', 'KP_Add', 'equal', 'AudioForward'):
+            self.set_zoom(self.zoom * ZOOM_STEP)
+        elif k in ('Page_Down', 'minus', 'KP_Subtract'):
+            self.set_zoom(self.zoom / ZOOM_STEP)
+        elif k in ('0', 'KP_0'):
+            self.set_zoom(1)
+        elif k in ('1', 'KP_1'):
+            self.set_zoom(1 / self.fit_scale(self.current()))
+        elif k in ('Up', 'Down'):
+            self.turn(k == 'Up')
+        elif k in ('Return', 'KP_Enter', 'AudioPlay', 'AudioPause', 'space'):
+            self.slideshow()
+        elif k in ('i', 'Tools', 'F2', 'Menu'):
+            self.show_info()
+        elif k in ('g', 'Launch4', 'Tab'):
+            self.open_gallery()
+        return True
+
+    def on_button(self, w, ev):
+        if self.screensaver:
+            self.win.destroy()
+            return True
+        if not self.files:
+            return True
+        if self.mode == 'gallery':
+            i = self.gallery_at(ev.x, ev.y)
+            if i is not None:
+                self.sel = i
+                self.update_foot()
+                self.area.queue_draw()
+                if ev.type == Gdk.EventType._2BUTTON_PRESS:
+                    self.show(i, 0)
+            return True
+        if ev.button == 3:
+            self.open_gallery()
+        elif ev.type == Gdk.EventType._2BUTTON_PRESS:
+            self.drag = None
+            p = self.current()
+            self.set_zoom(1 if self.zoom > 1 else 1 / self.fit_scale(p), (ev.x, ev.y))
+        elif ev.button == 1:
+            self.drag = (ev.x, ev.y, self.cx, self.cy, False)
+        return True
+
+    def on_release(self, w, ev):
+        if self.mode != 'photo' or not self.drag or ev.button != 1:
+            return True
+        x0, y0, _, _, moved = self.drag
+        self.drag = None
+        if not moved and self.zoom <= 1:
+            width = self.size()[0]
+            if ev.x < width / 4:
+                self.show(self.index - 1)
+            elif ev.x > width * 3 / 4:
+                self.show(self.index + 1)
+        return True
+
+    def on_motion(self, w, ev):
+        if self.screensaver:
+            # the first motion comes from the window appearing under the pointer
+            if self.moved_from is None:
+                self.moved_from = (ev.x_root, ev.y_root)
+            elif abs(ev.x_root - self.moved_from[0]) + abs(ev.y_root - self.moved_from[1]) > 8:
+                self.win.destroy()
+            return True
+        self.win.get_window().set_cursor(None)
+        if self.cursor_timer:
+            GLib.source_remove(self.cursor_timer)
+        self.cursor_timer = GLib.timeout_add_seconds(2, self.hide_cursor)
+        if self.drag and self.mode == 'photo':
+            x0, y0, cx, cy, _ = self.drag
+            if abs(ev.x - x0) + abs(ev.y - y0) > 6:
+                self.drag = (x0, y0, cx, cy, True)
+                if self.zoom > 1:
+                    p = self.current()
+                    s = self.fit_scale(p) * self.zoom
+                    self.cx = cx - (ev.x - x0) / (p.size[0] * s)
+                    self.cy = cy - (ev.y - y0) / (p.size[1] * s)
+                    self.clamp()
+                    self.area.queue_draw()
+        return True
+
+    def on_scroll(self, w, ev):
+        if self.screensaver:
+            self.win.destroy()
+            return True
+        if not self.files:
+            return True
+        up = ev.direction == Gdk.ScrollDirection.UP or (ev.direction == Gdk.ScrollDirection.SMOOTH and ev.delta_y < 0)
+        down = ev.direction == Gdk.ScrollDirection.DOWN or (ev.direction == Gdk.ScrollDirection.SMOOTH and ev.delta_y > 0)
+        if not (up or down):
+            return True
+        if self.mode == 'gallery':
+            cols, rows, _ = self.grid()
+            self.top = max(0, min((len(self.files) - 1) // cols - rows + 1, self.top + (-1 if up else 1)))
+            self.sel = min(max(self.sel, self.top * cols), (self.top + rows) * cols - 1, len(self.files) - 1)
+            self.update_foot()
+            self.area.queue_draw()
+        else:
+            self.set_zoom(self.zoom * ZOOM_STEP if up else self.zoom / ZOOM_STEP, (ev.x, ev.y))
+        return True
+
+
+def main(argv):
+    args = argv[1:]
+    mode, slideshow, screensaver = 'photo', False, False
+    if args[:1] == ['--gallery']:
+        mode, args = 'gallery', args[1:]
+    elif args[:1] == ['--slideshow']:
+        slideshow, args = True, args[1:]
+    elif args[:1] == ['--screensaver']:
+        screensaver, args = True, args[1:]
+    if not args and not screensaver and mode == 'photo':
+        mode, args = 'gallery', [os.path.join(HOME, 'Pictures')]
+    if not screensaver and len(args) != 1:
+        sys.exit(__doc__)
+    GLib.set_prgname('ozone-photos')
+    try:
+        Gtk.CssProvider().load_from_data(b'* { padding: 0px; }')   # see yt: the first stylesheet's
+    except GLib.Error:                                             # first number fails to parse
+        pass
+    css = Gtk.CssProvider()
+    css.load_from_data(CSS)
+    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    if screensaver:
+        s = saver_settings()
+        files = photos_under(s['folder']) if os.path.isdir(s['folder']) else []
+        random.shuffle(files)
+        App(files, 0, 'photo', screensaver=True)
+    else:
+        target = os.path.abspath(args[0])
+        folder = target if os.path.isdir(target) else os.path.dirname(target)
+        files = folder_photos(folder)
+        if not os.path.isdir(target) and target not in files:
+            files = [target] + files   # a file named oddly, or a hidden one: still shown
+        index = files.index(target) if target in files else 0
+        App(files, index, mode, slideshow=slideshow)
+    Gtk.main()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

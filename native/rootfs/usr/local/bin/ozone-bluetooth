@@ -82,7 +82,7 @@ def wake():
     """A device asking is someone at the box: the screensaver goes (it holds the keyboard, and rofi
     gives up without it), and X's idle time starts again, so it doesn't come straight back"""
     subprocess.call(['xset', 's', 'reset'], stderr=subprocess.DEVNULL)
-    if subprocess.call(['pkill', '-f', '^/usr/bin/python3 /usr/local/bin/ozone-files --screensave[r]']) == 0:
+    if subprocess.call(['pkill', '-f', '^/usr/bin/python3 /usr/local/bin/ozone-photos --screensave[r]']) == 0:
         time.sleep(0.5)
 
 

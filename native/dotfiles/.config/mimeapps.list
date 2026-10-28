@@ -1,0 +1,7 @@
+[Default Applications]
+image/jpeg=ozone-photos.desktop
+image/png=ozone-photos.desktop
+image/gif=ozone-photos.desktop
+image/bmp=ozone-photos.desktop
+image/tiff=ozone-photos.desktop
+image/webp=ozone-photos.desktop

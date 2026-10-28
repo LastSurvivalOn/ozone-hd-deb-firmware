@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Photos
+Comment=Photos full screen: zoom, thumbnails, slideshows, GIFs that move
+Exec=ozone-photos %f
+Icon=image-x-generic
+Terminal=false
+Categories=Graphics;Viewer;
+MimeType=image/jpeg;image/png;image/gif;image/bmp;image/tiff;image/webp;

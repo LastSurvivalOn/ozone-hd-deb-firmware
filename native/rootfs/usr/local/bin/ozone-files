@@ -3,8 +3,7 @@
 for the remote.
 
   ozone-files [FOLDER]     the window: places on the left, a folder's files on the right
-  ozone-files --screensaver   the photo slideshow (or a clock) until a key or the mouse moves;
-                              started by ozone-screensaver when nothing has been done for a while
+  ozone-files --screensaver   the same as ozone-photos --screensaver (the screensaver moved there)
 
 Videos play in amplay (the hardware decoder; mpv for what it can't decode), from where they were
 left, with the audio track and subtitles chosen last time; a .srt next to a video is shown too.
@@ -13,7 +12,8 @@ top), renamed, deleted, and new folders made; info shows what a file is (ffprobe
 music, the EXIF of photos).
 The media servers on the home network (DLNA: a NAS, Jellyfin, Plex...) are a place too, which
 opens ozone-dlna's browser. Music plays here, in the background of the window (mpv without video, ao=sdl: see CLAUDE.md), the
-whole folder from the track chosen. Photos open full-screen: one at a time, or a slideshow.
+whole folder from the track chosen. Photos open in ozone-photos: one at a time, zoomed, their
+thumbnails, a slideshow.
 
 Kept in ~/.local/share/ozone-files: state.json (where each video was left, its tracks; the last
 folder). The screensaver's settings: ~/.config/ozone/screensaver.json (the settings here).
@@ -22,7 +22,6 @@ import ctypes
 import json
 import os
 import signal
-import random
 import re
 import shutil
 import socket
@@ -50,7 +49,7 @@ DLNA = 'dlna:'   # the media servers on the network: a place, browsed by ozone-d
 VIDEO = {'mkv', 'mp4', 'm4v', 'avi', 'mov', 'ts', 'm2ts', 'mts', 'webm', 'mpg', 'mpeg', 'vob', 'flv', 'wmv',
          '3gp', 'ogv', 'divx', 'xvid'}
 AUDIO = {'mp3', 'flac', 'ogg', 'oga', 'opus', 'm4a', 'aac', 'wav', 'wma', 'ape', 'aiff', 'aif', 'mka', 'ac3', 'dts'}
-IMAGE = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff'}
+IMAGE = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp'}
 SUBS = {'srt', 'ass', 'ssa', 'vtt'}
 # FontAwesome 4
 ICONS = {'folder': '', 'video': '', 'audio': '', 'image': '', 'file': '',
@@ -101,10 +100,6 @@ switch:checked { background: #cba6f7; }
 .marked .name { color: #a6e3a1; }
 .status { color: #f9e2af; }
 .infotext { font-family: "JetBrains Mono"; font-size: 13px; }
-.viewer { background: #000000; }
-.caption { background: rgba(17, 17, 27, 0.85); padding: 8px 16px; font-size: 15px; }
-.clock { font-size: 96px; font-weight: bold; color: #cdd6f4; }
-.date { font-size: 28px; color: #a6adc8; }
 """
 
 
@@ -274,212 +269,6 @@ class Music:
         artist = self.cmd('get_property', 'metadata/by-key/Artist') or self.cmd('get_property', 'metadata/by-key/ARTIST')
         return (title, artist, self.cmd('get_property', 'time-pos'), self.cmd('get_property', 'duration'),
                 self.cmd('get_property', 'pause'), self.cmd('get_property', 'playlist-pos'))
-
-
-# ---- the photo viewer and the screensaver ----------------------------------------------------------
-
-class Viewer:
-    """Photos full-screen: one, or a slideshow; also the screensaver (any input ends it)"""
-
-    def __init__(self, files, index, slideshow=False, screensaver=False, on_close=None):
-        self.files, self.index = files, index
-        self.screensaver, self.on_close = screensaver, on_close
-        self.interval = saver_settings()['seconds']
-        self.rotation = {}
-        self.timer = None
-        self.loading = None
-        self.cache = {}
-        self.win = Gtk.Window(title='Photos')
-        self.win.get_style_context().add_class('viewer')
-        self.win.fullscreen()
-        self.win.connect('key-press-event', self.on_key)
-        self.win.connect('destroy', self.closed)
-        overlay = Gtk.Overlay()
-        self.image = Gtk.Image()
-        overlay.add(self.image)
-        self.caption = prepare_label('', 'caption', halign=Gtk.Align.CENTER, valign=Gtk.Align.END,
-                                     margin_bottom=24, ellipsize=Pango.EllipsizeMode.MIDDLE)
-        self.caption.set_no_show_all(True)
-        overlay.add_overlay(self.caption)
-        if screensaver:
-            # every key and the mouse are its own as soon as it is up, whatever has the focus
-            self.win.connect('map-event', self.grab)
-            self.win.add_events(Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
-            self.win.connect('motion-notify-event', self.on_motion)
-            self.win.connect('button-press-event', lambda w, e: self.win.destroy())
-            self.moved = None
-            if not files:   # no photos: a clock that moves about the screen (no burn-in)
-                self.clock = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, halign=Gtk.Align.START,
-                                     valign=Gtk.Align.START)
-                self.time_label = prepare_label('', 'clock')
-                self.date_label = prepare_label('', 'date')
-                self.clock.pack_start(self.time_label, False, False, 0)
-                self.clock.pack_start(self.date_label, False, False, 0)
-                overlay.add_overlay(self.clock)
-                GLib.timeout_add_seconds(1, self.tick_clock)
-                # once, at once (tick_clock says True to stay on the timer: as an idle it spun a core)
-                GLib.idle_add(lambda: self.tick_clock() and False)
-        self.win.add(overlay)
-        self.pixbuf = None
-        self.win.show_all()
-        Gdk.Window.set_cursor(self.win.get_window(), Gdk.Cursor.new_from_name(Gdk.Display.get_default(), 'none'))
-        if files:
-            self.show(index)
-            if slideshow or screensaver:
-                self.start_slideshow(announce=not screensaver)
-
-    def grab(self, w, ev):
-        seat = Gdk.Display.get_default().get_default_seat()
-        seat.grab(self.win.get_window(), Gdk.SeatCapabilities.ALL, True, None, None, None, None)
-        return False
-
-    def tick_clock(self):
-        self.time_label.set_text(time.strftime('%H:%M'))
-        self.date_label.set_text(time.strftime('%A, %d %B'))
-        if int(time.time()) % 30 == 0 or not self.clock.get_margin_start():
-            w, h = self.win.get_size()
-            self.clock.set_margin_start(random.randint(40, max(41, w - 520)))
-            self.clock.set_margin_top(random.randint(40, max(41, h - 220)))
-        return True
-
-    def on_motion(self, w, ev):
-        # the first motion event comes from the window appearing under the pointer
-        if self.moved is None:
-            self.moved = (ev.x_root, ev.y_root)
-        elif abs(ev.x_root - self.moved[0]) + abs(ev.y_root - self.moved[1]) > 8:
-            self.win.destroy()
-
-    def closed(self, w):
-        if self.timer:
-            GLib.source_remove(self.timer)
-        if self.on_close:
-            self.on_close()
-
-    def load(self, i):
-        """The photo at i, fitted to the screen (decoders scale JPEG while reading: fast)"""
-        path = self.files[i]
-        if path in self.cache:
-            return self.cache[path]
-        try:
-            pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 1280, 720, True)
-            pb = pb.apply_embedded_orientation() or pb
-        except GLib.Error:
-            pb = None
-        if len(self.cache) > 4:
-            self.cache.pop(next(iter(self.cache)))
-        self.cache[path] = pb
-        return pb
-
-    def show(self, i):
-        self.index = i % len(self.files)
-        path = self.files[self.index]
-
-        def work(index):
-            pb = self.load(index)
-            nxt = (index + 1) % len(self.files)
-            GLib.idle_add(self.shown, index, pb)
-            self.load(nxt)   # ready for the next one
-        threading.Thread(target=work, args=(self.index,), daemon=True).start()
-        if not self.screensaver:
-            self.caption.set_text('%d / %d   %s' % (self.index + 1, len(self.files), os.path.basename(path)))
-
-    def shown(self, index, pb):
-        if index != self.index:
-            return False
-        rot = self.rotation.get(self.files[index], 0)
-        if pb and rot:
-            pb = pb.rotate_simple(rot)
-        if pb:   # to the screen, keeping its shape (a rotated photo is the other way round)
-            w, h = self.win.get_size()
-            scale = min(w / pb.get_width(), h / pb.get_height())
-            if abs(scale - 1) > 0.01:
-                pb = pb.scale_simple(max(1, int(pb.get_width() * scale)), max(1, int(pb.get_height() * scale)),
-                                     GdkPixbuf.InterpType.BILINEAR)
-        self.pixbuf = pb
-        self.image.set_from_pixbuf(pb)
-        return False
-
-    def start_slideshow(self, announce=True):
-        if self.timer:
-            GLib.source_remove(self.timer)
-            self.timer = None
-            self.flash('Slideshow stopped')
-            return
-        self.timer = GLib.timeout_add_seconds(self.interval, self.next_slide)
-        if announce:
-            self.flash('Slideshow: a photo every %d s   (OK stops it)' % self.interval)
-
-    def next_slide(self):
-        if self.screensaver and len(self.files) > 1:
-            self.show(random.randrange(len(self.files)))
-        else:
-            self.show(self.index + 1)
-        return True
-
-    def flash(self, text):
-        self.caption.set_text(text)
-        self.caption.show()
-        GLib.timeout_add_seconds(3, self.caption_back)
-
-    def caption_back(self):
-        if self.screensaver:
-            self.caption.hide()
-        else:
-            self.caption.set_text('%d / %d   %s' % (self.index + 1, len(self.files),
-                                                     os.path.basename(self.files[self.index])))
-        return False
-
-    def on_key(self, w, ev):
-        if self.screensaver:   # any key: back to what was there
-            self.win.destroy()
-            return True
-        k = Gdk.keyval_name(ev.keyval) or ''
-        if k in ('Escape', 'BackSpace', 'q'):
-            self.win.destroy()
-        elif k in ('Right', 'Page_Down', 'space', 'AudioNext'):
-            self.show(self.index + 1)
-        elif k in ('Left', 'Page_Up', 'AudioPrev', 'AudioRewind'):
-            self.show(self.index - 1)
-        elif k in ('Return', 'KP_Enter', 'AudioPlay', 'AudioPause'):
-            self.start_slideshow()
-        elif k in ('Up', 'Down'):
-            path = self.files[self.index]
-            self.rotation[path] = (self.rotation.get(path, 0) + (90 if k == 'Up' else 270)) % 360
-            self.shown(self.index, self.load(self.index))
-        elif k in ('i', 'Tools', 'Menu', 'F2'):
-            if self.caption.get_visible():
-                self.caption.hide()
-            else:
-                pb = self.pixbuf
-                path = self.files[self.index]
-                st = os.stat(path)
-                self.caption.set_text('%s   %s   %s   %s' % (os.path.basename(path), human_size(st.st_size),
-                                                          time.strftime('%d.%m.%Y %H:%M', time.localtime(st.st_mtime)),
-                                                          '%dx%d shown' % (pb.get_width(), pb.get_height()) if pb else ''))
-                self.caption.show()
-        return True
-
-
-def photos_in(folder, limit=2000):
-    """The photos under folder, a few levels down (for the screensaver)"""
-    out = []
-    for root, dirs, files in os.walk(folder):
-        dirs[:] = [d for d in dirs if not d.startswith('.')]
-        if root[len(folder):].count(os.sep) > 4:
-            dirs[:] = []
-        out += [os.path.join(root, f) for f in files if kind(f) == 'image']
-        if len(out) >= limit:
-            break
-    return out
-
-
-def screensaver():
-    s = saver_settings()
-    files = photos_in(s['folder']) if os.path.isdir(s['folder']) else []
-    random.shuffle(files)
-    Viewer(files, 0, screensaver=True, on_close=Gtk.main_quit)
-    Gtk.main()
-    return 0
 
 
 # ---- copying, and what a file is ---------------------------------------------------------------------
@@ -839,7 +628,6 @@ class Window:
         self.state = load_json(STATE, {'resume': {}, 'last': None})
         self.state.setdefault('resume', {})
         self.music = Music()
-        self.viewer = None
         self.busy = False
         self.typed = ''
         self.marked = set()       # paths marked (green) for copy, cut, delete
@@ -1066,13 +854,10 @@ class Window:
         else:
             self.flash('Not a video, music or photo')
 
-    def view_photos(self, path, slideshow=False):
-        files = self.files_of('image')
-        self.viewer = Viewer(files, files.index(path), slideshow=slideshow, on_close=self.viewer_closed)
-
-    def viewer_closed(self):
-        self.viewer = None
-        self.win.present()
+    @staticmethod
+    def view_photos(path, how=None):
+        """ozone-photos: the photo (and its folder's), how '--slideshow' or '--gallery'"""
+        subprocess.Popen(['ozone-photos'] + ([how] if how else []) + [path])
 
     def play_video(self, path, from_start=False):
         if self.busy:
@@ -1177,7 +962,9 @@ class Window:
         elif kind_ == 'audio':
             items += [('Play from here (the whole folder)', lambda: self.activate(row))]
         elif kind_ == 'image':
-            items += [('View', lambda: self.activate(row)), ('Slideshow from here', lambda: self.view_photos(row.path, True)),
+            items += [('View', lambda: self.activate(row)),
+                      ('Slideshow from here', lambda: self.view_photos(row.path, '--slideshow')),
+                      ('The thumbnails of this folder', lambda: self.view_photos(row.path, '--gallery')),
                       ('Use this folder for the screensaver', lambda: self.saver_folder(os.path.dirname(row.path)))]
         elif kind_ == 'folder':
             items += [('Open', lambda: self.activate(row)),
@@ -1536,7 +1323,7 @@ class Window:
             if r != 1:
                 break
             d.hide()
-            subprocess.Popen([sys.argv[0], '--screensaver'])
+            subprocess.Popen(['ozone-photos', '--screensaver'])
             break
         d.destroy()
 
@@ -1649,7 +1436,7 @@ def main(argv):
     css.load_from_data(CSS)
     Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
     if argv[1:2] == ['--screensaver']:
-        return screensaver()
+        os.execvp('ozone-photos', ['ozone-photos', '--screensaver'])
     if argv[1:] and not os.path.isdir(argv[1]):
         sys.exit(__doc__)
     Window(argv[1] if argv[1:] else None)

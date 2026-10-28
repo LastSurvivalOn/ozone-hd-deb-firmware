@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """ozone-screensaver: after some minutes without a key, the mouse or the remote, the photo
-slideshow (ozone-files --screensaver), as Android's Daydream does; started by bspwmrc.
+slideshow (ozone-photos --screensaver), as Android's Daydream does; started by bspwmrc.
 
 Idle time is X's own (the MIT-SCREEN-SAVER extension: every keyboard, the remote through
 kbd-merge, and the mouse reset it). Not while something plays: amplay (videos, TV), mpv (music,
@@ -63,7 +63,7 @@ def main():
         idle = info.contents.idle / 1000
         if idle < s.get('minutes', 10) * 60 or os.path.exists(STANDBY_LOCK) or any(running(p) for p in PLAYING):
             continue
-        saver = subprocess.Popen(['ozone-files', '--screensaver'], stdin=subprocess.DEVNULL,
+        saver = subprocess.Popen(['ozone-photos', '--screensaver'], stdin=subprocess.DEVNULL,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 

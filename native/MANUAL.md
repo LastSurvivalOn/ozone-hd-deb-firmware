@@ -640,13 +640,31 @@ file goes down to them, **← / →** between them, **OK** presses one, **↑** 
 to the files. They are previous, 10 s back, pause, 10 s forward, next, stop. The music stops when the window
 is closed.
 
-**Photos** open full screen: **← / →** the previous / next one, **OK** a slideshow (again: stop),
-**↑ / ↓** turn the photo, **info** (or **I**) its name, size and date, **exit** back to the files.
+**Photos** open full screen in **Photos** (also in the app menu, where it shows the thumbnails of
+Photos, and for every picture opened elsewhere: the browser's downloads, a terminal). JPEG, PNG,
+GIF (they move), WebP, BMP and TIFF:
+
+| Remote | Keys, mouse | A photo |
+|---|---|---|
+| **← / →** | a click on the left / right edge | the previous / next one |
+| **page+ / page−** | **+ / −**, the wheel | zoom in / out (the wheel: where the pointer is) |
+| **↑ ↓ ← →** while zoomed in | dragging | move about the photo |
+| **0**, **1** | a double click | the whole photo again / its pixels 1:1 |
+| **↑ / ↓** | | turn it |
+| **OK**, **pause** | **Space** | a slideshow (again: stop it); photos fade into one another |
+| **info** | **I** | its name, size, date and the camera's details |
+| **blue** | **G**, a right click | the thumbnails of its folder |
+| **exit** | **Esc** | back: from zoomed in to the whole photo, then to the thumbnails (if they were open), then closed |
+
+**The thumbnails**: the arrows choose, **page+ / page−** a page at a time, **OK** opens the photo,
+**pause** a slideshow from it, **exit** closes. The first time a folder is shown they take a moment
+(they are kept for the next time). In Files, **blue** on a photo → **The thumbnails of this folder**
+opens them too.
 
 **The screensaver**: after 10 minutes without a key, the mouse or the remote, a slideshow of the
 photos in **Photos** (or the folder chosen with **blue** on a folder → *Use for the screensaver's
 photos*), or a clock that moves about the screen if there are none. Any key or the mouse ends it,
-and that key does nothing else. Not while a video, music, TV or a game plays. **Screensaver** at
+and that key does nothing else. The photos fade into one another. Not while a video, music, TV or a game plays. **Screensaver** at
 the top of the window: on / off, after how many minutes, how long each photo stays, the folder,
 and **Try it**.
 
