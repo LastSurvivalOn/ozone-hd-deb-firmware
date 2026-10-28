@@ -1,16 +1,34 @@
 #!/bin/sh
 # Power menu for the panel and sxhkd
 
+hours=$(ozone-screensaver hours 2> /dev/null || echo 4)
+case "$hours" in
+0) auto="never" ;;
+1) auto="after an hour without a button" ;;
+*) auto="after $hours hours without a button" ;;
+esac
+
 choice=$(printf '%s\n' \
     "  Sleep (a key or mouse click wakes it)" \
     "  Android (T2, SmartTube)" \
     "  Restart desktop" \
     "  Screen size (edges cut off)" \
     "  Reboot" \
-    "  Power off (Power on the remote turns it on)" |
-    rofi -dmenu -i -p "  Power" -theme-str 'listview { lines: 6; }')
+    "  Power off (Power on the remote turns it on)" \
+    "  Sleep by itself: $auto" |
+    rofi -dmenu -i -p "  Power" -theme-str 'listview { lines: 7; }')
 
 case "$choice" in
+*"by itself"*)
+    pick=$(printf '%s\n' "After 1 hour" "After 2 hours" "After 3 hours" "After 4 hours" "After 6 hours" \
+        "After 8 hours" "Never" |
+        rofi -dmenu -i -p "  Sleep by itself" -theme-str 'listview { lines: 7; }' \
+            -mesg "Now: $auto. A minute before, a countdown shows: any button keeps the box on.")
+    case "$pick" in
+    Never) ozone-screensaver hours 0 > /dev/null; ozone-notify "The box won't sleep by itself" ;;
+    After*) n=$(echo "$pick" | tr -dc 0-9); ozone-screensaver hours "$n" > /dev/null
+            ozone-notify "Sleeps after $n h without a button" ;;
+    esac ;;
 *Sleep*)            sudo ozone-standby ;;
 *Android*)          reboot-android ;;
 *desktop*)          bspc quit ;;

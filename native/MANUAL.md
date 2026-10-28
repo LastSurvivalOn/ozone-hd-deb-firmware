@@ -47,6 +47,14 @@ item with the arrows and Enter, or click it. Esc closes the menu.
 | Screen size | Fits the picture to a screen that cuts off its edges, see below. |
 | Reboot | Restarts the box into Linux. |
 | Power off | Stops the system and turns off the screen; the light on the box turns red. To turn it on again, press Power on the remote (or unplug the box and plug it back in): it starts from the beginning, with the logo, as after plugging in. |
+| Sleep by itself | When the box goes to sleep on its own if no button is pressed: after 1, 2, 3, 4 (the first setting), 6 or 8 hours, or never. |
+
+**Sleeping by itself.** If nobody presses a button (on the remote, a keyboard, a mouse, a
+gamepad) for 4 hours, the box goes to sleep, as TVs and Android boxes do when they were left on.
+A minute before, a window with a moon counts down over everything, the player too: any button
+keeps the box on. Then the video stops and the screen goes off; TV recordings and timers go on.
+Any button wakes it. Not during an update or a backup. **Sleep by itself** in the power menu sets
+the hours, or turns it off.
 
 **Screen size.** Some TVs and monitors cut off the edges of the picture: the panel at the top or
 the bottom of the player is half hidden. Open ⏻ → **Screen size** (or "Screen size" in the app

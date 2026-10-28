@@ -6,6 +6,16 @@ Idle time is X's own (the MIT-SCREEN-SAVER extension: every keyboard, the remote
 kbd-merge, and the mouse reset it). Not while something plays: amplay (videos, TV), mpv (music,
 yt's fallback), RetroArch, or the box sleeps (ozone-standby). The settings are the Files window's
 (~/.config/ozone/screensaver.json: enabled, minutes, folder, seconds).
+
+It also puts the box to sleep by itself after some hours without a button (Android TV boxes do
+it, and TVs by the EU's rules after 4): a minute before, a window over everything counts down,
+and any button keeps the box on. Then the player stops (nobody is watching) and ozone-standby
+turns the screen off; recordings and timers go on. The hours: ~/.config/ozone/sleep.json
+({"hours": 4}, 0 never), set in the power menu (ozone-power).
+
+  ozone-screensaver          the daemon (bspwmrc)
+  ozone-screensaver warn     the countdown window (the daemon starts it)
+  ozone-screensaver hours [N]   the hours, or set them
 """
 import ctypes
 import json
@@ -15,6 +25,10 @@ import sys
 import time
 
 CONF = os.path.expanduser('~/.config/ozone/screensaver.json')
+SLEEP_CONF = os.path.expanduser('~/.config/ozone/sleep.json')
+SLEEP_HOURS = 4          # by default
+WARN = 60                # s of countdown before it sleeps
+BUSY = ['^/usr/bin/python3 /usr/local/bin/ozone-system root']   # an update or a backup: not now
 PLAYING = ['amplay', 'mpv', 'retroarch']
 STANDBY_LOCK = '/run/ozone-standby.lock'
 
@@ -38,7 +52,103 @@ def running(name):
     return subprocess.call(['pgrep', '-x', name], stdout=subprocess.DEVNULL) == 0
 
 
-def main():
+def sleep_hours():
+    try:
+        with open(SLEEP_CONF) as f:
+            return float(json.load(f).get('hours', SLEEP_HOURS))
+    except (OSError, ValueError, AttributeError):
+        return SLEEP_HOURS
+
+
+def set_sleep_hours(hours):
+    os.makedirs(os.path.dirname(SLEEP_CONF), exist_ok=True)
+    with open(SLEEP_CONF + '.tmp', 'w') as f:
+        json.dump({'hours': hours}, f)
+    os.replace(SLEEP_CONF + '.tmp', SLEEP_CONF)
+
+
+def native():
+    return subprocess.call(['/etc/ozone/is-native'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+
+
+def go_to_sleep():
+    """Nobody is there: the player and the screensaver stop, then standby (which waits for a key)"""
+    subprocess.call(['pkill', '-x', 'amplay'])
+    subprocess.call(['pkill', '-f', '^/usr/bin/python3 /usr/local/bin/ozone-photos --screensave[r]'])
+    subprocess.Popen(['sudo', '-n', '/usr/local/bin/ozone-standby'], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def warn_window():
+    """The countdown: any key or click ends it with the box on; at 0 the box sleeps"""
+    import gi
+    gi.require_version('Gtk', '3.0')
+    gi.require_version('Gdk', '3.0')
+    from gi.repository import Gdk, GLib, Gtk
+    GLib.set_prgname('ozone-sleep')
+    try:   # see yt: the first stylesheet's first number fails to parse
+        Gtk.CssProvider().load_from_data(b'* { padding: 0px; }')
+    except GLib.Error:
+        pass
+    css = Gtk.CssProvider()
+    css.load_from_data(b"""
+* { font-family: "DejaVu Sans"; color: #cdd6f4; }
+window { background: #1e1e2e; border: 2px solid #cba6f7; }
+.icon { font-family: "FontAwesome"; font-size: 44px; color: #89b4fa; }
+.title { font-size: 22px; font-weight: bold; }
+.text { font-size: 15px; color: #a6adc8; }
+.count { font-size: 40px; font-weight: bold; color: #f9e2af; }
+""")
+    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    hours = sleep_hours()
+    win = Gtk.Window(title='Going to sleep')
+    win.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+    win.set_keep_above(True)
+    win.set_position(Gtk.WindowPosition.CENTER)
+    win.set_resizable(False)   # as big as what it says: bspwm gave it a tall box
+    box = Gtk.Box(spacing=24, margin=28, width_request=560)
+    icon = Gtk.Label(label='\uf186')
+    icon.get_style_context().add_class('icon')
+    box.pack_start(icon, False, False, 0)
+    texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+    for text, cls in (('The box goes to sleep', 'title'),
+                      ('No button was pressed for %s. Press any button to keep it on.'
+                       % ('%g hours' % hours if hours != 1 else 'an hour'), 'text')):
+        lb = Gtk.Label(label=text, xalign=0, wrap=True, max_width_chars=40)
+        lb.get_style_context().add_class(cls)
+        texts.pack_start(lb, False, False, 0)
+    box.pack_start(texts, True, True, 0)
+    count = Gtk.Label(label=str(WARN))
+    count.get_style_context().add_class('count')
+    box.pack_start(count, False, False, 0)
+    win.add(box)
+    left = [WARN]
+    idle_now = idle_clock()
+
+    def tick():
+        # a button pressed in a window that holds the keyboard (the player) never reaches this one
+        idle = idle_now()
+        if idle is not None and idle < 3:
+            Gtk.main_quit()
+            return False
+        left[0] -= 1
+        count.set_text(str(left[0]))
+        if left[0] <= 0:
+            go_to_sleep()
+            Gtk.main_quit()
+            return False
+        return True
+    win.connect('key-press-event', lambda *a: Gtk.main_quit())
+    win.connect('button-press-event', lambda *a: Gtk.main_quit())
+    win.connect('destroy', Gtk.main_quit)
+    win.show_all()
+    win.present()
+    GLib.timeout_add_seconds(1, tick)
+    Gtk.main()
+
+
+def idle_clock():
+    """A function giving X's idle time in s (None if X won't say)"""
     xlib = ctypes.cdll.LoadLibrary('libX11.so.6')
     xss = ctypes.cdll.LoadLibrary('libXss.so.1')
     xlib.XOpenDisplay.restype = ctypes.c_void_p
@@ -51,16 +161,35 @@ def main():
         sys.exit('no X display')
     root = xlib.XDefaultRootWindow(dpy)
     info = xss.XScreenSaverAllocInfo()
-    saver = None
+    return lambda: info.contents.idle / 1000 if xss.XScreenSaverQueryInfo(dpy, root, info) else None
+
+
+def main():
+    idle_now = idle_clock()
+    saver = warn = None
+    can_sleep = native()
     while True:
         time.sleep(15)
+        idle = idle_now()
+        if idle is None:
+            continue
+        # sleep by itself: the countdown a minute before, gone again if a button came meanwhile
+        limit = sleep_hours() * 3600
+        if warn and warn.poll() is not None:
+            warn = None
+        if warn and idle < limit - WARN:
+            warn.terminate()
+            warn = None
+        elif (can_sleep and limit > 0 and not warn and idle >= limit - WARN and not os.path.exists(STANDBY_LOCK)
+              and not any(subprocess.call(['pgrep', '-f', b], stdout=subprocess.DEVNULL) == 0 for b in BUSY)):
+            warn = subprocess.Popen([sys.argv[0], 'warn'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
         if saver and saver.poll() is None:
             continue
         saver = None
         s = settings()
-        if not s.get('enabled') or not xss.XScreenSaverQueryInfo(dpy, root, info):
+        if not s.get('enabled'):
             continue
-        idle = info.contents.idle / 1000
         if idle < s.get('minutes', 10) * 60 or os.path.exists(STANDBY_LOCK) or any(running(p) for p in PLAYING):
             continue
         saver = subprocess.Popen(['ozone-photos', '--screensaver'], stdin=subprocess.DEVNULL,
@@ -68,4 +197,11 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    if sys.argv[1:2] == ['warn']:
+        warn_window()
+    elif sys.argv[1:2] == ['hours']:
+        if len(sys.argv) > 2:
+            set_sleep_hours(float(sys.argv[2]))
+        print('%g' % sleep_hours())
+    else:
+        sys.exit(main())

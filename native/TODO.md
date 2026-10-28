@@ -138,9 +138,9 @@ What the stock Android has (its apps: DeskClock, Calculator, Settings, PackageIn
 LiveWallpapers, PrintSpooler, Camera2, PicoTts / TalkBack, VpnDialogs, the TV app) and native
 Linux doesn't:
 
-- [ ] **Easy**: a sleep timer (off or standby in 30 / 60 / 90 minutes, from the TV and the player),
-  and standby by itself after some hours without a button pressed. Android TV boxes do both; now
-  the box stays on until Power.
+- [ ] **Easy**: a sleep timer (off or standby in 30 / 60 / 90 minutes, from the TV and the player).
+  Standby by itself after some hours without a button pressed is done (4 by default, the power
+  menu's "Sleep by itself").
 - [ ] **Easy**: a clock with alarms, a timer and a stopwatch (DeskClock): the calendar's reminders
   already wake the screen, an alarm needs a sound too.
 - [x] **Easy**: a calculator: Qalculate! (Calculator) and wxMaxima on Maxima (Maths), a computer

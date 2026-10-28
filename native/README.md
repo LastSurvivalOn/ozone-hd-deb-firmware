@@ -583,7 +583,15 @@ type, a drive in use, the GPT way) and on a USB stick (exFAT and back to FAT32, 
 `ozone-screensaver` (started by bspwmrc) reads X's idle time from the MIT-SCREEN-SAVER extension
 (libXss through ctypes) every 15 s and starts `ozone-photos --screensaver` after the minutes set,
 unless amplay, mpv or RetroArch runs or the box is in standby. The saver grabs the keyboard and
-pointer once it is mapped, so the first key ends it wherever the focus was. A window opening on the
+pointer once it is mapped, so the first key ends it wherever the focus was.
+The same daemon puts the box to sleep after `~/.config/ozone/sleep.json`'s hours (4 by default, 0
+never; the power menu sets them through `ozone-screensaver hours N`) of X idle time, whatever
+plays: 60 s before, `ozone-screensaver warn` (bspwm's `above` layer) counts down, and quits at the
+first input. The player holds X's keyboard, so the countdown also reads X's idle time each
+second (below 3 s: somebody pressed something), and the daemon kills it when idle drops. At 0 it
+stops amplay (SIGTERM: Files keeps the position, TV goes back to its window) and the screensaver,
+then starts `ozone-standby`. Not while `ozone-system root` works (an update, a backup), and only
+in native Linux. A window opening on the
 desktop ends it too: bspwm takes full screen away from a fullscreen window when another one is
 added, which left the saver tiled beside it.
 

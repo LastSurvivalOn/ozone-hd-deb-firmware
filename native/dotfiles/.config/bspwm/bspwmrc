@@ -43,6 +43,7 @@ bspc rule -a Ozone-photos state=fullscreen
 bspc rule -a Rofi state=floating
 # a reminder comes over everything, the player and full-screen windows too
 bspc rule -a Ozone-reminder state=floating layer=above
+bspc rule -a Ozone-sleep state=floating layer=above
 
 feh --no-fehbg --bg-fill ~/.local/share/wallpapers/ozone.png
 ~/.config/polybar/launch.sh
