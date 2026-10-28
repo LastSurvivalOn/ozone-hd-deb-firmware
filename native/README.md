@@ -25,6 +25,7 @@ recovery partition  → stock Android boot.img (T2, SmartTube)
 ./install-games.sh <ip>             # RetroArch (NES, GB, GBA) and glmark2, needs the GPU
 ./install-network.sh <ip>           # Network menu, hotspot, VPN, phone remote, DLNA
 ./install-miracast.sh <ip>          # screen mirroring (a patched wpa_supplicant, built on the box)
+./install-bluetooth.sh <ip>         # Bluetooth with a USB adapter: btusb.ko, BlueZ, BlueALSA, the menu
 ```
 
 `install-gpu.sh` builds the kernel modules here first if they aren't in `out/gpu/` yet
@@ -161,6 +162,57 @@ and ffmpeg's `rtp_mpegts`): found in 2-10 s, the box's group formed 8 times in 9
 start once failed), picture in 5-10 s from choosing it. As a client of the source's group the box
 was refused by the laptop's group owner after WPS one time in two, so it owns the group. Not tried
 with a real phone or Windows here; no HDCP, no UIBC (the phone's touch from the TV), no LPCM audio.
+
+## Bluetooth (a USB adapter)
+
+The box has no Bluetooth of its own (`hw.has.bluetooth=false`), but the stock kernel has the whole
+stack built in: HCI, L2CAP, RFCOMM, BNEP, HIDP (classic keyboards, mice, gamepads), UHID (Bluetooth
+LE ones), RFKILL, the crypto for LE pairing. Only a driver for USB adapters is missing:
+`bluetooth/build-btusb.sh` builds `btusb.ko` from the GPU's kernel tree and toolchain (no
+MODVERSIONS, so vermagic only: the struct offsets in the Bluetooth core's functions built from this
+tree, `hci_alloc_dev`, `hci_register_dev`, `hci_recv_frame` and the rest, match the stock kernel's
+code). `/etc/init.d/ozone-bluetooth` loads it at boot (an adapter plugged in later is taken at
+once) and runs BlueALSA; bluetoothd is Debian's. Tested with a CSR8510 A10 (`0a12:0001`), the
+common cheap one; others that btusb knows should work, Realtek's (RTL8761B and the like) need
+firmware loading this btusb doesn't have.
+
+- **bluetoothd** (BlueZ 5.66, management API 1.3 on this kernel) needs `Channels = 1` under
+  `[GATT]` in `/etc/bluetooth/main.conf`: Enhanced ATT needs LE credit-based channels (3.14), and
+  with the default of 3 it fails at "Failed to create GATT database" and drops the adapter. The
+  adapter is "Ozone TV", Audio/Video set-top box, powered on when it appears (`AutoEnable`).
+- **Sound** is BlueALSA 4.0 (`bluealsa -p a2dp-source -p a2dp-sink`, SBC; no HFP, so no headset
+  microphones). While headphones or a speaker are connected, `ozone-bluetooth agent` writes their
+  address and rate to `/run/ozone-bluetooth-audio`, and `sound-config` puts BlueALSA's PCM where
+  `hw:0,N` was: the softvol Master, the equalizer and the panel's volume stay as they are. Without
+  channels and rate pinned on that last plug, softvol over BlueALSA's ioplug found no configuration,
+  as with the equalizer. amplay syncs to `snd_pcm_delay`, which counts BlueALSA's buffer and
+  encoder; the headphones' own delay isn't reported. No AC-3 / DTS passthrough then. Programs
+  already playing keep their old device until they open it again; when headphones go away under
+  amplay, it opens `default` again (on the TV by then), after `snd_config_update_free_global()`:
+  alsa-lib rereads only a changed `alsa.conf`, not the `asound.conf` it loads. A disconnected
+  BlueALSA PCM has no room and `snd_pcm_wait` fails at once with ENODEV; amplay looped on that
+  wait with a whole core before. From a phone, `bluealsa-aplay` plays to the default device and
+  lets it go as soon as the stream stops.
+- **Input**: HIDP and UHID create event devices like USB ones: kbd-merge takes keyboards,
+  `/dev/input/mice` mice. Without udev nodes made after boot were root's only, so `ozone-hw` sets
+  `/proc/sys/kernel/hotplug` to `lib/ozone/hotplug`, which gives them the input group (gamepads
+  for RetroArch, USB ones too). The box has no uevents at rest, so it costs nothing.
+- **`ozone-bluetooth`** (rofi menu; the user is in the `bluetooth` group for BlueZ's D-Bus policy,
+  and `audio` for BlueALSA's): the paired devices (connect, disconnect, forget), **Add a device**
+  (discovery, with found devices added to the open rofi list as they come, `-async-pre-read 0`;
+  only those with a class, an LE appearance or HID: the LE side of headphones, "JBL ...-LE", for
+  their app, is left out) and **Let a phone find the box** (discoverable for 3 minutes).
+  `ozone-bluetooth agent` (bspwmrc) is BlueZ's default agent, KeyboardDisplay: codes to type
+  (`rofi -e`), yes/no questions in rofi, one at a time (a new one, or BlueZ's Cancel, closes the
+  last). It closes the screensaver first and resets X's idle time: the screensaver's grab kept rofi
+  from the keyboard, and rofi gave up, which refused the pairing. It also keeps the panel's
+  `bluetooth` module (`~/.cache/ozone-bluetooth.panel`, a polybar hook).
+
+Tested here with the laptop (BlueZ, PipeWire) both ways: the box paired from the menu (no question,
+as with headphones) and by the laptop (the code confirmed on the TV), the box's sound in the
+laptop's speakers (a tone through `default`, 48 and 44.1 kHz, the equalizer on; a TV recording in
+amplay), the laptop's sound on the TV, and back to HDMI when it disconnects. Not tried: real
+headphones, keyboards, mice, gamepads.
 
 ## Android files
 

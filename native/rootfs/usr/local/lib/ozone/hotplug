@@ -1,0 +1,9 @@
+#!/bin/sh
+# The kernel runs this for every uevent (/proc/sys/kernel/hotplug, set by ozone-hw): there is no
+# udev. Input devices that turn up after boot (USB, Bluetooth keyboards and gamepads) come up for
+# root only; they get the input group, as ozone-hw gives the ones present at boot.
+[ "$ACTION" = add ] && [ "$SUBSYSTEM" = input ] || exit 0
+case $DEVNAME in
+input/*) /bin/chgrp input "/dev/$DEVNAME" && /bin/chmod 660 "/dev/$DEVNAME" ;;
+esac
+exit 0

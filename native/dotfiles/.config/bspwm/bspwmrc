@@ -15,6 +15,8 @@ pgrep -f "^/usr/bin/python3 /usr/local/bin/ozone-tv timer[s]" > /dev/null || ozo
 # DLNA: phones and computers can send videos, music and photos to the box (unless turned off in
 # the Network menu; it checks that itself, and that it isn't running already)
 ozone-dlna renderer &
+# Bluetooth: pairing codes on the screen, the sound to headphones while they are connected
+pgrep -f "^/usr/bin/python3 /usr/local/bin/ozone-bluetooth agen[t]" > /dev/null || ozone-bluetooth agent &
 
 bspc monitor -d 1 2 3 4 5
 

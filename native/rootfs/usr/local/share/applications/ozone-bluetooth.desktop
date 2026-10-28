@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Bluetooth
+Comment=Headphones, speakers, keyboards, mice, gamepads; music from a phone on the TV
+Exec=ozone-bluetooth
+Icon=bluetooth
+Terminal=false
+Categories=Settings;

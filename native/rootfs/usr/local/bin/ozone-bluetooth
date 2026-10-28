@@ -1,0 +1,587 @@
+#!/usr/bin/python3
+"""ozone-bluetooth: Bluetooth (a USB adapter), in a menu for the remote (rofi).
+
+  ozone-bluetooth            the menu: on or off, the paired devices (connect, disconnect,
+                             forget), adding one (headphones, a speaker, a keyboard, a mouse, a
+                             gamepad, a phone), and letting a phone find the box, to play its
+                             music on the TV
+  ozone-bluetooth agent      (X session, from bspwmrc) answers pairing requests on the screen,
+                             sends the sound to headphones and speakers while they are connected
+                             and keeps the panel's icon
+  ozone-bluetooth audio ADDR RATE | off
+                             (root) the sound to that device, or back to the TV: writes
+                             /run/ozone-bluetooth-audio, which sound-config follows
+  ozone-bluetooth status     one line, for scripts
+
+BlueZ (bluetoothd) and BlueALSA are reached over the system D-Bus: the user needs the bluetooth
+group for the first and audio for the second.
+"""
+import os
+import random
+import re
+import subprocess
+import sys
+import threading
+import time
+
+from gi.repository import Gio, GLib
+
+BLUEZ = 'org.bluez'
+BLUEALSA = 'org.bluealsa'
+OM = 'org.freedesktop.DBus.ObjectManager'
+PROPS = 'org.freedesktop.DBus.Properties'
+ADAPTER = 'org.bluez.Adapter1'
+DEVICE = 'org.bluez.Device1'
+AGENT_PATH = '/ozone/bluetooth/agent'
+AUDIO_FILE = '/run/ozone-bluetooth-audio'
+SOUND_CONFIG = '/usr/local/lib/ozone/sound-config'
+PANEL_FILE = os.path.expanduser('~/.cache/ozone-bluetooth.panel')
+ICON = ''   # FontAwesome bluetooth-b
+VISIBLE_SECONDS = 180
+
+# Device1.Icon -> (FontAwesome 4 glyph, what it is)
+KINDS = {
+    'audio-headphones': ('', 'headphones'),
+    'audio-headset': ('', 'headset'),
+    'audio-card': ('', 'speaker'),
+    'input-keyboard': ('', 'keyboard'),
+    'input-mouse': ('', 'mouse'),
+    'input-tablet': ('', 'tablet'),
+    'input-gaming': ('', 'gamepad'),
+    'phone': ('', 'phone'),
+    'computer': ('', 'computer'),
+    'video-display': ('', 'screen'),
+}
+
+
+def notify(text):
+    subprocess.call(['ozone-notify', text], stderr=subprocess.DEVNULL)
+
+
+def run_rofi(cmd, text, track=None):
+    """rofi's exit code and output; track(process) is told it, to close it from elsewhere"""
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    if track:
+        track(p)
+    out, _ = p.communicate(text)
+    return p.returncode, out
+
+
+def rofi(prompt, items, selected=0, message=None, track=None):
+    cmd = ['rofi', '-dmenu', '-i', '-format', 'i', '-p', prompt, '-selected-row', str(selected),
+           '-theme-str', 'listview { lines: %d; }' % max(1, min(len(items), 12))]
+    if message:
+        cmd += ['-mesg', message]
+    try:
+        return int(run_rofi(cmd, '\n'.join(items), track)[1].strip())
+    except ValueError:
+        return None
+
+
+def wake():
+    """A device asking is someone at the box: the screensaver goes (it holds the keyboard, and rofi
+    gives up without it), and X's idle time starts again, so it doesn't come straight back"""
+    subprocess.call(['xset', 's', 'reset'], stderr=subprocess.DEVNULL)
+    if subprocess.call(['pkill', '-f', '^/usr/bin/python3 /usr/local/bin/ozone-files --screensave[r]']) == 0:
+        time.sleep(0.5)
+
+
+def ask(prompt, message=None, track=None):
+    """A line typed in, or None"""
+    cmd = ['rofi', '-dmenu', '-p', prompt, '-theme-str', 'listview { lines: 0; }']
+    if message:
+        cmd += ['-mesg', message]
+    code, out = run_rofi(cmd, '', track)
+    return out.strip() if code == 0 else None
+
+
+# ---- D-Bus -------------------------------------------------------------------------------------
+
+def system_bus():
+    return Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+
+
+def call(bus, path, iface, method, args=None, timeout=25, dest=BLUEZ):
+    r = bus.call_sync(dest, path, iface, method, args, None, Gio.DBusCallFlags.NONE, timeout * 1000, None)
+    return r.unpack() if r else ()
+
+
+def set_prop(bus, path, iface, name, value):
+    call(bus, path, PROPS, 'Set', GLib.Variant('(ssv)', (iface, name, value)))
+
+
+def objects(bus, dest=BLUEZ, path='/'):
+    """path -> {interface: {property: value}}, or None without the service"""
+    try:
+        return call(bus, path, OM, 'GetManagedObjects', dest=dest)[0]
+    except GLib.Error:
+        return None
+
+
+def reason(e):
+    """A D-Bus error for people"""
+    name = Gio.DBusError.get_remote_error(e) or ''
+    msg = e.message.split(': ', 1)[-1] if name else e.message
+    if 'Timeout' in name or 'timed out' in msg.lower():
+        return 'no answer (is it on, near the box, in pairing mode?)'
+    if 'Authentication' in name or 'Rejected' in name:
+        return 'the pairing was refused'
+    if 'page-timeout' in msg or 'host-down' in msg or 'connection' in msg:
+        return 'it did not answer (is it on and near the box?)'
+    return msg
+
+
+def adapter(objs):
+    for path, ifaces in sorted(objs.items()):
+        if ADAPTER in ifaces:
+            return path, ifaces[ADAPTER]
+    return None, None
+
+
+def devices(objs, adapter_path):
+    return [(p, i[DEVICE]) for p, i in objs.items() if DEVICE in i and p.startswith(adapter_path + '/')]
+
+
+def address_of(device_path):
+    """/org/bluez/hci0/dev_00_11_22_33_44_55 -> 00:11:22:33:44:55"""
+    return device_path.rsplit('/dev_', 1)[-1].replace('_', ':')
+
+
+def name_of(d):
+    return d.get('Alias') or d.get('Name') or d.get('Address', '?')
+
+
+def kind(d):
+    return KINDS.get(d.get('Icon', ''), ('', ''))
+
+
+def pairable(d):
+    """Worth listing to pair: classic Bluetooth (it has a class), or Bluetooth LE that says what it
+    is (an appearance: a keyboard, a mouse...) or offers HID. Left out: nameless ones (beacons,
+    other people's phones) and the LE side of headphones, for their app ("JBL TUNE520BT-LE":
+    the sound is on their classic side, listed beside it in pairing mode)"""
+    if not d.get('Name'):
+        return False
+    return 'Class' in d or 'Icon' in d or any(u.startswith('00001812-') for u in d.get('UUIDs', []))
+
+
+def label(d):
+    glyph, what = kind(d)
+    return '%s  %s%s' % (glyph, name_of(d), ' (%s)' % what if what else '')
+
+
+def paired_label(d, objs, path):
+    state = 'connected' if d.get('Connected') else 'paired'
+    battery = objs.get(path, {}).get('org.bluez.Battery1', {}).get('Percentage')
+    if battery is not None and d.get('Connected'):
+        state += ', battery %d%%' % battery
+    return '%s: %s' % (label(d), state)
+
+
+# ---- the menu ----------------------------------------------------------------------------------
+
+def menu():
+    bus = system_bus()
+    while True:
+        objs = objects(bus)
+        if objs is None:
+            notify('Bluetooth: bluetoothd is not running')
+            return 1
+        ad_path, ad = adapter(objs)
+        if not ad_path:
+            rofi(ICON + '  Bluetooth', ['OK'], message='No Bluetooth adapter: plug a USB one into the box')
+            return 0
+        powered = ad.get('Powered')
+        paired = sorted((x for x in devices(objs, ad_path) if x[1].get('Paired')),
+                        key=lambda x: (not x[1].get('Connected'), name_of(x[1]).lower()))
+        items = ['Bluetooth: %s' % ('on' if powered else 'off')]
+        if powered:
+            items += [paired_label(d, objs, p) for p, d in paired]
+            items += ['Add a device…', 'Let a phone find the box (to play its music on the TV)…']
+        info = ['Seen as "%s"' % ad.get('Alias', '')]
+        sound = audio_now()
+        if sound:
+            info.append('Sound: %s' % next((name_of(d) for p, d in paired if address_of(p) == sound), sound))
+        i = rofi(ICON + '  Bluetooth', items, message='   '.join(info))
+        if i is None:
+            return 0
+        try:
+            if i == 0:
+                set_prop(bus, ad_path, ADAPTER, 'Powered', GLib.Variant('b', not powered))
+                if powered:
+                    time.sleep(0.5)   # BlueZ drops the devices first
+            elif i <= len(paired):
+                device_menu(bus, ad_path, *paired[i - 1])
+            elif i == len(paired) + 1:
+                add_device(bus, ad_path)
+            else:
+                set_prop(bus, ad_path, ADAPTER, 'Pairable', GLib.Variant('b', True))
+                set_prop(bus, ad_path, ADAPTER, 'DiscoverableTimeout', GLib.Variant('u', VISIBLE_SECONDS))
+                set_prop(bus, ad_path, ADAPTER, 'Discoverable', GLib.Variant('b', True))
+                notify('Bluetooth: "%s" can be found for 3 minutes; pair it in the phone\'s Bluetooth settings'
+                       % ad.get('Alias', ''))
+                return 0
+        except GLib.Error as e:
+            notify('Bluetooth: %s' % reason(e))
+
+
+def device_menu(bus, ad_path, path, d):
+    name = name_of(d)
+    glyph, what = kind(d)
+    items = ['Disconnect' if d.get('Connected') else 'Connect', 'Forget it (unpair)']
+    i = rofi('%s  %s' % (glyph, name), items,
+             message='%s%s' % (what.capitalize() + ', ' if what else '', d.get('Address', '')))
+    if i == 0 and d.get('Connected'):
+        call(bus, path, DEVICE, 'Disconnect')
+    elif i == 0:
+        connect(bus, path, name)
+    elif i == 1:
+        call(bus, ad_path, ADAPTER, 'RemoveDevice', GLib.Variant('(o)', (path,)))
+        notify('Bluetooth: %s forgotten' % name)
+
+
+def connect(bus, path, name):
+    notify('Bluetooth: connecting to %s…' % name)
+    try:
+        call(bus, path, DEVICE, 'Connect', timeout=40)
+        notify('Bluetooth: %s connected' % name)
+        return True
+    except GLib.Error as e:
+        if 'AlreadyConnected' in e.message:
+            return True
+        notify('Bluetooth: %s not connected: %s' % (name, reason(e)))
+        return False
+
+
+def add_device(bus, ad_path):
+    """Searches while a list shows what is found (rofi reads its lines as they come), and pairs the
+    one picked"""
+    try:
+        call(bus, ad_path, ADAPTER, 'StartDiscovery')
+    except GLib.Error as e:
+        if 'InProgress' not in e.message:
+            raise
+    shown = []
+    p = subprocess.Popen(['rofi', '-dmenu', '-i', '-format', 'i', '-p', 'Add a device', '-async-pre-read', '0',
+                          '-theme-str', 'listview { lines: 10; }',
+                          '-mesg', 'Searching… Put the device in pairing mode: usually, hold its power or '
+                                   'Bluetooth button until a light blinks. Found devices appear here.'],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        while p.poll() is None:
+            objs = objects(bus) or {}
+            for path, d in devices(objs, ad_path):
+                if path in shown or d.get('Paired') or not pairable(d):
+                    continue
+                shown.append(path)
+                try:
+                    p.stdin.write(label(d) + '\n')
+                    p.stdin.flush()
+                except (BrokenPipeError, ValueError):
+                    break
+            time.sleep(0.7)
+        out = p.stdout.read().strip()
+    finally:
+        try:
+            p.stdin.close()
+        except BrokenPipeError:
+            pass
+        try:
+            call(bus, ad_path, ADAPTER, 'StopDiscovery')
+        except GLib.Error:
+            pass
+    try:
+        path = shown[int(out)]
+    except (ValueError, IndexError):
+        return
+    d = (objects(bus) or {}).get(path, {}).get(DEVICE, {})
+    pair(bus, path, d)
+
+
+def pair(bus, path, d):
+    name = name_of(d)
+    notify('Bluetooth: pairing with %s…' % name)
+    try:
+        call(bus, path, DEVICE, 'Pair', timeout=90)
+    except GLib.Error as e:
+        if 'AlreadyExists' not in e.message:
+            notify('Bluetooth: %s not paired: %s' % (name, reason(e)))
+            return
+    # trusted: it may connect by itself from now on (headphones turned on, a keyboard waking)
+    set_prop(bus, path, DEVICE, 'Trusted', GLib.Variant('b', True))
+    connect(bus, path, name)
+
+
+def audio_now():
+    try:
+        with open(AUDIO_FILE) as f:
+            return f.read().split()[0]
+    except (OSError, IndexError):
+        return None
+
+
+def status():
+    bus = system_bus()
+    objs = objects(bus)
+    ad_path, ad = adapter(objs or {})
+    if objs is None or not ad_path:
+        print('no adapter' if objs is not None else 'no bluetoothd')
+        return 1
+    on = [name_of(d) for p, d in devices(objs, ad_path) if d.get('Connected')]
+    print('%s%s' % ('on' if ad.get('Powered') else 'off', ': ' + ', '.join(on) if on else ''))
+    return 0
+
+
+# ---- the agent: pairing on the screen, the sound, the panel --------------------------------------
+
+AGENT_XML = '''<node><interface name="org.bluez.Agent1">
+<method name="Release"/>
+<method name="RequestPinCode"><arg type="o" direction="in"/><arg type="s" direction="out"/></method>
+<method name="DisplayPinCode"><arg type="o" direction="in"/><arg type="s" direction="in"/></method>
+<method name="RequestPasskey"><arg type="o" direction="in"/><arg type="u" direction="out"/></method>
+<method name="DisplayPasskey"><arg type="o" direction="in"/><arg type="u" direction="in"/><arg type="q" direction="in"/></method>
+<method name="RequestConfirmation"><arg type="o" direction="in"/><arg type="u" direction="in"/></method>
+<method name="RequestAuthorization"><arg type="o" direction="in"/></method>
+<method name="AuthorizeService"><arg type="o" direction="in"/><arg type="s" direction="in"/></method>
+<method name="Cancel"/>
+</interface></node>'''
+
+
+class Agent:
+    def __init__(self):
+        self.bus = system_bus()
+        self.popup = None        # rofi -e showing a code to type, until paired or cancelled
+        self.asking = None       # rofi asking a question, until answered or cancelled
+        self.popup_for = None
+        self.sound = None        # (address, rate) the sound goes to
+        self.panel_pending = False
+        info = Gio.DBusNodeInfo.new_for_xml(AGENT_XML).interfaces[0]
+        self.bus.register_object(AGENT_PATH, info, self.on_call, None, None)
+        self.bus.signal_subscribe(BLUEZ, None, None, None, None, Gio.DBusSignalFlags.NONE, self.on_bluez)
+        self.bus.signal_subscribe(BLUEALSA, None, None, None, None, Gio.DBusSignalFlags.NONE,
+                                  lambda *a: GLib.timeout_add(300, self.sync_sound))
+        Gio.bus_watch_name_on_connection(self.bus, BLUEZ, Gio.BusNameWatcherFlags.NONE,
+                                         self.bluez_up, lambda *a: self.panel())
+        Gio.bus_watch_name_on_connection(self.bus, BLUEALSA, Gio.BusNameWatcherFlags.NONE,
+                                         lambda *a: self.sync_sound(), lambda *a: self.sync_sound())
+
+    def bluez_up(self, *args):
+        try:
+            call(self.bus, '/org/bluez', 'org.bluez.AgentManager1', 'RegisterAgent',
+                 GLib.Variant('(os)', (AGENT_PATH, 'KeyboardDisplay')))
+            call(self.bus, '/org/bluez', 'org.bluez.AgentManager1', 'RequestDefaultAgent',
+                 GLib.Variant('(o)', (AGENT_PATH,)))
+        except GLib.Error as e:
+            print('agent: %s' % e.message, file=sys.stderr)
+        self.panel()
+
+    # -- requests from bluetoothd
+
+    def on_call(self, conn, sender, path, iface, method, params, inv):
+        args = params.unpack()
+        dev = args[0] if args else None
+        d = (objects(self.bus) or {}).get(dev, {}).get(DEVICE, {}) if dev else {}
+        name = name_of(d) if d else ''
+        if method == 'RequestPinCode':
+            # old (2.0) devices: a keyboard types the PIN, headsets and the like have a fixed one
+            if kind(d)[1] == 'keyboard':
+                pin = '%06d' % random.randint(0, 999999)
+                self.show('Type %s on the keyboard "%s", then Enter' % (pin, name), dev)
+                inv.return_value(GLib.Variant('(s)', (pin,)))
+            else:
+                inv.return_value(GLib.Variant('(s)', ('0000',)))
+        elif method == 'DisplayPinCode':
+            self.show('Type %s on "%s", then Enter' % (args[1], name), dev)
+            inv.return_value(None)
+        elif method == 'DisplayPasskey':
+            if self.popup_for != (dev, args[1]):
+                self.show('Type %06d on "%s", then Enter' % (args[1], name), dev, args[1])
+            inv.return_value(None)
+        elif method == 'RequestPasskey':
+            self.in_thread(inv, lambda: self.ask_passkey(name))
+        elif method == 'RequestConfirmation':
+            self.in_thread(inv, lambda: self.confirm(
+                'Pair with "%s"?' % name, 'The same code must be on its screen: %06d' % args[1], dev))
+        elif method == 'RequestAuthorization':
+            self.in_thread(inv, lambda: self.confirm('Pair with "%s"?' % name, None, dev))
+        elif method == 'AuthorizeService':
+            self.in_thread(inv, lambda: self.confirm('Let "%s" connect?' % name, None, dev))
+        elif method == 'Cancel':
+            self.hide()
+            self.close_question()
+            inv.return_value(None)
+        else:   # Release
+            inv.return_value(None)
+
+    def in_thread(self, inv, ask):
+        """A question on the screen without stopping the loop; the answer goes back from it"""
+        def run():
+            answer = ask()
+            GLib.idle_add(self.reply, inv, answer)
+        threading.Thread(target=run, daemon=True).start()
+
+    @staticmethod
+    def reply(inv, answer):
+        if answer is False or answer is None:
+            inv.return_dbus_error('org.bluez.Error.Rejected', 'Rejected')
+        elif answer is True:
+            inv.return_value(None)
+        else:
+            inv.return_value(GLib.Variant('(u)', (answer,)))
+        return False
+
+    def track(self, p):
+        """One question at a time: one asked before is stale (BlueZ has given up on it), and its
+        rofi would keep the keyboard from the new one"""
+        self.close_question()
+        self.asking = p
+
+    def close_question(self):
+        p, self.asking = self.asking, None
+        if p and p.poll() is None:
+            p.terminate()
+
+    def confirm(self, question, message, dev):
+        wake()
+        ok = rofi(question, ['Yes', 'No'], message=message, track=self.track) == 0
+        if ok and dev:
+            # a phone that paired with the box needn't ask again for each connection
+            GLib.idle_add(lambda: self.trust(dev))
+        return ok
+
+    def trust(self, dev):
+        try:
+            set_prop(self.bus, dev, DEVICE, 'Trusted', GLib.Variant('b', True))
+        except GLib.Error:
+            pass
+        return False
+
+    def ask_passkey(self, name):
+        wake()
+        text = ask('Code', message='The code that "%s" shows' % name, track=self.track)
+        return int(text) if text and text.isdigit() else None
+
+    def show(self, text, dev, key=None):
+        self.hide()
+        wake()
+        self.popup = subprocess.Popen(['rofi', '-e', text])
+        self.popup_for = (dev, key)
+        GLib.timeout_add_seconds(90, self.hide_if, self.popup)
+
+    def hide(self):
+        if self.popup and self.popup.poll() is None:
+            self.popup.terminate()
+        self.popup = self.popup_for = None
+
+    def hide_if(self, popup):
+        if self.popup is popup:
+            self.hide()
+        return False
+
+    # -- signals: devices coming and going, the panel
+
+    def on_bluez(self, conn, sender, path, iface, signal, params):
+        if signal == 'PropertiesChanged':
+            changed_iface, changed = params.unpack()[:2]
+            if changed_iface == DEVICE and 'Connected' in changed:
+                d = (objects(self.bus) or {}).get(path, {}).get(DEVICE, {})
+                notify('Bluetooth: %s %s' % (name_of(d), 'connected' if changed['Connected'] else 'disconnected'))
+            if changed_iface == DEVICE and changed.get('Paired') and self.popup_for and self.popup_for[0] == path:
+                self.hide()
+        self.panel()
+
+    def panel(self):
+        """Soon, once for a burst of signals"""
+        if not self.panel_pending:
+            self.panel_pending = True
+            GLib.timeout_add(300, self.write_panel)
+
+    def write_panel(self):
+        self.panel_pending = False
+        objs = objects(self.bus)
+        ad_path, ad = adapter(objs or {})
+        if not ad_path:
+            text = ''
+        elif not ad.get('Powered'):
+            text = '%%{F#6c7086}%s%%{F-}' % ICON
+        else:
+            on = [name_of(d) for p, d in devices(objs, ad_path) if d.get('Connected')]
+            if not on:
+                text = '%%{F#a6adc8}%s%%{F-}' % ICON
+            elif len(on) == 1:
+                text = '%%{F#89b4fa}%s%%{F-} %s' % (ICON, on[0] if len(on[0]) <= 12 else on[0][:11] + '…')
+            else:
+                text = '%%{F#89b4fa}%s%%{F-} %d' % (ICON, len(on))
+        try:
+            os.makedirs(os.path.dirname(PANEL_FILE), exist_ok=True)
+            with open(PANEL_FILE, 'w') as f:
+                f.write(text + '\n')
+        except OSError:
+            pass
+        subprocess.call(['polybar-msg', 'action', '#bluetooth.hook.0'],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return False
+
+    # -- the sound: to headphones while they are connected
+
+    def sync_sound(self):
+        pcms = objects(self.bus, BLUEALSA, '/org/bluealsa') or {}
+        outs = []
+        for path, ifaces in pcms.items():
+            pcm = ifaces.get('org.bluealsa.PCM1', {})
+            if pcm.get('Transport', '').startswith('A2DP-source') and pcm.get('Mode') == 'sink':
+                outs.append((pcm.get('Sequence', 0), pcm['Device'], pcm.get('Sampling', 48000)))
+        # the one already chosen while it stays, else the newest
+        now = [o for o in outs if self.sound and address_of(o[1]) == self.sound[0]]
+        best = (now or sorted(outs))[-1] if outs else None
+        new = (address_of(best[1]), best[2]) if best else None
+        if new != self.sound or (new is None and audio_now()):
+            args = [new[0], str(new[1])] if new else ['off']
+            if subprocess.call(['sudo', '-n', sys.argv[0], 'audio'] + args) == 0:
+                if new:
+                    d = (objects(self.bus) or {}).get(best[1], {}).get(DEVICE, {})
+                    notify('Sound: %s (a video already playing keeps the old output)' % name_of(d))
+                elif self.sound:
+                    notify('Sound: back to the TV')
+            self.sound = new
+        return False
+
+
+def agent():
+    Agent()
+    GLib.MainLoop().run()
+
+
+# ---- root: where the sound goes ------------------------------------------------------------------
+
+def root_audio(args):
+    if os.geteuid() != 0:
+        sys.exit('as root')
+    if args == ['off']:
+        try:
+            os.unlink(AUDIO_FILE)
+        except FileNotFoundError:
+            pass
+    elif len(args) == 2 and re.fullmatch(r'([0-9A-F]{2}:){5}[0-9A-F]{2}', args[0]) and args[1].isdigit():
+        with open(AUDIO_FILE + '.tmp', 'w') as f:
+            f.write('%s %s\n' % (args[0], args[1]))
+        os.replace(AUDIO_FILE + '.tmp', AUDIO_FILE)
+    else:
+        sys.exit('usage: ozone-bluetooth audio ADDR RATE | off')
+    return subprocess.call([SOUND_CONFIG])
+
+
+def main(argv):
+    if argv[1:2] == ['audio']:
+        return root_audio(argv[2:])
+    if argv[1:] == ['agent']:
+        return agent()
+    if argv[1:] == ['status']:
+        return status()
+    if argv[1:]:
+        sys.exit(__doc__)
+    return menu()
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

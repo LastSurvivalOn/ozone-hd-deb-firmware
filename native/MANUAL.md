@@ -22,7 +22,8 @@ mouse work too.
 12. [Files: videos, music and photos](#12-files-videos-music-and-photos)
 13. [Games](#13-games)
 14. [The network, the hotspot, VPN, phones](#14-the-network-the-hotspot-vpn-phones)
-15. [All key combinations](#15-all-key-combinations)
+15. [Bluetooth](#15-bluetooth)
+16. [All key combinations](#16-all-key-combinations)
 
 ---
 
@@ -96,6 +97,7 @@ The panel is the bar along the top of the screen. From left to right:
 | centre | the title of the active window. Click it for a list of the open windows, to switch to one. |
 | pointer and keyboard icons | the remote's mouse mode and the on-screen keyboard (section 10): green when on, a click switches them |
 | drive icon | USB drives, SD cards and network folders (section 11): how many are open; a click gives the list |
+| Bluetooth icon | with a Bluetooth adapter plugged in (section 15): grey when nothing is connected, blue with the name of what is; a click gives the Bluetooth menu |
 | CPU %, memory, temperature | system load |
 | IP address | the cable connection (shown only with the cable plugged in). Click it for the Network menu (section 14). |
 | WiFi | the WiFi network the box is on. Click it for the Network menu. It stays grey when not connected. |
@@ -718,7 +720,47 @@ WiFi Direct, so neither needs the home network for it; the WiFi hotspot has to b
 folders; **OK** plays a video, a piece of music (and the ones after it) or a photo (a slideshow
 of that folder), **exit** goes up a folder.
 
-## 15. All key combinations
+## 15. Bluetooth
+
+The box has no Bluetooth of its own: plug a USB Bluetooth adapter into it (a small "CSR 4.0" one
+works). The Bluetooth icon appears on the panel. Then headphones and speakers play the box's
+sound, Bluetooth keyboards, mice and gamepads work like USB ones, and a phone can play its music
+on the TV.
+
+**Bluetooth** in the app menu, or a click on the icon on the panel:
+
+| Line | What it does |
+|---|---|
+| **Bluetooth: on / off** | turns it off and on |
+| a device (headphones, keyboard…) | the devices paired with the box, and whether they are connected now. **OK** on one: **Connect** / **Disconnect**, or **Forget it** (to pair it again, or for good) |
+| **Add a device…** | searches, and lists what it finds as it finds it |
+| **Let a phone find the box…** | for 3 minutes the box can be found as **Ozone TV** from a phone |
+
+**Headphones, a speaker, a keyboard, a mouse, a gamepad.** Put the device in pairing mode
+(usually: hold its power or Bluetooth button until a light blinks fast; see its manual), then
+**Add a device…** and choose it when it appears in the list. Headphones and speakers just
+connect. A keyboard may show "Type 123456 on the keyboard": type that number on the new keyboard,
+then Enter. A paired device usually connects by itself the next time it is turned on near the
+box; if not, choose it in the menu and **Connect**.
+
+While headphones or a speaker are connected, all the sound goes to them: videos, TV, YouTube,
+music, games (the panel says "Sound: …"). A video that was already playing keeps sounding on
+the TV until it is started again. When they are turned off or go out of reach, the sound comes
+back to the TV by itself. The volume on the panel and the remote sets their volume too. Bluetooth
+headphones are a little behind the picture (that's Bluetooth itself, more or less depending on
+the headphones), and AC-3 / DTS go to them as ordinary stereo.
+
+**A phone's music on the TV.** **Let a phone find the box…**, then on the phone: Bluetooth
+settings, look for devices, choose **Ozone TV**. The TV asks "Pair with …?" with a code: if the
+phone shows the same code, choose **Yes** (and confirm on the phone). After that, whatever the
+phone plays (music, a video's sound) comes out of the TV, and its volume buttons work. Next time it
+is enough to choose **Ozone TV** in the phone's Bluetooth list, the box needn't be found again.
+
+If a device doesn't connect: it may be connected to a phone or a computer (turn their Bluetooth
+off for a moment), or too far away; **Forget it**, then add it again. A phone that refuses
+pairing ("incorrect PIN") was given **No** or waited too long on the TV: try again.
+
+## 16. All key combinations
 
 ### Anywhere
 | Keys | Action |

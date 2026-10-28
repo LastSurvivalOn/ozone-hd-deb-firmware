@@ -1031,6 +1031,28 @@ static int resampler(const AVFrame *f)
     return 0;
 }
 
+/* The device is gone (Bluetooth headphones turned off): "default" again, which sound-config points
+   back at the TV by then. Twice a second at most. */
+static int pcm_reopen(void)
+{
+    static int64_t tried;
+    if (P.raw || now_us() - tried < 500000)
+        return -1;
+    tried = now_us();
+    snd_pcm_t *old = P.pcm;
+    P.pcm = NULL;
+    /* ALSA notices a change only in alsa.conf itself, not in the asound.conf it loads: read it all
+       again (the open devices keep the tree they were made from) */
+    snd_config_update_free_global();
+    if (open_pcm_dev("default", AUDIO_RATE) < 0) {
+        P.pcm = old;   /* still the dead one: it fails again, and is tried again */
+        return -1;
+    }
+    snd_pcm_close(old);
+    logmsg("audio: the device again");
+    return 0;
+}
+
 /* The Amlogic I2S driver keeps the buffer in blocks of 16 frames (16 left samples, then 16 right)
    and converts each write in place: one that doesn't start and end on a block boundary lands
    shifted, and the TV gets noise or nothing (dmesg: "audio data unligned"). So whole blocks of
@@ -1042,25 +1064,29 @@ static int pcm_write_blocks(uint8_t *buf, int n)
         audio_pause_wait();
         snd_pcm_sframes_t room = snd_pcm_avail_update(P.pcm);
         int len = whole - off;
+        snd_pcm_sframes_t w;
+        /* waiting can fail too: a BlueALSA device that disconnected has no room and
+           snd_pcm_wait says ENODEV at once (this loop spun a core on it) */
         if (room >= 0 && room < I2S_BLOCK) {
-            snd_pcm_wait(P.pcm, 100);
-            continue;
-        }
-        if (room > 0 && len > room)
-            len = room / I2S_BLOCK * I2S_BLOCK;
-        snd_pcm_sframes_t w = snd_pcm_writei(P.pcm, buf + off * 4, len);
-        if (w == -EAGAIN) {
-            snd_pcm_wait(P.pcm, 100);
-            continue;
-        }
-        if (w < 0) {
-            if (snd_pcm_recover(P.pcm, w, 1) < 0) {
-                logmsg("audio: %s", snd_strerror(w));
-                break;
+            w = snd_pcm_wait(P.pcm, 100);
+        } else {
+            if (room > 0 && len > room)
+                len = room / I2S_BLOCK * I2S_BLOCK;
+            w = snd_pcm_writei(P.pcm, buf + off * 4, len);
+            if (w >= 0) {
+                off += w;
+                continue;
             }
-            continue;
+            if (w == -EAGAIN)
+                w = snd_pcm_wait(P.pcm, 100);
         }
-        off += w;
+        if (w >= 0)
+            continue;
+        if (snd_pcm_recover(P.pcm, w, 1) == 0 || pcm_reopen() == 0)
+            continue;
+        /* nowhere to play them: the frames take their time, as if played, and go */
+        usleep((useconds_t)((int64_t)(whole - off) * 1000000 / P.out_rate));
+        break;
     }
     return whole;
 }
@@ -1083,11 +1109,14 @@ static int raw_write(void *opaque, uint8_t *buf, int size)
     return size;
 }
 
-/* PASSTHROUGH=on, or auto and the TV's (or receiver's) EDID lists the codec */
+/* PASSTHROUGH=on, or auto and the TV's (or receiver's) EDID lists the codec; never while the
+   sound goes to Bluetooth headphones (sound-config) */
 static int raw_wanted(enum AVCodecID id)
 {
     char mode[16], cap[2048];
     if (id != AV_CODEC_ID_AC3 && id != AV_CODEC_ID_DTS)
+        return 0;
+    if (access("/run/ozone-bluetooth-audio", F_OK) == 0)
         return 0;
     conf_get("PASSTHROUGH", "off", mode, sizeof mode);
     if (!strcmp(mode, "on"))

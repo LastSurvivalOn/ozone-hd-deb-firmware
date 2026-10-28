@@ -130,6 +130,8 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
 - [ ] **Medium**: HDMI-CEC: control the box with the TV's remote, turn the TV on and off with the
   box. The kernel has a `cec_input` device, while Android runs with CEC off (`hdmitx=cec0`,
   `ro.platform.has.cecmode=false`).
-- Bluetooth: no hardware (`hw.has.bluetooth=false`).
+- [x] **Medium**: Bluetooth. The box has none (`hw.has.bluetooth=false`) and Android no driver for
+  a USB adapter; native Linux takes one now: headphones and speakers, keyboards, mice, gamepads, a
+  phone's music on the TV (`install-bluetooth.sh`).
 - 4K: the S805 outputs 1080p at most.
 - Netflix and other DRM: Widevine is off (`media.amplayer.widevineenable=false`).

@@ -4,6 +4,8 @@
 #   SOUND=auto    HDMI, or the analog jack when the picture goes out as composite video (cvbs)
 #   SOUND=hdmi | analog
 #   EQ=1          the 10-band equalizer (alsaequal with the caps LADSPA plugins) before the output
+# While Bluetooth headphones or a speaker are connected, the sound goes there instead: ozone-bluetooth
+# writes their address and sampling rate to /run/ozone-bluetooth-audio (BlueALSA's PCM).
 #
 # What the Amlogic driver allows (see also amplay and CLAUDE.md):
 # 1. It hangs the kernel if silence filling is enabled in sw_params (mpv does that with ao=alsa,
@@ -20,6 +22,12 @@ device=1
 case $SOUND in
 analog) device=0 ;;
 auto) case "$(cat /sys/class/display/mode 2> /dev/null)" in *cvbs) device=0 ;; esac ;;
+esac
+slave="hw:0,$device" what="device $device ($( [ $device = 1 ] && echo HDMI || echo "analog jack" ))" bt_addr= bt_rate=
+[ -r /run/ozone-bluetooth-audio ] && read -r bt_addr bt_rate < /run/ozone-bluetooth-audio
+case "$bt_addr" in
+??:??:??:??:??:??) slave="bluealsa:DEV=$bt_addr,PROFILE=a2dp" what="Bluetooth $bt_addr" ;;
+*) bt_rate= ;;
 esac
 
 out=hw_out
@@ -61,10 +69,15 @@ ctl.equal {
 '
 fi
 
+# Bluetooth: pinned as well, to the rate the headphones agreed with BlueALSA (44.1 or 48 kHz);
+# softvol over BlueALSA's plugin finds no configuration either without it
+out_pin=$pin
+[ -n "$bt_rate" ] && out_pin="; channels 2; rate $bt_rate"
+
 tmp=/etc/asound.conf.new
 cat > $tmp << EOF
 # Written by /usr/local/lib/ozone/sound-config from /etc/ozone/display: edit that, not this.
-# Output: device $device ($( [ $device = 1 ] && echo HDMI || echo "analog jack" )), equalizer: $( [ $out = eq_in ] && echo on || echo off ).
+# Output: $what, equalizer: $( [ $out = eq_in ] && echo on || echo off ).
 pcm.!default {
     type plug
     slave { pcm "softvol"; format S16_LE$pin; }
@@ -81,7 +94,7 @@ pcm.softvol {
 $eq
 pcm.hw_out {
     type plug
-    slave { pcm "hw:0,$device"; format S16_LE$pin; }
+    slave { pcm "$slave"; format S16_LE$out_pin; }
 }
 
 ctl.!default {

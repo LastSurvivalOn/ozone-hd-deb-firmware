@@ -53,6 +53,8 @@ start)
     chgrp video /etc/ozone/screen $FB/fb0/window_axis $FB/fb0/free_scale &&
         chmod g+w /etc/ozone/screen $FB/fb0/window_axis $FB/fb0/free_scale
     chgrp input /dev/input/* && chmod g+rw /dev/input/*
+    # and those plugged in later, USB or Bluetooth
+    echo /usr/local/lib/ozone/hotplug > /proc/sys/kernel/hotplug
     # ozone-remote (in the X session) passes the remote on through virtual devices of its own
     chgrp input /dev/uinput && chmod g+rw /dev/uinput
 

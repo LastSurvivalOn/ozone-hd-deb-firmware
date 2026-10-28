@@ -1,0 +1,50 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          ozone-bluetooth
+# Required-Start:    $local_fs dbus bluetooth
+# Required-Stop:     $local_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: USB Bluetooth adapters, and Bluetooth sound (BlueALSA)
+### END INIT INFO
+
+# Only native: the box has no Bluetooth of its own, and Android has no driver for USB adapters
+/etc/ozone/is-native || exit 0
+
+# The stock kernel has the Bluetooth stack but no USB adapter driver (native/bluetooth). Loaded at
+# boot, with or without an adapter: one plugged in later is taken at once, and bluetoothd
+# (Debian's init script) powers it on (AutoEnable in /etc/bluetooth/main.conf).
+MODULE=/lib/modules/3.10.33/extra/btusb.ko
+
+case "$1" in
+start)
+    [ -d /sys/module/btusb ] || insmod $MODULE
+    # Sound to headphones and speakers (A2DP source), and from phones to the TV (A2DP sink, played
+    # by bluealsa-aplay on the default ALSA device, see sound-config). Headsets' microphones (HFP)
+    # are left out. Debian's build logs every stream in detail: the log starts again each time.
+    start-stop-daemon --start --quiet --background --make-pidfile --pidfile /run/ozone-bluealsa.pid \
+        --startas /bin/sh -- -c 'exec /usr/bin/bluealsa -p a2dp-source -p a2dp-sink > /var/log/bluealsa.log 2>&1'
+    start-stop-daemon --start --quiet --background --make-pidfile --pidfile /run/ozone-bluealsa-aplay.pid \
+        --startas /bin/sh -- -c 'sleep 1; exec /usr/bin/bluealsa-aplay >> /var/log/bluealsa.log 2>&1'
+    ;;
+stop)
+    start-stop-daemon --stop --quiet --pidfile /run/ozone-bluealsa-aplay.pid --remove-pidfile
+    start-stop-daemon --stop --quiet --pidfile /run/ozone-bluealsa.pid --remove-pidfile
+    # the sound back to the TV (sound-config follows this file)
+    if [ -e /run/ozone-bluetooth-audio ]; then
+        rm -f /run/ozone-bluetooth-audio
+        /usr/local/lib/ozone/sound-config
+    fi
+    ;;
+restart|force-reload)
+    $0 stop
+    $0 start
+    ;;
+status)
+    start-stop-daemon --status --pidfile /run/ozone-bluealsa.pid
+    ;;
+*)
+    echo "usage: $0 start|stop|restart|status" >&2
+    exit 3
+    ;;
+esac

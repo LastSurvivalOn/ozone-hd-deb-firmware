@@ -21,6 +21,7 @@ import sys
 CONF = '/etc/ozone/display'
 LIB = '/usr/local/lib/ozone'
 MODE_FILE = '/sys/class/display/mode'
+BT_AUDIO = '/run/ozone-bluetooth-audio'   # Bluetooth headphones have the sound (ozone-bluetooth)
 CAP = '/sys/class/amhdmitx/amhdmitx0/disp_cap'
 DEFAULTS = {'MODE': 'auto', 'MATCH_RATE': '0', 'SOUND': 'auto', 'PASSTHROUGH': 'off', 'EQ': '0'}
 LABELS = {
@@ -130,10 +131,13 @@ def menu():
     while True:
         s = load()
         mode_now = read(MODE_FILE)
+        sound = SOUNDS.get(s['SOUND'], s['SOUND']).split(':')[0]
+        if read(BT_AUDIO):
+            sound = 'Bluetooth while it is connected, then %s' % sound
         items = [
             'Resolution: %s' % ('Auto (%s)' % label(mode_now) if s['MODE'] == 'auto' else label(s['MODE'])),
             'Match the frame rate of videos (50 / 60 Hz): %s' % ('on' if s['MATCH_RATE'] == '1' else 'off'),
-            'Sound output: %s' % SOUNDS.get(s['SOUND'], s['SOUND']).split(':')[0],
+            'Sound output: %s' % sound,
             'Digital sound: %s' % PASSTHROUGHS.get(s['PASSTHROUGH'], s['PASSTHROUGH']).split(':')[0],
             'Equalizer…',
             'Screen edges (overscan)…',
