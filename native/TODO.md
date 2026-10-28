@@ -2,7 +2,8 @@
 
 Collected 2026-10-21 from the stock apps on `/system` (the TV app `th.dtv`, SettingsEx,
 MoviePlayer, DLNA, Miracast, OTAUpgrade, the phone remotes), `build.prop` and the hardware, against
-what native Linux does now. Levels:
+what native Linux does now. Audited again on 2026-10-28 against every app in the system.img backup
+(`/system/app`, `/system/priv-app`): section 6 is what that added. Levels:
 
 - **Easy**: a day or less, known ground (a script, a menu, a small change to an existing tool).
 - **Medium**: a few days, or new code in amplay / ozone-tv, or something not tried on this kernel.
@@ -104,6 +105,9 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
 - [ ] **Medium**: YouTube features SmartTube has and `yt` doesn't: account sign-in, subscriptions,
   history, the home feed, channel pages, playlists, SponsorBlock, YouTube's own subtitles, speed,
   chapters. Starting a video also takes ~10 s.
+- [ ] **Medium or Hard**: casting from the YouTube app on a phone (its "Cast" button, or "Link with
+  TV code"): the DIAL protocol and YouTube's Lounge API, as SmartTube does. Now a phone sends
+  YouTube to the box only by DLNA apps or by the phone remote's address box.
 - [ ] **Medium**: settings in the interface: sound, screen, network, language in one place.
 - [ ] **Medium**: the interface in Ukrainian (Android's is uk-UA; ours is English).
 - [x] **Medium**: backup / restore of the system and settings, and a "factory reset", from the box
@@ -126,6 +130,35 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
   ozone-web's cookies (not for YouTube).
 - [ ] **Hard / not planned**: Android apps (Google Play, APKs) in Linux. Rebooting into Android
   is the way.
+
+## 6. Found in the second audit (2026-10-28)
+
+What the stock Android has (its apps: DeskClock, Calculator, Settings, PackageInstaller, Email,
+LiveWallpapers, PrintSpooler, Camera2, PicoTts / TalkBack, VpnDialogs, the TV app) and native
+Linux doesn't:
+
+- [ ] **Easy**: a sleep timer (off or standby in 30 / 60 / 90 minutes, from the TV and the player),
+  and standby by itself after some hours without a button pressed. Android TV boxes do both; now
+  the box stays on until Power.
+- [ ] **Easy**: a clock with alarms, a timer and a stopwatch (DeskClock): the calendar's reminders
+  already wake the screen, an alarm needs a sound too.
+- [ ] **Easy**: a calculator for the remote.
+- [ ] **Easy**: screenshots: a key (Print, or a remote combination) saves the screen into Pictures.
+- [ ] **Easy**: choosing the wallpaper (Android has a picker and live wallpapers): now one picture.
+- [ ] **Easy**: the messages of the last hours in one place (Android's notification shade): now
+  the panel's message is gone after 6 s.
+- [ ] **Easy**: L2TP / IPsec and PPTP VPN (Android's own VPN types), and a proxy from a PAC file
+  (ProxyHandler). Now OpenVPN, WireGuard and a plain proxy address.
+- [ ] **Medium**: a programs manager (Android's package installer and store): install and remove
+  Debian programs from a menu, by name or by kind. Now apt in the terminal.
+- [ ] **Medium**: text size for the whole interface (Android's "large text" and magnification):
+  the menus and windows have fixed sizes, small from a sofa on a big TV.
+- [ ] **Medium**: the calendar synced with Google Calendar or a calendar's ICS address, as
+  Android's Calendar with its Google sync adapter.
+- [ ] **Medium**: sharing the box's own files with the network (a DLNA media server, or a Windows
+  share), so a phone or a TV plays the box's recordings and videos.
+- [ ] **Low value**: e-mail (Email, Gmail: web mail in the browser does it), printing (CUPS is
+  heavy), a USB webcam (Camera2), text to speech and a screen reader (PicoTts, TalkBack).
 
 ## Neither has it
 
