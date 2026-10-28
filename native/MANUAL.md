@@ -876,8 +876,8 @@ too, only slowly (the box's processor is about a fifth of a laptop's). The **Bui
 
 Two programs, both for a keyboard (or the on-screen one, or the phone remote's typing) and the mouse:
 
-**Calculator** (Qalculate!) is for everyday sums, written as you would on paper: `2400 × 15%` (or `2400 + 15%`),
-`250 USD to UAH` (the exchange rates update themselves once a week), `100 km/h to m/s`,
+**Calculator** (Qalculate!) is for everyday sums, written as you would on paper: `2400 × 15%`
+(or `2400 + 15%`), `250 USD to UAH` (the exchange rates update themselves once a week), `100 km/h to m/s`,
 `5 feet 11 inches to cm`, `sqrt(2)^10`, `solve(x^2 - 5x + 6 = 0)`, `diff(sin(x)^2, x)`,
 `integrate(sqrt(1 - x^2), -1, 1)`, dates (`today + 90 days`). Enter calculates; the buttons below
 do the same with the mouse; **History** keeps what was calculated; **File → Plot Functions/Data**
