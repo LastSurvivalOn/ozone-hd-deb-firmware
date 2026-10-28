@@ -340,7 +340,7 @@ DIGITS = {E.KEY_1: 1, E.KEY_2: 2, E.KEY_3: 3, E.KEY_4: 4, E.KEY_5: 5, E.KEY_6: 6
 ARROWS = (E.KEY_UP, E.KEY_DOWN, E.KEY_LEFT, E.KEY_RIGHT)
 # windows where exit means Esc (they handle it); other windows it closes
 ESC_CLASSES = ('ozone-tv', 'ozone-screen', 'ozone-files', 'ozone-equalizer', 'ozone-photos', 'ozone-calendar',
-               'ozone-reminder')
+               'ozone-reminder', 'ozone-system')
 INFO_CLASSES = ('ozone-files', 'ozone-photos')   # info is their own key (a file's details), not the panel
 
 

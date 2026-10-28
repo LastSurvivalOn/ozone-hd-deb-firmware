@@ -18,6 +18,8 @@ tar -C "$HERE/rootfs" -czf - \
     usr/local/share/applications/ozone-photos.desktop \
     usr/local/bin/ozone-calendar usr/local/share/applications/ozone-calendar.desktop \
     usr/local/bin/ozone-code usr/local/share/applications/ozone-code.desktop usr/local/share/ozone/geany \
+    usr/local/bin/ozone-system usr/local/share/applications/ozone-updates.desktop \
+    usr/local/share/applications/ozone-backup.desktop etc/init.d/ozone-system \
     usr/local/bin/yt usr/local/bin/ozone-web usr/local/bin/ozone-web-show usr/local/share/applications/ozone-web.desktop usr/local/bin/ozone-power usr/local/bin/ozone-screen usr/local/share/applications/ozone-screen.desktop usr/local/bin/ozone-standby usr/local/bin/ozone-notify etc/init.d/ozone-input etc/ozone/remote.conf etc/ozone/native-only \
     usr/local/bin/ozone-wifi usr/local/bin/ozone-volume usr/local/bin/ozone-remote usr/local/bin/ozone-panel usr/local/bin/ozone-media usr/local/share/applications/ozone-media.desktop usr/local/bin/ozone-terminal usr/local/share/applications/ozone-terminal.desktop usr/local/bin/ozone-sysinfo usr/local/share/applications/ozone-sysinfo.desktop etc/init.d/ozone-media usr/local/share/applications/ozone-wifi.desktop usr/local/share/applications/yt.desktop usr/local/share/applications/ozone-tv.desktop usr/local/share/applications/ozone-power.desktop etc/init.d/ozone-wifi usr/local/lib/ozone/wifi-event usr/local/lib/ozone/netwatch \
     usr/local/lib/ozone/gen-xorg-screen etc/X11/Xwrapper.config etc/asound.conf |
@@ -26,15 +28,29 @@ tar -C "$HERE/rootfs" -czf - \
 # what System info shows as the version of these scripts
 echo "$(git -C "$HERE" log -1 --format='%h, %cd' --date=format:'%d.%m.%Y' 2>/dev/null || echo unknown)$(git -C "$HERE" diff --quiet HEAD 2>/dev/null || echo ' (with local changes)')" |
     ssh_box 'sudo mkdir -p /etc/ozone && sudo tee /etc/ozone/version > /dev/null'
+# and the commit, which Updates compares with GitHub's
+git -C "$HERE" rev-parse HEAD 2>/dev/null | ssh_box 'sudo tee /etc/ozone/commit > /dev/null'
 
-echo ">> user files"
-tar -C "$HERE/dotfiles" -czf - . | ssh_box 'tar -C ~ -xzf - && chmod +x ~/.xinitrc ~/.config/bspwm/bspwmrc ~/.config/polybar/launch.sh'
-
-echo ">> amplay (video through the hardware decoder), built on the box"
+echo ">> amplay (video through the hardware decoder), built on the box, and the user files"
 # libzvbi decodes TV teletext (its runtime comes with FFmpeg already)
 ssh_box 'sudo apt-get install -y -qq --no-install-recommends libzvbi-dev > /dev/null'
-tar -C "$HERE/amplay" -czf - amplay.c osd.c osd.h ttx.c ttx.h Makefile |
-    ssh_box 'set -e; d=$(mktemp -d); tar -C $d -xzf -; make -s -C $d; sudo make -s -C $d install; rm -r $d'
+# The user files go through update.py, as the box's own updates do: one the user changed is kept.
+# A file is still ours if it is a version from git history (known.sha256), or the one installed last.
+W=$(mktemp -d)
+trap 'rm -rf "$W"' EXIT
+mkdir -p "$W/amplay"
+cp -a "$HERE/dotfiles" "$HERE/update.py" "$W/"
+cp "$HERE"/amplay/{amplay.c,osd.c,osd.h,ttx.c,ttx.h,Makefile} "$W/amplay/"
+(cd "$HERE/dotfiles" && find . -type f | sed 's|^\./||') | while read -r f; do
+    git -C "$HERE" log --format=%H -- "dotfiles/$f" 2>/dev/null | while read -r c; do
+        h=$(git -C "$HERE" show "$c:native/dotfiles/$f" 2>/dev/null | sha256sum | cut -d' ' -f1)
+        echo "$h  $f"
+    done
+done | sort -u > "$W/known.sha256"
+tar -C "$W" -czf - . | ssh_box 'set -e; d=$(mktemp -d); tar -C $d -xzf -
+    make -s -C $d/amplay; sudo make -s -C $d/amplay install
+    sudo python3 -I $d/update.py --native $d --user "$(id -un)" --dotfiles-only --known $d/known.sha256 --amplay-built
+    rm -r $d'
 
 echo ">> yt-dlp (latest release: the Debian version stopped working with YouTube long ago)"
 ssh_box 'sudo curl -fsSL -o /usr/local/bin/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp &&
@@ -72,6 +88,10 @@ ssh_box 'set -e
     sudo apt-get install -y -qq --no-install-recommends python3-gi-cairo webp-pixbuf-loader > /dev/null
     # the code editor (ozone-code): Geany with its file tree, and C++ beside the C compiler amplay needs
     sudo apt-get install -y -qq --no-install-recommends geany geany-plugin-treebrowser g++ > /dev/null
+    # Updates and backups (ozone-system): zstd packs the whole system in four threads; the settings
+    # restored and the reset happen at the start, before the network and Bluetooth (ozone-system)
+    sudo apt-get install -y -qq --no-install-recommends zstd > /dev/null
+    sudo update-rc.d ozone-system defaults
     # the folders Files starts with
     mkdir -p ~/Videos ~/Music ~/Pictures
     # ozone-web opens links from other programs

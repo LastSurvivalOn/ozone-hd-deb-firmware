@@ -25,7 +25,8 @@ mouse work too.
 15. [Bluetooth](#15-bluetooth)
 16. [Calendar](#16-calendar)
 17. [The code editor](#17-the-code-editor)
-18. [All key combinations](#18-all-key-combinations)
+18. [Updates, backups and the reset](#18-updates-backups-and-the-reset)
+19. [All key combinations](#19-all-key-combinations)
 
 ---
 
@@ -496,6 +497,7 @@ users: sign in to the site in the browser first, and the player gets the browser
 | Games or videos show a black window, or the desktop looks wrong | The graphics chip may be at fault. ⏻ → **Reboot**: if the desktop fails with it, the box falls back to drawing without it by itself. |
 | No internet (no IP address or WiFi name on the panel) | Click **WiFi** on the panel and choose your network. If it doesn't connect, check the router, then ⏻ → **Reboot**. |
 | "Could not connect …: wrong password?" | Choose the network again and retype the password (letter case matters). |
+| Something stopped working after an update | **Backup and reset** → **Restore**: the whole system backed up "before the updates" takes the box back to how it was (section 18). |
 
 ## 10. The remote control
 
@@ -847,7 +849,59 @@ quick for programs of a few files (a small C program takes under a second); a bi
 too, only slowly (the box's processor is about a fifth of a laptop's). The **Build** menu has
 **Set Build Commands** to change what F8, F9 and F5 run (to add `-lm`, say, or to run `make`).
 
-## 18. All key combinations
+## 18. Updates, backups and the reset
+
+**Updates** and **Backup and reset** in the app menu open the same window, with four sections on
+the left: **↑ / ↓** choose one, **→** or **OK** goes into it, **exit** goes back and closes. The bar
+at the bottom says what the buttons do.
+
+**Updates.** The box looks for updates itself once a day and says so on the panel ("Updates are
+ready"). The window looks again when it opens (or with **Look for updates**), for three things:
+- **Debian**: the system's programs and their security fixes;
+- **YouTube (yt-dlp)**: what YouTube needs, as YouTube changes;
+- **the box software**: these menus, the TV, the player and the rest, from the project's page on
+  GitHub; the list of what is new shows under the buttons.
+
+**Install the updates** (press **OK** twice) installs all of them. **First back up the whole system
+on the box** (on by default; ← → turn it off) makes a backup first, to go back to with Restore if
+something goes wrong after the update; it takes about 2 minutes and 0.7 GB, and only the newest
+one of these is kept. Settings and files you changed yourself (the terminal's colours, say) stay
+as you made them. Some updates need a restart: the window offers **Restart the box now** or
+**Later**. A few parts are made on a computer (the graphics and Bluetooth drivers, the TV tuner's
+program, the browser's engine); when they change, the window says so, and they are updated from
+the computer.
+
+**Back up.** **Where**: ← → choose a USB drive or SD card plugged in, or **On the box** (its free
+space is shown). Then:
+- **Back up the settings**: WiFi and network settings, Bluetooth devices, network folders, VPN, TV
+  channels, favourites and timers, the browser's bookmarks and sign-ins, the calendar, the
+  display, sound and every program's settings. A few MB, a few seconds.
+- **Back up the whole system**: everything, as it is now, to start again from. About 0.7 GB and
+  2 minutes (the box keeps working meanwhile). Your videos, music and photos in the home folder
+  are in it too, the TV recordings are not.
+
+On a drive they go into its folder **ozone-backups**, so a drive can carry them to another box
+like this one. **exit** stops a backup halfway (press it twice).
+
+**Restore** lists the backups found on the box and on the drives plugged in, newest first. **OK**
+twice on one restores it, and the box restarts:
+- the settings come back at the start, before the network and the desktop;
+- the whole system takes about 10 minutes before the restart (it is put next to the one running,
+  which is replaced only at the restart: until then nothing changes, and if anything fails,
+  nothing is changed at all). It needs free space on the box about as big as the system, 1.6 GB:
+  restore from a drive if a backup on the box doesn't fit.
+
+Before restoring, the settings as they are are backed up onto the box (named "before restoring"),
+so a wrong choice can be taken back. Blue (pressed twice) deletes a backup.
+
+**Reset.** **Reset the settings** brings the box back to how it was after installing: WiFi
+networks, Bluetooth devices, TV channels, the browser's data and all settings go; your videos,
+music, photos, downloads, code, games and TV recordings stay. **Erase everything** removes your
+files and the TV recordings too. Both first back up the settings onto the box ("before the
+reset": Restore brings them back), restart the box and do it at the start. The programs, the
+updates installed and the backups stay; so does the way in for the computer (`~/.ssh`).
+
+## 19. All key combinations
 
 ### Anywhere
 | Keys | Action |

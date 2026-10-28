@@ -1,0 +1,1561 @@
+#!/usr/bin/python3
+"""ozone-system: updates, backups, restoring them and the factory reset, from the box itself.
+
+  ozone-system [updates|backup|restore|reset]   the window, at that section ("Updates" and
+                                                "Backup and reset" in the apps menu)
+  ozone-system check                            (bspwmrc) looks for updates 10 minutes after the
+                                                start, then once a day, and says on the panel when
+                                                there are some
+  ozone-system root COMMAND ...                 the work, as root (sudo -n): its progress on stdout
+
+Updates: the Debian packages (apt-get upgrade, with sysvinit kept), yt-dlp (YouTube) and the box's
+own scripts from GitHub (REPO's main branch: native/update.py of the new tree brings the box up to
+it, keeping the user's own changes to their files). Before installing, a backup of the whole system
+can be made on the box, to go back to.
+
+Backups go to a USB drive or SD card (its folder ozone-backups) or to the box's own storage
+(/mnt/nand/linux/backups), each with a .json beside it saying what it is:
+- the settings (a .tar.gz of a few MB): the hidden files of the home folder (the programs'
+  settings, TV channels, the browser's data, the calendar...) and the system's settings below
+  (WiFi networks, the network, Bluetooth pairings, network folders, VPN, display and sound);
+- the whole system (a .tar.zst of the root filesystem, ~0.7 GB): restoring it makes a new
+  debian.img next to the one in use, and renames it over that one: the running system keeps its
+  own (the loop device holds it) until the restart, which starts the restored one.
+Restoring settings and the factory reset happen at the next start, before anything uses the files
+(/etc/init.d/ozone-system runs "ozone-system root pending"); both first back up the settings as
+they are onto the box, so they can be undone. The reset keeps the user's files (or erases them too)
+and ~/.ssh, and puts back the files install-desktop.sh installed (/usr/local/share/ozone/dotfiles).
+"""
+import calendar
+import json
+import os
+import pwd
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tarfile
+import threading
+import time
+import urllib.error
+import urllib.request
+
+REPO = 'LastSurvivalOn/ozone-hd-deb-firmware'
+BRANCH = 'main'
+SELF = '/usr/local/bin/ozone-system'
+NAND = '/mnt/nand/linux'
+IMAGE = NAND + '/debian.img'
+NAND_BACKUPS = NAND + '/backups'
+FOLDER = 'ozone-backups'
+STATE = '/var/lib/ozone'
+PENDING = STATE + '/pending.json'
+PENDING_SETTINGS = STATE + '/pending-settings.tar.gz'
+UPDATE_CACHE = '/var/cache/ozone-update'
+PRISTINE = '/usr/local/share/ozone/dotfiles'
+HOME = os.path.expanduser('~')
+CACHE = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.join(HOME, '.cache'), 'ozone-system')
+CHECKED = os.path.join(CACHE, 'updates.json')
+LOG = '/var/log/ozone-system.log'
+
+# the system's settings, kept in a settings backup and put back by the reset (deleted: the tools
+# fall back to their defaults)
+SYSTEM_SETTINGS = ['/etc/ozone/display', '/etc/ozone/screen', '/etc/ozone/network.json', '/etc/ozone/proxy',
+                   '/etc/ozone/hotspot.json', '/etc/ozone/shares.json', '/etc/ozone/alsaequal.bin',
+                   '/etc/ozone/vpn', '/etc/wpa_supplicant/ozone.conf', '/var/lib/bluetooth']
+SYSTEM_KEPT = ['/etc/timezone', '/etc/localtime', '/etc/environment', '/etc/apt/apt.conf.d/80ozone-proxy',
+               '/etc/ppp/pap-secrets', '/etc/ppp/chap-secrets']
+# the home's hidden entries a settings backup leaves out, and the reset leaves alone
+HOME_SKIP = {'.cache', '.dbus', '.Xauthority', '.xsession-errors', '.local/share/Trash', '.thumbnails'}
+HOME_KEEP = {'.ssh'}
+HOME_FOLDERS = ['Videos', 'Music', 'Pictures', 'Downloads']
+BIG = 100 << 20    # a settings backup skips files bigger than this
+# the whole system leaves out what isn't on the root filesystem or is made anew
+SYSTEM_EXCLUDE = ['./proc/*', './sys/*', './dev/*', './run/*', './tmp/*', './mnt/*', './media/*', './system/*',
+                  './var/tmp/*', './var/cache/apt/archives/*.deb', './var/cache/apt/*.bin', './home/*/.cache/*',
+                  './root/.cache/*', './var/cache/ozone-update/*', './var/lib/ozone/pending*']
+MOUNTPOINTS = {'proc': 0o555, 'sys': 0o555, 'dev': 0o755, 'run': 0o755, 'tmp': 0o1777, 'mnt': 0o755,
+               'media': 0o755, 'system': 0o755}
+
+
+def human(n):
+    n = float(n)
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if n < 1024 or unit == 'TB':
+            return ('%.0f %s' if unit in ('B', 'KB') or n >= 100 else '%.1f %s') % (n, unit)
+        n /= 1024
+
+
+def read(path, default=''):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def native():
+    return subprocess.call(['/etc/ozone/is-native'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0 \
+        and os.path.exists(IMAGE)
+
+
+def box_backups():
+    """Where "on the box" is: the NAND beside debian.img, or (under Android) inside Debian"""
+    return NAND_BACKUPS if os.path.isdir(NAND) else STATE + '/backups'
+
+
+def free(path):
+    while not os.path.exists(path):
+        path = os.path.dirname(path)
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize
+
+
+def drives():
+    """The writable mounts in /media: [(path, name)]"""
+    out = []
+    try:
+        with open('/proc/mounts') as f:
+            for line in f:
+                dev, mnt, fs, opts = line.split()[:4]
+                mnt = mnt.replace('\\040', ' ')
+                if mnt.startswith('/media/') and 'rw' in opts.split(','):
+                    out.append((mnt, os.path.basename(mnt)))
+    except OSError:
+        pass
+    return sorted(out)
+
+
+def places():
+    """Where backups can go: [(folder, name)]"""
+    out = [(box_backups(), 'On the box')]
+    out += [(os.path.join(m, FOLDER), 'Drive ' + name) for m, name in drives()]
+    return out
+
+
+def place_name(path):
+    if path.startswith(box_backups()):
+        return 'on the box'
+    m = re.match(r'/media/([^/]+)/', path)
+    return 'drive ' + m.group(1) if m else os.path.dirname(path)
+
+
+def backups():
+    """Every backup found: [info] newest first; info has path, kind, made, bytes, note, auto"""
+    out = []
+    for folder, _name in places():
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for n in names:
+            m = re.match(r'ozone-(settings|system)-(\d{8}-\d{6})\.tar\.(gz|zst)$', n)
+            if not m:
+                continue
+            path = os.path.join(folder, n)
+            info = {}
+            try:
+                with open(path + '.json') as f:
+                    info = json.load(f)
+            except (OSError, ValueError):
+                pass
+            info.setdefault('kind', m.group(1))
+            if 'made' not in info:
+                info['made'] = calendar.timegm(time.strptime(m.group(2), '%Y%m%d-%H%M%S')) + time.timezone
+            try:
+                info['bytes'] = os.path.getsize(path)
+            except OSError:
+                continue
+            info['path'] = path
+            out.append(info)
+    return sorted(out, key=lambda i: -i['made'])
+
+
+def installed_commit():
+    c = read('/etc/ozone/commit')
+    if c:
+        return c
+    m = re.match(r'([0-9a-f]{7,40})\b', read('/etc/ozone/version'))
+    return m.group(1) if m else ''
+
+
+# ---- the work, as root ----------------------------------------------------------------------------
+
+CLEANUP = []    # half-made files a stopped worker deletes
+
+
+def on_term(signum, frame):
+    for p in CLEANUP:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    os._exit(1)
+
+
+def out(*words):
+    print(' '.join(str(w) for w in words), flush=True)
+
+
+def progress(frac, text=''):
+    out('progress', '%.3f' % frac, text)
+
+
+def fail(text):
+    out('error', text)
+    sys.exit(1)
+
+
+def user_home(user):
+    pw = pwd.getpwnam(user)
+    return pw.pw_dir, pw.pw_uid, pw.pw_gid
+
+
+def stamp():
+    return time.strftime('%Y%m%d-%H%M%S')
+
+
+def sidecar(path, info):
+    with open(path + '.json.tmp', 'w') as f:
+        json.dump(info, f, indent=1)
+    os.replace(path + '.json.tmp', path + '.json')
+
+
+def finish(tmp, path):
+    with open(tmp, 'rb+') as f:
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    subprocess.call(['sync'])
+
+
+def home_filter(home):
+    def f(ti):
+        rel = ti.name.split('/', 1)[1] if '/' in ti.name else ''
+        if any(rel == s or rel.startswith(s + '/') for s in HOME_SKIP):
+            return None
+        if not (ti.isfile() or ti.isdir() or ti.issym()):
+            return None
+        if ti.isfile() and ti.size > BIG:
+            out('log', 'left out (too big for a settings backup): ~/%s, %s' % (rel, human(ti.size)))
+            return None
+        return ti
+    return f
+
+
+def backup_settings(folder, user, note='', auto=False):
+    home, _uid, _gid = user_home(user)
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, 'ozone-settings-%s.tar.gz' % stamp())
+    tmp = path + '.part'
+    CLEANUP.append(tmp)
+    progress(-1, 'the settings')
+    info = {'kind': 'settings', 'made': time.time(), 'version': read('/etc/ozone/version'), 'note': note,
+            'auto': auto, 'user': user}
+    try:
+        with tarfile.open(tmp, 'w:gz', compresslevel=6, format=tarfile.PAX_FORMAT) as tar:
+            data = json.dumps(info, indent=1).encode()
+            ti = tarfile.TarInfo('ozone-backup.json')
+            ti.size, ti.mtime = len(data), time.time()
+            import io
+            tar.addfile(ti, io.BytesIO(data))
+            filt = home_filter(home)
+            for entry in sorted(os.listdir(home)):
+                if entry.startswith('.') and entry not in HOME_SKIP:
+                    tar.add(os.path.join(home, entry), 'home/' + entry, filter=filt)
+            for p in SYSTEM_SETTINGS + SYSTEM_KEPT:
+                if os.path.lexists(p):
+                    tar.add(p, 'root' + p)
+        finish(tmp, path)
+    except Exception as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        fail('The backup failed: %s' % e)
+    info['bytes'] = os.path.getsize(path)
+    sidecar(path, info)
+    out('log', 'settings: %s, %s' % (path, human(info['bytes'])))
+    return path
+
+
+def prune(folder, kind, keep):
+    """Deletes the oldest automatic backups of a kind beyond keep"""
+    old = [b for b in backups() if b['path'].startswith(folder + '/') and b['kind'] == kind and b.get('auto')]
+    for b in old[keep:]:
+        delete(b['path'])
+
+
+def pump(src, dst, total, text, start=0.0, span=1.0):
+    """Copies a pipe into another, saying how far it got"""
+    n = 0
+    last = 0
+    while True:
+        chunk = src.read(1 << 20)
+        if not chunk:
+            break
+        dst.write(chunk)
+        n += len(chunk)
+        if n - last > 8 << 20:
+            last = n
+            progress(start + span * min(0.99, n / total) if total else -1, '%s: %s' % (text, human(n)))
+    return n
+
+
+def backup_system(folder, note='', auto=False):
+    if not native():
+        fail('The whole system can be backed up only in native Linux (not under Android).')
+    st = os.statvfs('/')
+    used = (st.f_blocks - st.f_bfree) * st.f_frsize
+    need = int(used * 0.5)
+    if auto:
+        prune(folder, 'system', 0)
+    if free(folder) < need + (300 << 20):
+        fail('Not enough space %s: it needs about %s, %s is free.' % (place_name(folder + '/x'), human(need),
+                                                                       human(free(folder))))
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, 'ozone-system-%s.tar.zst' % stamp())
+    tmp = path + '.part'
+    CLEANUP.append(tmp)
+    progress(0, 'the whole system')
+    subprocess.call(['sync'])
+    cmd = ['tar', '--create', '--one-file-system', '--numeric-owner', '--xattrs', '--xattrs-include=*',
+           '--warning=no-file-changed', '--warning=no-file-ignored', '--warning=no-file-removed', '-C', '/']
+    cmd += ['--exclude=' + e for e in SYSTEM_EXCLUDE] + ['.']
+    with open(tmp, 'wb') as f:
+        tar = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        zst = subprocess.Popen(['zstd', '-1', '-T4', '-q', '-c'], stdin=subprocess.PIPE, stdout=f)
+        err = []
+        t = threading.Thread(target=lambda: err.append(tar.stderr.read()), daemon=True)
+        t.start()
+        try:
+            n = pump(tar.stdout, zst.stdin, used, 'the whole system')
+        except BrokenPipeError:
+            n = 0
+        zst.stdin.close()
+        tar.wait()
+        zst.wait()
+        t.join(5)
+    # tar's 1 is "some files changed while read": logs, which is fine
+    if tar.returncode not in (0, 1) or zst.returncode != 0:
+        os.unlink(tmp)
+        msg = (err[0].decode(errors='replace').strip().splitlines() or [''])[-1] if err else ''
+        fail('The backup failed (tar %s, zstd %s): %s' % (tar.returncode, zst.returncode, msg))
+    finish(tmp, path)
+    info = {'kind': 'system', 'made': time.time(), 'version': read('/etc/ozone/version'), 'note': note,
+            'auto': auto, 'size': n, 'bytes': os.path.getsize(path)}
+    sidecar(path, info)
+    out('log', 'the whole system: %s, %s' % (path, human(info['bytes'])))
+    return path
+
+
+def delete(path):
+    path = os.path.realpath(path)
+    if os.path.basename(os.path.dirname(path)) not in (FOLDER, 'backups') or \
+            not re.match(r'ozone-(settings|system)-[\d-]+\.tar\.(gz|zst)$', os.path.basename(path)):
+        fail('Not a backup: %s' % path)
+    for p in (path, path + '.json'):
+        try:
+            os.unlink(p)
+        except FileNotFoundError:
+            pass
+    subprocess.call(['sync'])
+
+
+def write_pending(info):
+    os.makedirs(STATE, exist_ok=True)
+    with open(PENDING + '.tmp', 'w') as f:
+        json.dump(info, f)
+    os.replace(PENDING + '.tmp', PENDING)
+    subprocess.call(['sync'])
+
+
+def restore(path, user):
+    kind = 'system' if path.endswith('.tar.zst') else 'settings'
+    if kind == 'settings':
+        progress(-1, 'first the settings as they are now, onto the box')
+        prune(box_backups(), 'settings', 4)
+        backup_settings(box_backups(), user, 'before restoring the settings of %s' % time.strftime('%d.%m.%Y'), True)
+        shutil.copyfile(path, PENDING_SETTINGS + '.tmp')
+        os.replace(PENDING_SETTINGS + '.tmp', PENDING_SETTINGS)
+        write_pending({'action': 'restore-settings', 'user': user, 'from': path})
+        out('restart', 'reboot')
+        return
+    restore_system(path)
+    out('restart', 'reboot')
+
+
+def fs_layout(dev):
+    """The running root's ext4 features, for an image the stock kernel mounts as it does this one"""
+    r = subprocess.run(['dumpe2fs', '-h', dev], capture_output=True, text=True)
+    info = {}
+    for line in r.stdout.splitlines():
+        if ':' in line:
+            k, v = line.split(':', 1)
+            info[k.strip()] = v.strip()
+    features = [f for f in info.get('Filesystem features', '').split() if f not in ('needs_recovery',)]
+    if 'has_journal' not in features or 'extent' not in features:
+        fail('Could not read how the system disk is made (dumpe2fs %s).' % dev)
+    return features, info.get('Inode size', '256'), info.get('Inode count'), info.get('Block size', '4096')
+
+
+def root_device():
+    """The loop device debian.img is on (/proc/mounts starts with the initramfs' rootfs on /)"""
+    r = subprocess.run(['losetup', '-j', IMAGE], capture_output=True, text=True)
+    return r.stdout.split(':')[0] if r.stdout.startswith('/dev/') else '/dev/loop0'
+
+
+def restore_system(path, test=False):
+    if not native():
+        fail('The whole system can be restored only in native Linux (not under Android).')
+    try:
+        with open(path + '.json') as f:
+            size = json.load(f).get('size') or 0
+    except (OSError, ValueError):
+        size = 0
+    size = size or os.path.getsize(path) * 3
+    # the files, their last blocks, and ext4's journal and inode tables; less than that would end in
+    # "no space" halfway, which changes nothing either
+    need = size * 1.08 + (100 << 20)
+    if free(NAND) < need:
+        fail('Not enough space on the box to restore it: it needs about %s, %s is free. Delete a backup kept '
+             'on the box (blue on it), or restore from a drive.' % (human(need), human(free(NAND))))
+    new = IMAGE + '.new'
+    mnt = '/run/ozone-restore'
+    features, isize, icount, bsize = fs_layout(root_device())
+    progress(0, 'a new system disk')
+    for p in (new,):
+        if os.path.exists(p):
+            os.unlink(p)
+    with open(new, 'wb') as f:
+        f.truncate(os.path.getsize(IMAGE))
+    cmd = ['mke2fs', '-q', '-F', '-t', 'ext4', '-O', 'none,' + ','.join(features), '-b', bsize, '-I', isize, '-m', '0']
+    if icount:
+        cmd += ['-N', icount]
+    if subprocess.call(cmd + [new]) != 0:
+        os.unlink(new)
+        fail('Could not make the new system disk (mke2fs).')
+    loop = subprocess.run(['losetup', '-f', '--show', new], capture_output=True, text=True).stdout.strip()
+    if not loop:
+        os.unlink(new)
+        fail('No free loop device for the new system disk.')
+    os.makedirs(mnt, exist_ok=True)
+    ok = False
+    try:
+        if subprocess.call(['mount', '-t', 'ext4', loop, mnt]) != 0:
+            fail('Could not mount the new system disk.')
+        try:
+            zst = subprocess.Popen(['zstd', '-d', '-q', '-c', path], stdout=subprocess.PIPE)
+            tar = subprocess.Popen(['tar', '--extract', '--numeric-owner', '--xattrs', '--xattrs-include=*', '-p',
+                                    '-C', mnt], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+            err = []
+            t = threading.Thread(target=lambda: err.append(tar.stderr.read()), daemon=True)
+            t.start()
+            try:
+                pump(zst.stdout, tar.stdin, size, 'restoring', 0.02, 0.9)
+            except BrokenPipeError:
+                pass
+            tar.stdin.close()
+            zst.wait()
+            tar.wait()
+            t.join(5)
+            if zst.returncode != 0 or tar.returncode != 0:
+                msg = (err[0].decode(errors='replace').strip().splitlines() or [''])[-1] if err else ''
+                fail('Restoring failed (zstd %s, tar %s): %s' % (zst.returncode, tar.returncode, msg))
+            for name, mode in MOUNTPOINTS.items():
+                p = os.path.join(mnt, name)
+                if not os.path.isdir(p):
+                    os.mkdir(p, mode)
+            os.makedirs(os.path.join(mnt, 'mnt/nand'), exist_ok=True)
+            for need in ('sbin/init', 'etc/fstab', 'etc/inittab', 'lib/modules/3.10.33', 'usr/local/lib/ozone'):
+                if not os.path.exists(os.path.join(mnt, need)):
+                    fail('The backup has no %s: not a whole system of this box. Nothing was changed.' % need)
+            ok = True
+        finally:
+            subprocess.call(['umount', mnt])
+    finally:
+        subprocess.call(['losetup', '-d', loop])
+        if not ok and os.path.exists(new):
+            os.unlink(new)
+    progress(0.95, 'checking the new system disk')
+    r = subprocess.run(['e2fsck', '-f', '-n', new], capture_output=True, text=True)
+    if r.returncode != 0:
+        os.unlink(new)
+        fail('The new system disk did not check out (e2fsck %d). Nothing was changed.' % r.returncode)
+    if test:   # root restore-test: all but the last step
+        os.unlink(new)
+        out('log', 'the test went through; nothing was changed')
+        return
+    subprocess.call(['sync'])
+    # the system running now keeps its own disk through the loop device until the restart
+    os.replace(new, IMAGE)
+    subprocess.call(['sync'])
+    out('log', 'the restored system starts at the next start')
+
+
+def reset(mode, user):
+    progress(-1, 'first the settings as they are now, onto the box')
+    prune(box_backups(), 'settings', 4)
+    backup_settings(box_backups(), user, 'before the reset of %s' % time.strftime('%d.%m.%Y'), True)
+    write_pending({'action': 'reset', 'mode': mode, 'user': user})
+    out('restart', 'reboot')
+
+
+def remove(path):
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path, ignore_errors=True)
+    elif os.path.lexists(path):
+        os.unlink(path)
+
+
+def safe_dest(base, rel):
+    """base/rel when nothing on the way there is a symbolic link (a crafted backup can't write
+    elsewhere)"""
+    parts = [p for p in rel.split('/') if p not in ('', '.')]
+    if not parts or '..' in parts:
+        return None
+    d = base
+    for p in parts[:-1]:
+        d = os.path.join(d, p)
+        if os.path.islink(d):
+            return None
+    return os.path.join(base, *parts)
+
+
+def allowed_system(path):
+    return any(path == p or path.startswith(p + '/') for p in SYSTEM_SETTINGS + SYSTEM_KEPT)
+
+
+def unpack_settings(archive, user):
+    home, uid, gid = user_home(user)
+    with tarfile.open(archive, 'r:gz') as tar:
+        for m in tar:
+            if m.name.startswith('home/'):
+                dest, owner = safe_dest(home, m.name[5:]), (uid, gid)
+            elif m.name.startswith('root/') and allowed_system('/' + m.name[5:]):
+                dest, owner = safe_dest('/', m.name[5:]), (m.uid, m.gid)
+            else:
+                continue
+            if not dest:
+                out('log', 'skipped %s' % m.name)
+                continue
+            try:
+                if m.isdir():
+                    if os.path.lexists(dest) and not os.path.isdir(dest):
+                        remove(dest)
+                    os.makedirs(dest, exist_ok=True)
+                elif m.isfile():
+                    if os.path.isdir(dest) and not os.path.islink(dest):
+                        remove(dest)
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    tmp = dest + '.ozone-restore'
+                    with tar.extractfile(m) as src, open(tmp, 'wb') as f:
+                        shutil.copyfileobj(src, f)
+                    os.replace(tmp, dest)
+                elif m.issym():
+                    remove(dest)
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    os.symlink(m.linkname, dest)
+                else:
+                    continue
+                os.lchown(dest, *owner)
+                if not m.issym():
+                    os.chmod(dest, m.mode & 0o7777)
+                    os.utime(dest, (m.mtime, m.mtime))
+            except OSError as e:
+                out('log', 'could not restore %s: %s' % (m.name, e))
+
+
+def do_reset(mode, user):
+    home, uid, gid = user_home(user)
+    for entry in os.listdir(home):
+        if entry in HOME_KEEP:
+            continue
+        if entry.startswith('.') or mode == 'all':
+            remove(os.path.join(home, entry))
+    if mode == 'all' and os.path.isdir(NAND + '/Recordings'):
+        for n in os.listdir(NAND + '/Recordings'):
+            remove(os.path.join(NAND, 'Recordings', n))
+    # Debian's own (.bashrc, .profile), then the files install-desktop.sh installed
+    subprocess.call(['cp', '-a', '--no-preserve=ownership', '/etc/skel/.', home + '/'])
+    if os.path.isdir(PRISTINE):
+        subprocess.call(['cp', '-a', '--no-preserve=ownership', PRISTINE + '/.', home + '/'])
+    for d in HOME_FOLDERS:
+        os.makedirs(os.path.join(home, d), exist_ok=True)
+    subprocess.call(['chown', '-R', '%d:%d' % (uid, gid), home])
+    for p in SYSTEM_SETTINGS:
+        if p in ('/etc/ozone/vpn', '/var/lib/bluetooth') and os.path.isdir(p):
+            for n in os.listdir(p):
+                remove(os.path.join(p, n))
+        else:
+            remove(p)
+    with open('/etc/timezone', 'w') as f:
+        f.write('Europe/Kyiv\n')
+    remove('/etc/localtime')
+    os.symlink('/usr/share/zoneinfo/Europe/Kyiv', '/etc/localtime')
+    # the proxy's files from no proxy, the sound's from no settings
+    for tool in (['/usr/local/lib/ozone/net-apply', 'proxy'], ['/usr/local/lib/ozone/sound-config']):
+        if os.path.exists(tool[0]):
+            subprocess.call(tool, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def pending():
+    """At the start (/etc/init.d/ozone-system), before the programs that use the files"""
+    try:
+        with open(PENDING) as f:
+            job = json.load(f)
+    except (OSError, ValueError):
+        return
+    # once only, even if it fails halfway
+    os.replace(PENDING, PENDING + '.done')
+    subprocess.call(['sync'])
+    out('log', '%s: %s' % (time.strftime('%F %T'), json.dumps(job)))
+    if job.get('action') == 'restore-settings' and os.path.exists(PENDING_SETTINGS):
+        unpack_settings(PENDING_SETTINGS, job['user'])
+        os.unlink(PENDING_SETTINGS)
+    elif job.get('action') == 'reset':
+        do_reset(job.get('mode', 'settings'), job['user'])
+    subprocess.call(['sync'])
+    out('log', 'done')
+
+
+def apt_env():
+    return dict(os.environ, DEBIAN_FRONTEND='noninteractive', LC_ALL='C')
+
+
+def check_init():
+    r = subprocess.run(['dpkg', '-S', '/sbin/init'], capture_output=True, text=True)
+    if 'sysvinit-core' not in r.stdout:
+        fail('/sbin/init is not sysvinit any more: do NOT restart the box. Reinstall sysvinit-core '
+             '(sudo apt-get install sysvinit-core) first.')
+
+
+def apt_check():
+    progress(-1, 'asking Debian what is new')
+    r = subprocess.run(['apt-get', 'update', '-q'], env=apt_env(), stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, text=True)
+    if r.returncode != 0:
+        fail('apt-get update failed: %s' % (r.stdout.strip().splitlines() or [''])[-1])
+    r = subprocess.run(['apt-get', '-s', '-q', '--no-install-recommends', 'upgrade'], env=apt_env(),
+                       capture_output=True, text=True)
+    n = 0
+    for line in r.stdout.splitlines():
+        m = re.match(r'Inst (\S+) \[([^\]]+)\] \((\S+)', line)
+        if m:
+            out('pkg', m.group(1), m.group(2), m.group(3))
+            n += 1
+    out('count', n)
+
+
+def apt_upgrade():
+    check_init()
+    cmd = ['apt-get', '-y', '-q', '--no-install-recommends', '-o', 'APT::Status-Fd=1',
+           '-o', 'Dpkg::Options::=--force-confdef', '-o', 'Dpkg::Options::=--force-confold', 'upgrade']
+    p = subprocess.Popen(cmd, env=apt_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    upgraded = []
+    for line in p.stdout:
+        line = line.rstrip()
+        m = re.match(r'(dlstatus|pmstatus):([^:]*):([\d.]+):(.*)', line)
+        if m:
+            pct = float(m.group(3)) / 100
+            frac = pct * 0.3 if m.group(1) == 'dlstatus' else 0.3 + pct * 0.7
+            progress(frac, m.group(4))
+            continue
+        m = re.match(r'Unpacking (\S+?)(:\S+)? ', line)
+        if m:
+            upgraded.append(m.group(1))
+        if line.startswith(('E:', 'W:')):
+            out('log', line)
+    p.wait()
+    if p.returncode != 0:
+        fail('apt-get upgrade failed (%d): see /var/log/apt/term.log' % p.returncode)
+    check_init()
+    subprocess.call(['apt-get', 'clean'])
+    out('log', 'Debian: %d packages updated' % len(upgraded))
+    if any(u.startswith(('libwebkit2gtk', 'libjavascriptcoregtk')) for u in upgraded) and \
+            os.path.isdir('/usr/local/lib/ozone-webkit'):
+        out('warn', "WebKit was updated: the browser's own WebKit should be rebuilt on a computer "
+                    '(native/install-webkit.sh) for the same fixes')
+    if upgraded:
+        out('restart', 'reboot')
+
+
+def ytdlp():
+    progress(-1, 'yt-dlp')
+    r = subprocess.run(['/usr/local/bin/yt-dlp', '-U'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for line in r.stdout.strip().splitlines()[-2:]:
+        out('log', 'yt-dlp: ' + line)
+
+
+def ozone_update(sha, date, user):
+    if not re.match(r'^[0-9a-f]{40}$', sha):
+        fail('Not a commit: %s' % sha)
+    shutil.rmtree(UPDATE_CACHE, ignore_errors=True)
+    os.makedirs(UPDATE_CACHE)
+    url = 'https://codeload.github.com/%s/tar.gz/%s' % (REPO, sha)
+    progress(-1, 'downloading the box software')
+    archive = os.path.join(UPDATE_CACHE, 'src.tar.gz')
+    try:
+        with urllib.request.urlopen(url, timeout=60) as r, open(archive, 'wb') as f:
+            n = 0
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                f.write(chunk)
+                n += len(chunk)
+                if n % (1 << 20) < (1 << 16):
+                    progress(-1, 'downloading the box software: %s' % human(n))
+    except (OSError, urllib.error.URLError) as e:
+        fail('Could not download %s: %s' % (url, e))
+    tree = os.path.join(UPDATE_CACHE, 'tree')
+    with tarfile.open(archive, 'r:gz') as tar:
+        for m in tar:
+            parts = m.name.split('/')
+            if m.name.startswith('/') or '..' in parts or not (m.isfile() or m.isdir() or m.issym()):
+                continue
+            if m.issym() and (m.linkname.startswith('/') or '..' in m.linkname.split('/')):
+                continue
+            tar.extract(m, tree, set_attrs=m.isfile() or m.isdir())
+    tops = os.listdir(tree)
+    native_dir = os.path.join(tree, tops[0], 'native') if len(tops) == 1 else ''
+    script = os.path.join(native_dir, 'update.py')
+    if not os.path.isfile(script):
+        fail('The download has no native/update.py.')
+    progress(-1, 'installing')
+    p = subprocess.Popen(['python3', '-I', script, '--native', native_dir, '--user', user, '--commit', sha,
+                          '--date', date], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for line in p.stdout:
+        line = line.rstrip()
+        if line.startswith('@@ '):
+            progress(-1, line[3:])
+            out('log', line[3:])
+        elif line.startswith('!! '):
+            out('warn', line[3:])
+        elif line.startswith('== '):
+            if line[3:] in ('reboot', 'desktop'):
+                out('restart', line[3:])
+        elif line.strip():
+            out('log', line.strip())
+    p.wait()
+    shutil.rmtree(UPDATE_CACHE, ignore_errors=True)
+    if p.returncode != 0:
+        fail('The update stopped (update.py %d).' % p.returncode)
+
+
+def root_main(args):
+    if os.geteuid() != 0:
+        fail('ozone-system root needs root (sudo)')
+    os.umask(0o022)
+    signal.signal(signal.SIGTERM, on_term)
+    cmd, rest = args[0], args[1:]
+    if cmd == 'backup-settings':
+        backup_settings(rest[0], rest[1], *(rest[2:3] or ['']))
+    elif cmd == 'backup-system':
+        backup_system(rest[0], *(rest[1:2] or ['']), auto=len(rest) > 1)
+    elif cmd == 'restore':
+        restore(rest[0], rest[1])
+    elif cmd == 'reset':
+        if rest[0] not in ('settings', 'all'):
+            fail('reset settings|all USER')
+        reset(rest[0], rest[1])
+    elif cmd == 'restore-test':
+        restore_system(rest[0], test=True)
+    elif cmd == 'delete':
+        delete(rest[0])
+    elif cmd == 'pending':
+        pending()
+    elif cmd == 'apt-check':
+        apt_check()
+    elif cmd == 'apt-upgrade':
+        apt_upgrade()
+    elif cmd == 'ytdlp':
+        ytdlp()
+    elif cmd == 'update':
+        ozone_update(rest[0], rest[1], rest[2])
+    else:
+        fail('unknown: %s' % cmd)
+    out('done', '')
+
+
+# ---- looking for updates (as the user) ------------------------------------------------------------
+
+def github(path):
+    req = urllib.request.Request('https://api.github.com/repos/%s' % path,
+                                 headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'ozone-system'})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r)
+
+
+def check_box_software():
+    """{'state': 'new' | 'same' | 'newer' | 'apart' | 'unknown' | 'error', 'commits': [...], ...}"""
+    have = installed_commit()
+    if not have:
+        return {'state': 'unknown', 'text': 'The box does not know its version'}
+    try:
+        c = github('%s/compare/%s...%s' % (REPO, have, BRANCH))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return {'state': 'unknown', 'text': 'This version (%s) is not on GitHub: it was installed from a '
+                                                'computer. Updates come from there.' % have[:7]}
+        return {'state': 'error', 'text': 'GitHub: %s' % e}
+    except (OSError, ValueError) as e:
+        return {'state': 'error', 'text': 'GitHub could not be reached: %s' % getattr(e, 'reason', e)}
+    status = c.get('status')
+    commits = [{'sha': x['sha'], 'title': x['commit']['message'].split('\n')[0],
+                'date': x['commit']['committer']['date']} for x in c.get('commits', [])]
+    if status == 'ahead' and commits:
+        head = commits[-1]
+        d = time.strptime(head['date'][:10], '%Y-%m-%d')
+        return {'state': 'new', 'commits': commits[::-1], 'sha': head['sha'], 'date': time.strftime('%d.%m.%Y', d),
+                'text': '%d changes' % len(commits)}
+    if status in ('identical', 'behind'):
+        return {'state': 'same', 'text': 'Up to date'}
+    return {'state': 'apart', 'text': 'The box has changes GitHub hasn\'t: update it from the computer'}
+
+
+def check_ytdlp():
+    try:
+        have = subprocess.run(['/usr/local/bin/yt-dlp', '--version'], capture_output=True, text=True,
+                              timeout=30).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        have = ''
+    try:
+        latest = github('yt-dlp/yt-dlp/releases/latest').get('tag_name', '')
+    except (OSError, ValueError):
+        latest = ''
+    return {'have': have, 'latest': latest, 'new': bool(have and latest and latest > have)}
+
+
+def check_debian():
+    p = subprocess.run(['sudo', '-n', SELF, 'root', 'apt-check'], capture_output=True, text=True)
+    pkgs = []
+    error = ''
+    for line in p.stdout.splitlines():
+        w = line.split()
+        if w[:1] == ['pkg'] and len(w) >= 4:
+            pkgs.append({'name': w[1], 'old': w[2], 'new': w[3]})
+        elif w[:1] == ['error']:
+            error = line[6:]
+    if p.returncode != 0 and not error:
+        error = (p.stderr.strip().splitlines() or ['sudo failed'])[-1]
+    return {'packages': pkgs, 'error': error}
+
+
+def check_all():
+    result = {'time': time.time(), 'box': check_box_software(), 'ytdlp': check_ytdlp(), 'debian': check_debian()}
+    os.makedirs(CACHE, exist_ok=True)
+    with open(CHECKED + '.tmp', 'w') as f:
+        json.dump(result, f)
+    os.replace(CHECKED + '.tmp', CHECKED)
+    return result
+
+
+def load_checked():
+    try:
+        with open(CHECKED) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def updates_count(r):
+    if not r:
+        return 0
+    return len(r['debian'].get('packages', [])) + (1 if r['ytdlp'].get('new') else 0) + \
+        (len(r['box'].get('commits', [])) and 1 if r['box'].get('state') == 'new' else 0)
+
+
+def check_service():
+    time.sleep(600)
+    while True:
+        try:
+            r = check_all()
+            if updates_count(r):
+                subprocess.call(['ozone-notify', ' Updates are ready: Updates in the apps menu'],
+                                stderr=subprocess.DEVNULL)
+        except Exception as e:   # the network may be down: try again tomorrow
+            print('check failed: %r' % e, file=sys.stderr, flush=True)
+        time.sleep(86400)
+
+
+# ---- the window -----------------------------------------------------------------------------------
+
+CSS = b"""
+* { font-family: "DejaVu Sans"; font-size: 13px; color: #cdd6f4; }
+window, scrolledwindow, viewport { background: #11111b; }
+.header { padding: 10px 16px; }
+.logo { font-family: "FontAwesome"; font-size: 24px; color: #cba6f7; }
+.heading { font-size: 18px; font-weight: bold; }
+.status { color: #7f849c; }
+button.close { font-family: "FontAwesome"; font-size: 16px; background: transparent; border: none;
+               padding: 4px 10px; color: #a6adc8; box-shadow: none; }
+button.close:hover { background: #f38ba8; color: #11111b; }
+.sections { border-right: 1px solid #313244; padding-top: 4px; }
+.section { padding: 12px 16px; border-left: 3px solid transparent; }
+.section.current { background: #1e1e2e; }
+.section.chosen { border-left-color: #cba6f7; background: #313244; }
+.section .icon { font-family: "FontAwesome"; font-size: 15px; color: #cba6f7; min-width: 24px; }
+.section .name { font-size: 15px; font-weight: bold; }
+.content { padding: 14px 24px; }
+.title { font-size: 17px; font-weight: bold; padding-bottom: 4px; }
+.text { color: #a6adc8; }
+.row { padding: 10px 12px; border-radius: 8px; border: 2px solid transparent; }
+.row.chosen { border-color: #cba6f7; background: #313244; }
+.row .rtitle { font-size: 14px; font-weight: bold; }
+.row .sub { color: #7f849c; font-size: 12px; }
+.row .arrows { font-family: "FontAwesome"; color: #585b70; }
+.row.chosen .arrows { color: #cba6f7; }
+.row .ricon { font-family: "FontAwesome"; font-size: 16px; color: #89b4fa; min-width: 26px; }
+.row.armed { border-color: #f38ba8; }
+.row.armed .rtitle { color: #f38ba8; }
+.row.off .rtitle { color: #6c7086; }
+.good { color: #a6e3a1; }
+.warn { color: #f9e2af; }
+.bad { color: #f38ba8; }
+.mono { font-family: "JetBrains Mono"; font-size: 12px; color: #a6adc8; }
+progressbar trough { min-height: 10px; background: #313244; border: none; border-radius: 5px; }
+progressbar progress { min-height: 10px; background: #89b4fa; border: none; border-radius: 5px; }
+.hints { background: #181825; padding: 8px 16px; color: #a6adc8; }
+"""
+
+SECTIONS = [('updates', '', 'Updates'), ('backup', '', 'Back up'), ('restore', '', 'Restore'),
+            ('reset', '', 'Reset')]
+BLUE = ('Launch4', 'Delete')
+
+
+def setup_gtk():
+    global Gdk, GLib, Gtk, Pango
+    import gi
+    gi.require_version('Gtk', '3.0')
+    gi.require_version('Gdk', '3.0')
+    from gi.repository import Gdk, GLib, Gtk, Pango
+    # GTK's CSS parser loses the first number of the first stylesheet to a stale errno (see yt)
+    try:
+        Gtk.CssProvider().load_from_data(b'* { padding: 0px; }')
+    except GLib.Error:
+        pass
+    style = Gtk.CssProvider()
+    style.load_from_data(CSS)
+    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), style,
+                                             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+
+def label(text='', cls=None, **kw):
+    kw.setdefault('xalign', 0)
+    w = Gtk.Label(label=text, **kw)
+    for c in (cls or '').split():
+        w.get_style_context().add_class(c)
+    return w
+
+
+def classes(widget, *names, on=True):
+    ctx = widget.get_style_context()
+    for n in names:
+        (ctx.add_class if on else ctx.remove_class)(n)
+
+
+def hint_markup(pairs):
+    colours = {'red': '#f38ba8', 'green': '#a6e3a1', 'yellow': '#f9e2af', 'blue': '#89b4fa'}
+    parts = []
+    for keys, what in pairs:
+        k = GLib.markup_escape_text(keys)
+        for name, c in colours.items():
+            k = k.replace(name, '<span foreground="%s">●</span> %s' % (c, name))
+        parts.append('<b>%s</b>  %s' % (k, GLib.markup_escape_text(what)))
+    return '      '.join(parts)
+
+
+class Row:
+    def __init__(self, key, title, sub='', icon='', options=None, value=None, enabled=True):
+        self.key, self.title, self.sub, self.icon = key, title, sub, icon
+        self.options, self.value, self.enabled = options, value, enabled
+
+
+class Window:
+    def __init__(self, section):
+        self.user = pwd.getpwuid(os.getuid()).pw_name
+        self.section = [s[0] for s in SECTIONS].index(section) if section in [s[0] for s in SECTIONS] else 0
+        self.focus = 'rows'
+        self.chosen = 0
+        self.armed = None
+        self.job = None           # the running work: {'title', 'proc', 'stoppable'}
+        self.checking = False
+        self.checked = load_checked()
+        self.backup_first = True
+        self.place = 0
+        self.message = ('', '')   # (class, text) under the rows
+        self.restart = None
+        self.lines = []
+
+        self.win = Gtk.Window(title='Updates and backups')
+        self.win.set_default_size(1280, 720)
+        self.win.connect('delete-event', self.on_delete)
+        self.win.connect('destroy', Gtk.main_quit)
+        self.win.connect('key-press-event', self.on_key)
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        header = Gtk.Box(spacing=12)
+        classes(header, 'header')
+        header.pack_start(label('', 'logo'), False, False, 0)
+        header.pack_start(label('Updates and backups', 'heading'), False, False, 0)
+        self.status = label('', 'status', ellipsize=Pango.EllipsizeMode.END)
+        header.pack_start(self.status, True, True, 0)
+        close = Gtk.Button(label='', tooltip_text='Close (exit)', can_focus=False)
+        classes(close, 'close')
+        close.connect('clicked', lambda w: self.close())
+        header.pack_start(close, False, False, 0)
+        top.pack_start(header, False, False, 0)
+        body = Gtk.Box()
+        self.side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, width_request=220)
+        classes(self.side, 'sections')
+        self.section_rows = []
+        for i, (_key, icon, name) in enumerate(SECTIONS):
+            ev = Gtk.EventBox(visible_window=False)
+            box = Gtk.Box(spacing=10)
+            classes(box, 'section')
+            box.pack_start(label(icon, 'icon', xalign=0.5), False, False, 0)
+            box.pack_start(label(name, 'name'), False, False, 0)
+            ev.add(box)
+            ev.connect('button-press-event', lambda w, e, i=i: self.click_section(i))
+            self.side.pack_start(ev, False, False, 0)
+            self.section_rows.append(box)
+        body.pack_start(self.side, False, False, 0)
+        scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, can_focus=False)
+        self.scroll = scroll
+        self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        classes(self.content, 'content')
+        scroll.add(self.content)
+        body.pack_start(scroll, True, True, 0)
+        top.pack_start(body, True, True, 0)
+        self.hints = label('', 'hints', use_markup=True)
+        top.pack_start(self.hints, False, False, 0)
+        self.win.add(top)
+        self.win.show_all()
+        self.render()
+        if SECTIONS[self.section][0] == 'updates' and (not self.checked or time.time() - self.checked['time'] > 3600):
+            self.check()
+        GLib.timeout_add_seconds(5, self.tick)
+
+    # -- the sections' rows
+
+    def rows(self):
+        key = SECTIONS[self.section][0]
+        if self.job:
+            return []
+        if self.restart:
+            if self.restart == 'reboot':
+                return [Row('reboot', 'Restart the box now', 'needed for everything to take effect', ''),
+                        Row('later', 'Later', 'the next time the box starts', '')]
+            return [Row('desktop', 'Restart the desktop now', 'the programs start again with the new version; '
+                                   'open windows close', ''),
+                    Row('later', 'Later', '', '')]
+        if key == 'updates':
+            n = updates_count(self.checked)
+            rows = [Row('check', 'Look for updates', 'Debian, YouTube (yt-dlp) and the box software', '')]
+            if n:
+                rows.append(Row('install', 'Install the updates', self.updates_summary(), ''))
+                if native():
+                    rows.append(Row('first', 'First back up the whole system on the box',
+                                    'about 2 minutes and 0.7 GB: Restore takes the box back to it if '
+                                    'something goes wrong', '', ['Yes', 'No'], 0 if self.backup_first else 1))
+            return rows
+        if key == 'backup':
+            ps = places()
+            self.place = min(self.place, len(ps) - 1)
+            folder = ps[self.place][0]
+            opts = ['%s (%s free)' % (name, human(free(f))) for f, name in ps]
+            rows = [Row('place', 'Where', 'a USB drive or SD card plugged in, or the box itself', '',
+                        opts, self.place),
+                    Row('settings', 'Back up the settings',
+                        'WiFi and network, Bluetooth devices, TV channels and timers, the browser, the '
+                        'calendar, every program\'s settings: a few MB, seconds', '')]
+            if native():
+                rows.append(Row('system', 'Back up the whole system',
+                                'everything installed and set up, to start again from: about 0.7 GB, 2 minutes',
+                                ''))
+            n = len([b for b in backups() if b['path'].startswith(folder + '/')])
+            if n:
+                self.message = ('text', '%d backup%s there already (Restore lists them).' % (n, '' if n == 1 else 's'))
+            return rows
+        if key == 'restore':
+            rows = []
+            for b in backups():
+                what = 'The settings' if b['kind'] == 'settings' else 'The whole system'
+                sub = '%s, %s' % (place_name(b['path']), human(b['bytes']))
+                if b.get('note'):
+                    sub += ', ' + b['note']
+                if b.get('version'):
+                    sub += ' · version ' + b['version'].split(',')[0]
+                rows.append(Row(b['path'], '%s of %s' % (what, time.strftime('%d.%m.%Y %H:%M',
+                                                                           time.localtime(b['made']))),
+                                sub, '' if b['kind'] == 'settings' else ''))
+            return rows
+        if key == 'reset':
+            return [Row('reset-settings', 'Reset the settings',
+                        'as after installing: WiFi networks, Bluetooth devices, TV channels, the browser\'s '
+                        'data and every setting go. Videos, music, photos, downloads, code, games and TV '
+                        'recordings stay.', ''),
+                    Row('reset-all', 'Erase everything',
+                        'the settings and your files too: the home folder and the TV recordings. Backups stay.',
+                        '')]
+        return []
+
+    def updates_summary(self):
+        r = self.checked
+        parts = []
+        if r['debian'].get('packages'):
+            parts.append('%d Debian packages' % len(r['debian']['packages']))
+        if r['ytdlp'].get('new'):
+            parts.append('yt-dlp %s' % r['ytdlp']['latest'])
+        if r['box'].get('state') == 'new':
+            parts.append('the box software: %s' % r['box']['text'])
+        return ', '.join(parts)
+
+    def info(self):
+        """The text above the rows: [(class, text)]"""
+        key = SECTIONS[self.section][0]
+        if self.job:
+            return []
+        if self.restart:
+            return [('title', 'Done'), ('text', 'Restart the %s for it to take effect.' %
+                                        ('box' if self.restart == 'reboot' else 'desktop'))]
+        if key == 'updates':
+            out = [('title', 'Updates'), ('text', 'This box: version %s' % (read('/etc/ozone/version') or 'unknown'))]
+            r = self.checked
+            if self.checking:
+                out.append(('warn', 'Looking for updates…'))
+            elif not r:
+                out.append(('text', 'Not looked for yet.'))
+            else:
+                out.append(('text', 'Looked %s.' % time.strftime('%d.%m %H:%M', time.localtime(r['time']))))
+                b = r['box']
+                out.append(('good' if b['state'] == 'same' else 'warn' if b['state'] == 'new' else 'text',
+                            'Box software: ' + b.get('text', '')))
+                d = r['debian']
+                if d.get('error'):
+                    out.append(('bad', 'Debian: ' + d['error']))
+                else:
+                    n = len(d.get('packages', []))
+                    out.append(('warn' if n else 'good', 'Debian: %s' % ('%d packages to update' % n if n else 'up to date')))
+                y = r['ytdlp']
+                if y.get('have'):
+                    out.append(('warn' if y.get('new') else 'good', 'YouTube (yt-dlp): %s%s' % (
+                        y['have'], ', %s is out' % y['latest'] if y.get('new') else ', up to date')))
+            return out
+        if key == 'backup':
+            return [('title', 'Back up'), ('text', 'A copy to take the box back to later (Restore), or to another '
+                                                   'box like this one.')]
+        if key == 'restore':
+            if not backups():
+                return [('title', 'Restore'), ('text', 'No backups found. Plug in the drive they are on: '
+                                                       'they are in its folder ozone-backups.')]
+            return [('title', 'Restore'), ('text', 'Backups found on the box and the drives, newest first. The box '
+                                                   'restarts to finish; the settings as they are now are kept on the '
+                                                   'box first.')]
+        if key == 'reset':
+            return [('title', 'Reset'), ('text', 'Back to how it was after installing. The settings as they are '
+                                                 'now are first backed up onto the box (Restore can bring them '
+                                                 'back). The box restarts to do it. The programs and their updates '
+                                                 'stay.')]
+        return []
+
+    def after(self):
+        """What comes below the rows"""
+        key = SECTIONS[self.section][0]
+        out = []
+        if self.job:
+            return out
+        if key == 'updates' and self.checked and not self.restart:
+            b = self.checked['box']
+            if b.get('state') == 'new':
+                out.append(('title', 'New in the box software'))
+                for c in b['commits'][:15]:
+                    out.append(('text', '•  ' + c['title']))
+                if len(b['commits']) > 15:
+                    out.append(('text', '…and %d more' % (len(b['commits']) - 15)))
+            pkgs = self.checked['debian'].get('packages', [])
+            if pkgs:
+                out.append(('title', 'Debian packages'))
+                names = ', '.join(p['name'] for p in pkgs[:40])
+                out.append(('mono', names + (' and %d more' % (len(pkgs) - 40) if len(pkgs) > 40 else '')))
+        return out
+
+    # -- drawing
+
+    def render(self):
+        for i, box in enumerate(self.section_rows):
+            classes(box, 'current', on=i == self.section)
+            classes(box, 'chosen', on=i == self.section and self.focus == 'sections')
+        for w in self.content.get_children():
+            self.content.remove(w)
+        for cls, text in self.info():
+            self.content.pack_start(label(text, cls, wrap=True, max_width_chars=90), False, False, 0)
+        self.current_rows = self.rows()
+        if self.current_rows:   # none while working: the choice stays for afterwards
+            self.chosen = min(self.chosen, len(self.current_rows) - 1)
+        if self.current_rows:
+            self.content.pack_start(Gtk.Box(height_request=6), False, False, 0)
+        for i, r in enumerate(self.current_rows):
+            ev = Gtk.EventBox(visible_window=False)
+            box = Gtk.Box(spacing=10)
+            classes(box, 'row')
+            classes(box, 'chosen', on=self.focus == 'rows' and i == self.chosen)
+            classes(box, 'armed', on=self.armed == (r.key, 'do') and i == self.chosen)
+            box.pack_start(label(r.icon, 'ricon', yalign=0), False, False, 0)
+            texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            title = r.title
+            if self.armed and self.armed[0] == r.key and i == self.chosen:
+                title = {'do': 'Press OK again to %s' % self.confirm_text(r.key),
+                         'delete': 'Press blue again to delete this backup'}[self.armed[1]]
+            texts.pack_start(label(title, 'rtitle', wrap=True), False, False, 0)
+            if r.sub:
+                texts.pack_start(label(r.sub, 'sub', wrap=True, max_width_chars=95), False, False, 0)
+            box.pack_start(texts, True, True, 0)
+            if r.options:
+                box.pack_start(label('', 'arrows'), False, False, 0)
+                box.pack_start(label(r.options[r.value], 'rtitle'), False, False, 0)
+                box.pack_start(label('', 'arrows'), False, False, 0)
+            ev.add(box)
+            ev.connect('button-press-event', lambda w, e, i=i: self.click_row(i, e))
+            self.content.pack_start(ev, False, False, 0)
+        if self.message[1]:
+            self.content.pack_start(label(self.message[1], self.message[0], wrap=True, max_width_chars=90,
+                                          margin_top=8), False, False, 0)
+        if self.job:
+            self.content.pack_start(label(self.job['title'], 'title'), False, False, 0)
+            self.bar = Gtk.ProgressBar(margin_top=6, margin_bottom=6)
+            self.content.pack_start(self.bar, False, False, 0)
+            self.job_text = label(self.job.get('text', ''), 'text', ellipsize=Pango.EllipsizeMode.MIDDLE)
+            self.content.pack_start(self.job_text, False, False, 0)
+            self.set_progress(self.job.get('frac', -1), self.job.get('text', ''))
+        if self.lines:
+            self.content.pack_start(Gtk.Box(height_request=8), False, False, 0)
+            for cls, text in self.lines[-14:]:
+                self.content.pack_start(label(text, cls, wrap=True, max_width_chars=100, selectable=False),
+                                        False, False, 0)
+        for cls, text in self.after():
+            self.content.pack_start(label(text, cls, wrap=True, max_width_chars=95,
+                                          margin_top=10 if cls == 'title' else 0), False, False, 0)
+        self.content.show_all()
+        self.render_hints()
+
+    def confirm_text(self, key):
+        return {'reset-settings': 'reset the settings: the box restarts',
+                'reset-all': 'ERASE EVERYTHING: the box restarts',
+                'install': 'install the updates'}.get(key, 'restore it: the box restarts')
+
+    def render_hints(self):
+        if self.job:
+            pairs = [('exit', 'stop it')] if self.job.get('stoppable') else [('', 'Working: please wait, it can\'t be '
+                                                                               'stopped halfway')]
+        elif self.focus == 'sections':
+            pairs = [('↑ ↓', 'section'), ('→ OK', 'into it'), ('exit', 'close')]
+        else:
+            r = self.current_rows[self.chosen] if self.current_rows else None
+            pairs = [('↑ ↓', 'choose'), ('← →', 'change') if r and r.options else ('OK', 'do it')]
+            if SECTIONS[self.section][0] == 'restore' and self.current_rows:
+                pairs.append(('blue', 'delete the backup'))
+            if not (r and r.options) and not self.restart:
+                pairs.append(('←', 'the sections'))
+            pairs.append(('exit', 'close' if self.restart else 'back'))
+        self.hints.set_markup(hint_markup(pairs))
+
+    def set_progress(self, frac, text):
+        if not self.job:
+            return
+        self.job['frac'], self.job['text'] = frac, text
+        if frac < 0:
+            self.bar.pulse()
+        else:
+            self.bar.set_fraction(frac)
+        self.job_text.set_text(text)
+
+    def tick(self):
+        if self.job and self.job.get('frac', 0) < 0:
+            self.bar.pulse()
+        elif not self.job and SECTIONS[self.section][0] in ('backup', 'restore') and self.focus == 'sections':
+            self.render()   # drives come and go
+        return True
+
+    # -- doing things
+
+    def say(self, cls, text):
+        self.lines.append((cls, text))
+
+    def run_jobs(self, jobs, done=None):
+        """jobs: [(title, argv, stoppable)] run one after another as root; the window shows their
+        progress"""
+        self.lines = []
+        self.message = ('', '')
+        self.armed = None
+
+        def worker():
+            restart = None
+            ok = True
+            for title, argv, stoppable in jobs:
+                GLib.idle_add(self.start_job, title, stoppable)
+                p = subprocess.Popen(['sudo', '-n', SELF, 'root'] + argv, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, text=True, start_new_session=True)
+                self.job['proc'] = p
+                error = ''
+                for line in p.stdout:
+                    w = line.rstrip('\n').split(' ', 2)
+                    if w[0] == 'progress' and len(w) >= 2:
+                        GLib.idle_add(self.set_progress, float(w[1]), w[2] if len(w) > 2 else '')
+                    elif w[0] in ('log', 'warn'):
+                        text = line.rstrip('\n').split(' ', 1)[1] if ' ' in line.strip() else ''
+                        GLib.idle_add(self.say, 'warn' if w[0] == 'warn' else 'mono', text)
+                    elif w[0] == 'restart' and len(w) > 1:
+                        restart = 'reboot' if 'reboot' in (restart, w[1]) else w[1]
+                    elif w[0] == 'error':
+                        error = line.rstrip('\n')[6:]
+                p.wait()
+                err = p.stderr.read().strip()
+                if p.returncode != 0:
+                    if self.job and self.job.get('stopped'):
+                        GLib.idle_add(self.say, 'warn', 'Stopped.')
+                    else:
+                        GLib.idle_add(self.say, 'bad', error or (err.splitlines() or ['failed'])[-1])
+                    ok = False
+                    break
+                GLib.idle_add(self.say, 'good', '  ' + title)
+            GLib.idle_add(self.jobs_done, ok, restart, done)
+        self.job = {'title': '', 'stoppable': False}
+        threading.Thread(target=worker, daemon=True).start()
+
+    def start_job(self, title, stoppable):
+        proc = self.job.get('proc') if self.job else None
+        self.job = {'title': title, 'stoppable': stoppable, 'frac': -1, 'text': '', 'proc': proc}
+        self.render()
+
+    def jobs_done(self, ok, restart, done):
+        self.job = None
+        if done:
+            done(ok)
+        if ok and restart:
+            self.restart = restart
+            self.chosen = 0
+        self.focus = 'rows'
+        self.render()
+
+    def stop_job(self):
+        p = self.job.get('proc') if self.job else None
+        if p and p.poll() is None:
+            self.job['stopped'] = True
+            # sudo passes the signal on to the worker, which leaves no half-made file behind it
+            subprocess.call(['sudo', '-n', 'pkill', '-TERM', '-s', str(os.getpgid(p.pid))])
+
+    def check(self):
+        if self.checking:
+            return
+        self.checking = True
+        self.render()
+
+        def work():
+            try:
+                r = check_all()
+            except Exception as e:
+                r = None
+                GLib.idle_add(self.say, 'bad', 'Could not look for updates: %s' % e)
+            GLib.idle_add(self.checked_done, r)
+        threading.Thread(target=work, daemon=True).start()
+
+    def checked_done(self, r):
+        self.checking = False
+        if r:
+            self.checked = r
+        self.render()
+
+    def install(self):
+        r = self.checked
+        jobs = []
+        if self.backup_first and native():
+            jobs.append(('Backing up the whole system onto the box', ['backup-system', box_backups(),
+                                                                      'before the updates'], True))
+        if r['debian'].get('packages'):
+            jobs.append(('Updating Debian (%d packages)' % len(r['debian']['packages']), ['apt-upgrade'], False))
+        if r['ytdlp'].get('new'):
+            jobs.append(('Updating yt-dlp', ['ytdlp'], False))
+        if r['box'].get('state') == 'new':
+            jobs.append(('Updating the box software', ['update', r['box']['sha'], r['box']['date'], self.user], False))
+
+        def done(ok):
+            if ok:
+                self.checked = None
+                try:
+                    os.unlink(CHECKED)
+                except OSError:
+                    pass
+                GLib.timeout_add_seconds(1, lambda: self.check() and False)
+        self.run_jobs(jobs, done)
+
+    def activate(self):
+        if not self.current_rows:
+            return
+        r = self.current_rows[self.chosen]
+        key = r.key
+        if r.options:
+            self.change(1)
+            return
+        if key == 'reboot':
+            self.status.set_text('restarting…')
+            subprocess.Popen(['sudo', '-n', '/sbin/reboot'])
+            return
+        if key == 'desktop':
+            subprocess.Popen(['bspc', 'quit'])
+            return
+        if key == 'later':
+            self.restart = None
+            self.lines = []
+            self.render()
+            return
+        if key == 'check':
+            self.lines = []
+            self.check()
+            return
+        needs_confirm = key in ('install', 'reset-settings', 'reset-all') or SECTIONS[self.section][0] == 'restore'
+        if needs_confirm and self.armed != (key, 'do'):
+            self.armed = (key, 'do')
+            self.render()
+            return
+        self.armed = None
+        if key == 'install':
+            self.install()
+        elif key == 'settings':
+            self.run_jobs([('Backing up the settings', ['backup-settings', places()[self.place][0], self.user], True)])
+        elif key == 'system':
+            self.run_jobs([('Backing up the whole system', ['backup-system', places()[self.place][0]], True)])
+        elif key in ('reset-settings', 'reset-all'):
+            self.run_jobs([('Getting ready to reset', ['reset', key[6:], self.user], False)], self.reboot_after)
+        elif SECTIONS[self.section][0] == 'restore':
+            what = 'the whole system' if key.endswith('.zst') else 'the settings'
+            self.run_jobs([('Restoring %s' % what, ['restore', key, self.user], False)], self.reboot_after)
+
+    def reboot_after(self, ok):
+        if ok:
+            self.say('warn', 'The box restarts in 5 seconds…')
+            GLib.timeout_add_seconds(5, lambda: subprocess.Popen(['sudo', '-n', '/sbin/reboot']) and False)
+
+    def change(self, n):
+        r = self.current_rows[self.chosen] if self.current_rows else None
+        if not r or not r.options:
+            return
+        if r.key == 'first':
+            self.backup_first = not self.backup_first
+        elif r.key == 'place':
+            self.place = (self.place + n) % len(r.options)
+            self.message = ('', '')
+        self.render()
+
+    def delete_backup(self):
+        r = self.current_rows[self.chosen] if self.current_rows else None
+        if not r or SECTIONS[self.section][0] != 'restore':
+            return
+        if self.armed != (r.key, 'delete'):
+            self.armed = (r.key, 'delete')
+            self.render()
+            return
+        self.armed = None
+        self.run_jobs([('Deleting the backup', ['delete', r.key], False)])
+
+    # -- input
+
+    def click_section(self, i):
+        if self.job:
+            return
+        self.section, self.focus, self.chosen, self.armed = i, 'rows', 0, None
+        self.lines, self.message = [], ('', '')
+        self.render()
+
+    def click_row(self, i, ev):
+        if self.job or ev.type != Gdk.EventType.BUTTON_PRESS:
+            return
+        self.focus = 'rows'
+        if self.chosen != i:
+            self.armed = None
+        self.chosen = i
+        if self.current_rows and self.current_rows[i].options:
+            self.change(1 if ev.button == 1 else -1)
+        else:
+            self.activate()
+
+    def on_delete(self, w, ev):
+        if self.job and not self.job.get('stoppable'):
+            return True   # it can't be stopped halfway
+        if self.job:
+            self.stop_job()
+        return False
+
+    def close(self):
+        if self.job:
+            if self.job.get('stoppable'):
+                self.stop_job()
+            return
+        self.win.destroy()
+
+    def on_key(self, w, ev):
+        k = Gdk.keyval_name(ev.keyval)
+        if self.job:
+            if k == 'Escape' and self.job.get('stoppable'):
+                if self.job.get('confirm_stop'):
+                    self.stop_job()
+                else:
+                    self.job['confirm_stop'] = True
+                    self.set_progress(self.job.get('frac', -1), 'press exit again to stop it')
+            return True
+        if k == 'Escape':
+            if self.armed:
+                self.armed = None
+            elif self.focus == 'rows' and not self.restart:
+                self.focus = 'sections'
+            else:
+                self.win.destroy()
+                return True
+            self.render()
+            return True
+        if self.focus == 'sections':
+            if k in ('Up', 'Down'):
+                self.section = (self.section + (1 if k == 'Down' else -1)) % len(SECTIONS)
+                self.chosen, self.armed, self.lines, self.message = 0, None, [], ('', '')
+                if SECTIONS[self.section][0] == 'updates' and not self.checked:
+                    self.check()
+                self.render()
+            elif k in ('Right', 'Return', 'KP_Enter', 'Tab'):
+                self.focus = 'rows'
+                self.render()
+            return True
+        r = self.current_rows[self.chosen] if self.current_rows else None
+        if k in ('Up', 'Down'):
+            if self.current_rows:
+                self.chosen = (self.chosen + (1 if k == 'Down' else -1)) % len(self.current_rows)
+            self.armed = None
+            self.render()
+        elif k in ('Left', 'Right') and r and r.options:
+            self.change(1 if k == 'Right' else -1)
+        elif k in ('Left', 'ISO_Left_Tab', 'BackSpace') and not self.restart:
+            self.focus = 'sections'
+            self.armed = None
+            self.render()
+        elif k in ('Return', 'KP_Enter', 'space'):
+            self.activate()
+        elif k in BLUE:
+            self.delete_backup()
+        return True
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ['root']:
+        root_main(args[1:])
+        return
+    if args[:1] == ['check']:
+        check_service()
+        return
+    section = args[0] if args else 'updates'
+    setup_gtk()
+    GLib.set_prgname('ozone-system')
+    Window(section)
+    Gtk.main()
+
+
+if __name__ == '__main__':
+    main()

@@ -19,6 +19,8 @@ ozone-dlna renderer &
 pgrep -f "^/usr/bin/python3 /usr/local/bin/ozone-bluetooth agen[t]" > /dev/null || ozone-bluetooth agent &
 # the calendar's reminders, waking the screen from sleep
 pgrep -f "^/usr/bin/python3 /usr/local/bin/ozone-calendar reminder[s]" > /dev/null || ozone-calendar reminders &
+# updates: looks once a day, and says on the panel when there are some
+pgrep -f "^/usr/bin/python3 /usr/local/bin/ozone-system chec[k]" > /dev/null || ozone-system check &
 
 bspc monitor -d 1 2 3 4 5
 

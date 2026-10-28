@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Backup and reset
+Comment=Back up the settings or the whole system to a USB drive, restore them, reset to how it was installed
+Exec=ozone-system backup
+Icon=document-save
+Terminal=false
+Categories=System;Settings;

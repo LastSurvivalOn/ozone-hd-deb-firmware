@@ -106,9 +106,10 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
   chapters. Starting a video also takes ~10 s.
 - [ ] **Medium**: settings in the interface: sound, screen, network, language in one place.
 - [ ] **Medium**: the interface in Ukrainian (Android's is uk-UA; ours is English).
-- [ ] **Medium**: backup / restore of the system and settings, and a "factory reset", from the box
-  itself. Now only the laptop scripts.
-- [ ] **Medium**: updates from the box (apt and our scripts), in place of Android's OTA.
+- [x] **Medium**: backup / restore of the system and settings, and a "factory reset", from the box
+  itself: "Backup and reset" (`ozone-system`), to a drive or the box.
+- [x] **Medium**: updates from the box (apt and our scripts), in place of Android's OTA: "Updates"
+  (`ozone-system`, `update.py`): Debian, yt-dlp and the scripts from GitHub, once a day.
 - [ ] **Medium**: a TV-style home screen with tiles (Android's DTVLauncher); now rofi and the panel.
 - [x] **Hard**: GPU acceleration (Mali-450) for X: OpenGL ES 2.0 for games, mpv and code of
   one's own (`install-gpu.sh`, `install-games.sh`, [gpu/README.md](gpu/README.md)).

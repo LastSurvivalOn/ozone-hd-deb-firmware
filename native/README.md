@@ -611,3 +611,49 @@ colours, JetBrains Mono, spaces, the terminal is `ozone-terminal -e`, as Debian'
 scheme and `geany.css` (Geany's message colours are dark red and blue). Debian has no `python`:
 `filedefs/filetypes.python` builds and runs with python3. Files opens text and code in it (`TEXT` in
 ozone-files), and `mimeapps.list` makes it the default for text. A small C file builds in 0.3 s.
+
+## Updates, backups, the reset
+
+`ozone-system` (GTK) is the window; `ozone-system root …` (through `sudo -n`) does the work and
+prints its progress (`progress FRACTION TEXT`, `log`, `warn`, `restart reboot|desktop`, `error`).
+- **Updates**: `apt-get update` and a simulated `upgrade` list the packages; installing runs
+  `apt-get upgrade --no-install-recommends` with `--force-confold` and `APT::Status-Fd` for the
+  progress, and checks that `/sbin/init` is still sysvinit's before and after. yt-dlp is
+  compared with its latest GitHub release and updated with `-U`. The box software: GitHub's
+  compare API between `/etc/ozone/commit` (written by install-desktop.sh and by updates) and
+  `main`; a commit GitHub hasn't got (installed from a computer before pushing) gets no update.
+  The update downloads the commit's tarball from codeload and runs its `native/update.py` as root
+  (below). `ozone-system check` (bspwmrc) does all that once a day and writes
+  `~/.cache/ozone-system/updates.json`.
+- `update.py`: replaces each `rootfs/` file the box has that differs; a new file is installed when
+  the part of the system it belongs to is (the install script that names it, by a file only that
+  script installs; install-desktop.sh's and prepare-debian.sh's always). The user's files: replaced
+  only if they are still a version of ours, by sha256 (`/var/lib/ozone/dotfiles.sha256`, and the
+  versions in git history that install-desktop.sh sends); a copy of ours is kept in
+  `/usr/local/share/ozone/dotfiles`. It installs the packages the installed parts' install
+  scripts name (their `apt-get install` lines) and rebuilds amplay when the hash of its sources
+  differs (`/var/lib/ozone/amplay.sha256`). What only a computer builds (kernel modules, btusb,
+  dtvfe, wireguard-go, WebKit, wpa_supplicant-p2p) it only reports, when its sources' hash
+  changes. install-desktop.sh puts the user's files through it too (`--dotfiles-only`), so it no
+  longer overwrites what the user changed.
+- **Backups**: the settings with Python's tarfile (`home/` for the hidden entries of the home
+  folder but `.cache`, `root/` for the system's settings files), 8.6 MB here in 14 s. The whole
+  system: `tar --one-file-system --xattrs --numeric-owner` of `/` (without the mount points' contents
+  and `/system`, which is a bind mount of the same filesystem) into `zstd -1 -T4`: 1.43 GB into
+  567 MB in 2.5 min; NAND reads limit it (gzip -1, one thread, managed 6.5 MB/s).
+- **Restoring the whole system**: a new sparse `debian.img.new` the size of the old one, mke2fs'd
+  with the running root's features (`-O none,…` from dumpe2fs: the stock kernel's ext4, no
+  `flex_bg` or `metadata_csum`), mounted on a free loop device, the archive extracted into it,
+  checked (`/sbin/init`, `/etc/inittab`, the modules, `e2fsck -f -n`), then renamed over
+  `debian.img`. The running system keeps the old inode through loop0 until the restart; the
+  initramfs then mounts the new file, and the data partition's mount frees the old one. 8 min
+  here, written to NAND; it needs free space about the size of the system.
+- **Restoring settings and the reset** leave `/var/lib/ozone/pending.json` (with the archive
+  copied next to it) and restart; `/etc/init.d/ozone-system` (S01, before WiFi, Bluetooth and the
+  drives) runs `ozone-system root pending` once (renamed to `.done` first). The archive's members
+  are written only below the home folder or into the list of settings files, and never through a
+  symbolic link. The reset deletes the hidden entries of the home folder but `.ssh` (and with
+  "everything" the rest of it and the TV recordings), copies `/etc/skel` and our dotfiles back,
+  deletes the settings files (the tools fall back to their defaults) and the Bluetooth pairings,
+  sets Europe/Kyiv and runs `net-apply proxy` and `sound-config`. Both first back up the settings
+  onto the box (`auto`, the last four kept).
