@@ -497,13 +497,10 @@ class Agent:
         elif not ad.get('Powered'):
             text = '%%{F#6c7086}%s%%{F-}' % ICON
         else:
-            on = [name_of(d) for p, d in devices(objs, ad_path) if d.get('Connected')]
-            if not on:
-                text = '%%{F#a6adc8}%s%%{F-}' % ICON
-            elif len(on) == 1:
-                text = '%%{F#89b4fa}%s%%{F-} %s' % (ICON, on[0] if len(on[0]) <= 12 else on[0][:11] + '…')
-            else:
-                text = '%%{F#89b4fa}%s%%{F-} %d' % (ICON, len(on))
+            # the icon alone, blue while something is connected: the panel is full (a name pushed
+            # its close and power buttons off the screen); the names are in the menu
+            on = any(d.get('Connected') for p, d in devices(objs, ad_path))
+            text = '%%{F%s}%s%%{F-}' % ('#89b4fa' if on else '#a6adc8', ICON)
         try:
             os.makedirs(os.path.dirname(PANEL_FILE), exist_ok=True)
             with open(PANEL_FILE, 'w') as f:

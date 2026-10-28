@@ -206,7 +206,9 @@ firmware loading this btusb doesn't have.
   (`rofi -e`), yes/no questions in rofi, one at a time (a new one, or BlueZ's Cancel, closes the
   last). It closes the screensaver first and resets X's idle time: the screensaver's grab kept rofi
   from the keyboard, and rofi gave up, which refused the pairing. It also keeps the panel's
-  `bluetooth` module (`~/.cache/ozone-bluetooth.panel`, a polybar hook).
+  `bluetooth` module (`~/.cache/ozone-bluetooth.panel`, a polybar hook): the icon alone, as the
+  panel is full and what doesn't fit goes off its right end (a device's name there took the close
+  and power buttons with it).
 
 Tested here with the laptop (BlueZ, PipeWire) both ways: the box paired from the menu (no question,
 as with headphones) and by the laptop (the code confirmed on the TV), the box's sound in the

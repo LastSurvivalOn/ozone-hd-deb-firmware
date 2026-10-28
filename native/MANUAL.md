@@ -94,16 +94,15 @@ The panel is the bar along the top of the screen. From left to right:
 | Screen icon | television (section 6) |
 | 1 2 3 4 5 | workspaces (section 3). The current one is highlighted; the ones with windows are coloured. |
 | yellow text | short messages: "Loading video…", "Scan finished", errors. They disappear after 6 s. |
-| centre | the title of the active window. Click it for a list of the open windows, to switch to one. |
+| title, ✕ | the active window's title (shortened) and its close button: a click on the title lists the open windows, to switch to one; ✕ closes this window (on the remote: **home** lists the windows, **exit** closes one) |
 | pointer and keyboard icons | the remote's mouse mode and the on-screen keyboard (section 10): green when on, a click switches them |
 | drive icon | USB drives, SD cards and network folders (section 11): how many are open; a click gives the list |
-| Bluetooth icon | with a Bluetooth adapter plugged in (section 15): grey when nothing is connected, blue with the name of what is; a click gives the Bluetooth menu |
+| Bluetooth icon | with a Bluetooth adapter plugged in (section 15): grey when nothing is connected, blue when something is; a click gives the Bluetooth menu |
 | CPU %, memory, temperature | system load |
 | IP address | the cable connection (shown only with the cable plugged in). Click it for the Network menu (section 14). |
 | WiFi | the WiFi network the box is on. Click it for the Network menu. It stays grey when not connected. |
 | 🔈 percentage | volume. Click to mute, scroll the wheel over it to change the volume. |
 | date and time | |
-| ✕ | closes the active window |
 | ⏻ | power menu |
 
 A window in full screen (the video player, TV, a full-screen page) covers the panel. To see it
