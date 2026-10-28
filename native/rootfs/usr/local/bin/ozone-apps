@@ -255,6 +255,44 @@ def launchers(pkg):
     return desktops, cmds
 
 
+GL_LIB = re.compile(r'\blib(GL|OpenGL|GLX|GLU|GLEW)\.so')
+USER_APPS = os.path.join(os.environ.get('XDG_DATA_HOME') or os.path.join(HOME, '.local/share'), 'applications')
+
+
+def uses_gl(pkg):
+    """Its programs are linked with desktop OpenGL (most 3D games)"""
+    _desktops, cmds = launchers(pkg)
+    for c in cmds[:8]:
+        r = subprocess.run(['ldd', c], capture_output=True, text=True)
+        if GL_LIB.search(r.stdout):
+            return True
+    return False
+
+
+def gl_launchers(pkg, on):
+    """An OpenGL program's menu entries in the user's applications, started through
+    "ozone-gl --gl" (gl4es on the GPU): written after installing, taken away after removing"""
+    desktops, _cmds = launchers(pkg)
+    for d in desktops:
+        mine = os.path.join(USER_APPS, os.path.basename(d))
+        if not on:
+            try:
+                with open(mine) as f:
+                    ours = 'Exec=ozone-gl --gl ' in f.read()
+            except OSError:
+                ours = False
+            if ours:
+                os.unlink(mine)
+            continue
+        with open(d) as f:
+            text = f.read()
+        text = re.sub(r'^Exec=(?!ozone-gl )', 'Exec=ozone-gl --gl ', text, flags=re.M)
+        os.makedirs(USER_APPS, exist_ok=True)
+        with open(mine + '.tmp', 'w') as f:
+            f.write(text)
+        os.replace(mine + '.tmp', mine)
+
+
 def load_mine():
     try:
         with open(MINE) as f:
@@ -799,6 +837,8 @@ class Window:
         return False
 
     def run_root(self, verb, app):
+        if verb == 'remove':   # its menu entries of ours first: dpkg -L still knows them now
+            gl_launchers(app.pkg, False)
         title = '%s %s' % ('Installing' if verb == 'install' else 'Removing', app.name)
         self.job = {'title': title, 'frac': -1, 'text': ''}
         self.lines = []
@@ -831,6 +871,9 @@ class Window:
         if not error:
             if verb == 'install':
                 mine[app.pkg] = {'pkgs': app.pkgs, 'name': app.name, 'what': app.what, 'when': time.time()}
+                if uses_gl(app.pkg):   # on the GPU through gl4es, from the menu and from here
+                    gl_launchers(app.pkg, True)
+                    mine[app.pkg]['gl'] = True
                 self.lines = [('good', ' %s is installed%s.' % (app.name, ': OK on Open starts it'
                                                                       if self.openable(app) else ''))]
             else:
@@ -850,7 +893,9 @@ class Window:
         desktops, cmds = launchers(app.pkg)
         if self.openable(app) == 'window':
             from gi.repository import Gio
-            info = Gio.DesktopAppInfo.new_from_filename(sorted(desktops, key=len)[0])
+            first = sorted(desktops, key=len)[0]
+            mine = os.path.join(USER_APPS, os.path.basename(first))   # an OpenGL one, through gl4es
+            info = Gio.DesktopAppInfo.new_from_filename(mine if os.path.exists(mine) else first)
             if info:
                 ctx = Gio.AppLaunchContext()
                 ctx.setenv('GTK_THEME', 'Adwaita:dark')   # dark, as the rest of the desktop

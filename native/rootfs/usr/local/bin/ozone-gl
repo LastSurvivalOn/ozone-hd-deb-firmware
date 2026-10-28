@@ -2,10 +2,25 @@
 # Runs a program on the Mali-450 GPU: OpenGL ES 2.0 through EGL on X11 (DRI2 + UMP, see
 # native/gpu). Only when the desktop runs the Mali X driver (/run/ozone-gpu-desktop); otherwise the
 # program runs as it would without this (Mesa in software).
-# Usage: ozone-gl PROGRAM [ARGS]
+# Usage: ozone-gl [--gl] PROGRAM [ARGS]
+#   --gl   for a program made for desktop OpenGL (most 3D games): gl4es (gpu/build-gl4es.sh) turns
+#          its OpenGL 2.1 into the GPU's GLES 2.0; without gl4es it runs on Mesa, in software
 MALI=/usr/local/lib/mali
+GL4ES=/usr/local/lib/gl4es
+gl=
+if [ "$1" = --gl ]; then
+    gl=1
+    shift
+fi
 
 if [ -e /run/ozone-gpu-desktop ] && [ -e $MALI/libMali.so ]; then
+    if [ -n "$gl" ]; then
+        [ -e $GL4ES/libGL.so.1 ] || exec "$@"
+        # gl4es's libGL.so.1 in front of glvnd's; it finds libEGL / libGLESv2 in mali/
+        export LD_LIBRARY_PATH=$GL4ES:$MALI${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+        export LIBGL_ES=2 LIBGL_GL=21 LIBGL_NOBANNER=1
+        exec "$@"
+    fi
     # libEGL.so.1 there is libMali.so with fixes (native/gpu/egl-fix)
     export LD_LIBRARY_PATH=$MALI${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
     # SDL2: GLES through EGL (there is no GLX), and its 2D renderer on the GPU too
