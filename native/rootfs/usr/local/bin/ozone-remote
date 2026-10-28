@@ -345,7 +345,7 @@ DIGITS = {E.KEY_1: 1, E.KEY_2: 2, E.KEY_3: 3, E.KEY_4: 4, E.KEY_5: 5, E.KEY_6: 6
 ARROWS = (E.KEY_UP, E.KEY_DOWN, E.KEY_LEFT, E.KEY_RIGHT)
 # windows where exit means Esc (they handle it); other windows it closes
 ESC_CLASSES = ('ozone-tv', 'ozone-screen', 'ozone-files', 'ozone-equalizer', 'ozone-photos', 'ozone-calendar',
-               'ozone-reminder', 'ozone-system', 'yt')
+               'ozone-reminder', 'ozone-system', 'yt', 'ozone-apps')
 INFO_CLASSES = ('ozone-files', 'ozone-photos')   # info is their own key (a file's details), not the panel
 BACK_CLASSES = ('ozone-web',)   # exit is Back there: the page before, then the tab, then the window
 # a gamepad's buttons as the remote's. BTN_NORTH and BTN_WEST are the top and left buttons by the

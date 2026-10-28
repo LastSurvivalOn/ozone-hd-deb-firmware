@@ -151,8 +151,8 @@ Linux doesn't:
   the panel's message is gone after 6 s.
 - [ ] **Easy**: L2TP / IPsec and PPTP VPN (Android's own VPN types), and a proxy from a PAC file
   (ProxyHandler). Now OpenVPN, WireGuard and a plain proxy address.
-- [ ] **Medium**: a programs manager (Android's package installer and store): install and remove
-  Debian programs from a menu, by name or by kind. Now apt in the terminal.
+- [x] **Medium**: a programs manager (Android's package installer and store): Programs
+  (`ozone-apps`), picked programs by kind, a search of all of Debian, install, open, remove.
 - [ ] **Medium**: text size for the whole interface (Android's "large text" and magnification):
   the menus and windows have fixed sizes, small from a sofa on a big TV.
 - [ ] **Medium**: the calendar synced with Google Calendar or a calendar's ICS address, as

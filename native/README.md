@@ -705,3 +705,27 @@ prints its progress (`progress FRACTION TEXT`, `log`, `warn`, `restart reboot|de
   ozone-math in the background when it is missing. Plots go through gnuplot into the sheet; the
   examples in the manual take 1-2 s each. Both together take about 110 MB of the root
   filesystem.
+
+## Programs
+
+`ozone-apps` (GTK) is a store over apt. Its index is built from apt's own lists
+(`/var/lib/apt/lists/*_Packages.lz4`, read with `apt-helper cat-file`: 48 MB in 0.6 s, parsed in
+10 s, kept in `~/.cache/ozone-apps/index.pickle` until the lists change, then 0.6 s): name, the
+newest version (`apt_pkg.version_compare`, from python3-apt; `apt.Cache` itself took minutes to go
+through 61 000 packages on the box), section, sizes, the short description, the homepage and the
+debtags, which tell windows (`interface::x11`, `uitoolkit::*`) from terminal commands. The lists
+have no long descriptions (no Translation files are fetched). A search leaves out libraries and the
+like by section and by name.
+- Picked programs (`CATALOGUE`): GTK, Qt or SDL without OpenGL (the X desktop has none), small;
+  mupdf (84 MB with its fonts) and the 3D games were left out.
+- Before installing, `apt-get -s install --no-install-recommends` as the user lists what comes
+  with it; their sizes against the free space (plus the download and 40 MB) decide whether it can
+  go. `ozone-apps root install|remove` (sudo -n) runs apt-get with `APT::Status-Fd` for the bar,
+  checks `/sbin/init` before and after, and cleans the archives.
+- Removing (`--autoremove`) is offered only for what was installed here
+  (`~/.local/share/ozone-apps/installed.json`; the root side reads `SUDO_USER`'s copy), and refused
+  when it would take any other package that was installed on purpose (not apt's
+  `Auto-Installed`): the desktop's own packages were all installed by hand, so they stay.
+- Open: the package's `.desktop` file through Gio with `GTK_THEME=Adwaita:dark`, or a command of
+  its in `ozone-terminal` (only for terminal programs, picked ones, or ones installed here).
+- Tested with Mines: 3.7 MB with what it needs, installed, opened, removed, the space back.

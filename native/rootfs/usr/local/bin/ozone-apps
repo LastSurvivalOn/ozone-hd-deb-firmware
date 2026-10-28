@@ -1,0 +1,992 @@
+#!/usr/bin/python3
+"""ozone-apps: Programs, a store of Debian's programs for the remote: picked ones by kind, a search
+of all of Debian, installing, opening and removing.
+
+  ozone-apps                    the window
+  ozone-apps root install PKG...   (sudo -n) apt-get install, its progress on stdout
+  ozone-apps root remove PKG...    (sudo -n) apt-get remove --autoremove
+
+The picked programs (CATALOGUE) are ones that suit the box: a window of GTK, Qt or SDL without
+OpenGL (the desktop has none: the GPU is GLES only, through ozone-gl), small enough for its 2 GB
+system disk. The search reads apt's own package lists (/var/lib/apt/lists, lz4: apt-helper
+cat-file), indexed once per update into ~/.cache/ozone-apps; their debtags tell windows from
+terminal commands, and libraries are left out.
+
+Before installing it works out (apt-get -s) what comes with it and how much space that takes, and
+refuses if the disk hasn't got it. Everything goes with --no-install-recommends, and /sbin/init is
+checked after (apt could trade sysvinit for systemd, which doesn't start on this kernel). Removing
+takes the program and what only it needed; never anything else installed on purpose (the system's
+own programs): then it says what still needs it instead. Only what was installed here can be
+removed here (the root side checks it too), so the desktop's own programs can't be: they are
+"part of the system". What was installed here is listed under "Installed by you"
+(~/.local/share/ozone-apps/installed.json).
+"""
+import glob
+import json
+import os
+import pickle
+import re
+import subprocess
+import sys
+import threading
+import time
+
+SELF = '/usr/local/bin/ozone-apps'
+LISTS = '/var/lib/apt/lists'
+HOME = os.path.expanduser('~')
+CACHE = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.join(HOME, '.cache'), 'ozone-apps')
+INDEX = os.path.join(CACHE, 'index.pickle')
+DATA = os.path.join(os.environ.get('XDG_DATA_HOME') or os.path.join(HOME, '.local/share'), 'ozone-apps')
+MINE = os.path.join(DATA, 'installed.json')
+MARGIN = 40 << 20        # bytes the disk keeps free after an install
+SEARCH_MAX = 150
+
+# (section key, icon, name, [(packages, name, what it is)]); the first package is the program
+CATALOGUE = [
+    ('games', '', 'Games', [
+        (['aisleriot'], 'Solitaire', 'Over 80 card games: Klondike, FreeCell, Spider…'),
+        (['gnome-mines'], 'Mines', 'Minesweeper'),
+        (['gnome-sudoku'], 'Sudoku', 'Sudoku puzzles of four levels'),
+        (['quadrapassel'], 'Quadrapassel', 'Falling blocks, as Tetris'),
+        (['gnome-chess', 'gnuchess'], 'Chess', 'Chess against the computer (GNU Chess) or a friend'),
+        (['iagno'], 'Reversi', 'Reversi (Othello) against the computer'),
+        (['four-in-a-row'], 'Four in a row', 'Connect four against the computer'),
+        (['gnome-mahjongg'], 'Mahjongg', 'Mahjong solitaire'),
+        (['gnome-2048'], '2048', 'Slide the tiles to 2048'),
+        (['tali'], 'Tali', 'Yahtzee, the dice game'),
+        (['five-or-more'], 'Five or more', 'Lines of five balls of a colour'),
+        (['swell-foop'], 'Swell Foop', 'Clear the board of coloured balls'),
+        (['lightsoff'], 'Lights Off', 'Turn all the lights off'),
+        (['gnome-robots'], 'Robots', 'Escape the robots'),
+        (['gnome-klotski'], 'Klotski', 'Slide the blocks out'),
+        (['gnome-tetravex'], 'Tetravex', 'Match the edges of the tiles'),
+        (['hitori'], 'Hitori', 'A logic puzzle of numbers'),
+        (['atomix'], 'Atomix', 'Build molecules out of atoms'),
+        (['gnubg'], 'Backgammon', 'GNU Backgammon, a strong opponent'),
+        (['lbreakout2'], 'LBreakout2', 'Breakout: the ball, the bat and the bricks'),
+        (['frozen-bubble'], 'Frozen Bubble', 'Shoot the coloured bubbles'),
+        (['freeciv-client-gtk3', 'freeciv-server'], 'Freeciv', 'Civilization: build an empire'),
+        (['pychess'], 'PyChess', 'Chess with lessons, puzzles and online play'),
+    ]),
+    ('learning', '', 'Learning', [
+        (['tuxmath'], 'Tux Math', 'Arithmetic for children, as a space game'),
+        (['tuxtype'], 'Tux Typing', 'Typing for children, as a game'),
+        (['gtypist'], 'GNU Typist', 'Touch typing lessons (in the terminal)'),
+        (['thonny'], 'Thonny', 'Python for beginners: write, run and follow a program step by step'),
+        (['gperiodic'], 'Periodic table', 'The elements and their properties'),
+        (['wxmaxima', 'maxima', 'maxima-share'], 'Maths (Maxima)', 'Integrals, equations, plots'),
+        (['qalculate-gtk'], 'Calculator', 'Qalculate!: units, currencies, functions'),
+    ]),
+    ('internet', '', 'Internet', [
+        (['transmission-gtk'], 'Transmission', 'Download torrents'),
+        (['uget'], 'uGet', 'A download manager: pause, resume, many at once'),
+        (['filezilla'], 'FileZilla', 'Files to and from FTP and SFTP servers'),
+        (['hexchat'], 'HexChat', 'IRC chat'),
+        (['pidgin'], 'Pidgin', 'Chat over XMPP, IRC and more'),
+        (['remmina', 'remmina-plugin-rdp', 'remmina-plugin-vnc'], 'Remmina',
+         'Use a computer from the box: Windows remote desktop, VNC'),
+        (['x11vnc'], 'x11vnc', 'Show and control the box\'s screen from a computer (VNC; a terminal command)'),
+    ]),
+    ('media', '', 'Music and video', [
+        (['audacious'], 'Audacious', 'A music player with playlists'),
+        (['goodvibes'], 'Goodvibes', 'Internet radio stations'),
+        (['gpodder'], 'gPodder', 'Podcasts: subscribe and download'),
+        (['easytag'], 'EasyTAG', 'The tags of music files'),
+        (['cmus'], 'cmus', 'A music player in the terminal'),
+    ]),
+    ('graphics', '', 'Graphics', [
+        (['mtpaint'], 'mtPaint', 'Painting and pixel art'),
+        (['drawing'], 'Drawing', 'A simple drawing program'),
+        (['gimp'], 'GIMP', 'Photo editing (large)'),
+    ]),
+    ('office', '', 'Office and reading', [
+        (['abiword'], 'AbiWord', 'A word processor: opens Word documents'),
+        (['gnumeric'], 'Gnumeric', 'Spreadsheets: opens Excel files'),
+        (['evince'], 'Document viewer', 'PDF, DjVu, comics'),
+        (['foliate'], 'Foliate', 'E-books: EPUB, MOBI, FB2'),
+        (['xournalpp'], 'Xournal++', 'Notes and drawing, and writing on PDFs'),
+    ]),
+    ('code', '', 'Programming', [
+        (['git'], 'Git', 'Version control (a terminal command)'),
+        (['meld'], 'Meld', 'Compare files and folders'),
+        (['ghex'], 'GHex', 'A hex editor'),
+        (['sqlitebrowser'], 'DB Browser for SQLite', 'SQLite databases'),
+        (['vim-gtk3'], 'Vim', 'The editor, with a window'),
+        (['python3-pip', 'python3-venv'], 'pip', 'Python packages from PyPI (a terminal command)'),
+        (['minicom'], 'Minicom', 'Serial ports, for boards like Arduino (a terminal command)'),
+    ]),
+    ('tools', '', 'Tools', [
+        (['baobab'], 'Disk usage', 'What takes the space on a drive'),
+        (['file-roller'], 'Archives', 'Zip, 7z, tar, rar: open and make them'),
+        (['catfish'], 'Catfish', 'Find files by name'),
+        (['keepassxc'], 'KeePassXC', 'Passwords, kept encrypted'),
+        (['gucharmap'], 'Characters', 'Every character of every font'),
+        (['mc'], 'Midnight Commander', 'Two panes of files in the terminal'),
+        (['ncdu'], 'ncdu', 'Disk usage in the terminal'),
+        (['neofetch'], 'neofetch', 'The system at a glance, in the terminal'),
+    ]),
+]
+EXTRA_SECTIONS = [('search', '', 'Search all of Debian'), ('mine', '', 'Installed by you')]
+# packages a search doesn't show: libraries, headers, debug symbols, documentation, fonts…
+HIDDEN_SECTIONS = {'libs', 'libdevel', 'oldlibs', 'debug', 'doc', 'fonts', 'kernel', 'localization', 'metapackages',
+                   'introspection', 'httpd', 'otherosfs', 'zope', 'cli-mono', 'java', 'ocaml', 'haskell', 'rust',
+                   'golang', 'javascript', 'perl', 'python', 'ruby', 'php', 'lisp', 'raku', 'tasks'}
+HIDDEN_NAME = re.compile(r'^(lib|golang-|node-|ruby-|php-|r-cran-|r-bioc-|haskell-|elpa-|fonts-|texlive-|'
+                         r'gir1\.2-|python3-(?!pip|venv)|linux-)|(-dev|-dbg|-dbgsym|-doc|-data|-common|-dbgsym)$')
+
+
+def human(n):
+    n = float(n)
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if n < 1024 or unit == 'GB':
+            return ('%.0f %s' if unit in ('B', 'KB') or n >= 100 else '%.1f %s') % (n, unit)
+        n /= 1024
+
+
+def free_bytes(path='/'):
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize
+
+
+# ---- what Debian has ------------------------------------------------------------------------------
+
+def list_files():
+    return sorted(f for f in glob.glob(os.path.join(LISTS, '*_Packages*')) if not f.endswith('.diff_Index'))
+
+
+def build_index():
+    """{name: (version, section, installed KB, download B, summary, homepage, tags)}, the newest
+    version of each across the lists"""
+    import apt_pkg
+    apt_pkg.init_system()
+    out = {}
+    for path in list_files():
+        raw = subprocess.run(['/usr/lib/apt/apt-helper', 'cat-file', path], capture_output=True).stdout
+        for stanza in raw.decode('utf-8', 'replace').split('\n\n'):
+            f = {}
+            for line in stanza.split('\n'):
+                if line[:1] in (' ', '\t') or ':' not in line:
+                    continue
+                k, v = line.split(':', 1)
+                if k in ('Package', 'Version', 'Section', 'Installed-Size', 'Size', 'Description', 'Homepage', 'Tag'):
+                    f[k] = v.strip()
+            name = f.get('Package')
+            if not name:
+                continue
+            old = out.get(name)
+            if old and apt_pkg.version_compare(old[0], f.get('Version', '')) >= 0:
+                continue
+            section = f.get('Section', '').split('/')[-1]
+            out[name] = (f.get('Version', ''), section, int(f.get('Installed-Size') or 0), int(f.get('Size') or 0),
+                         f.get('Description', ''), f.get('Homepage', ''), f.get('Tag', ''))
+    return out
+
+
+def load_index():
+    stamp = [(f, os.path.getmtime(f), os.path.getsize(f)) for f in list_files()]
+    try:
+        with open(INDEX, 'rb') as f:
+            saved = pickle.load(f)
+        if saved.get('stamp') == stamp:
+            return saved['index']
+    except (OSError, ValueError, EOFError, pickle.UnpicklingError, AttributeError):
+        pass
+    index = build_index()
+    os.makedirs(CACHE, exist_ok=True)
+    with open(INDEX + '.tmp', 'wb') as f:
+        pickle.dump({'stamp': stamp, 'index': index}, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(INDEX + '.tmp', INDEX)
+    return index
+
+
+def installed_packages():
+    """(installed, installed on purpose): from dpkg's status and apt's auto marks"""
+    inst = set()
+    name = None
+    try:
+        with open('/var/lib/dpkg/status') as f:
+            for line in f:
+                if line.startswith('Package: '):
+                    name = line[9:].strip()
+                elif line.startswith('Status: ') and line.rstrip().endswith(' installed') and name:
+                    inst.add(name.split(':')[0])
+    except OSError:
+        pass
+    auto = set()
+    try:
+        with open('/var/lib/apt/extended_states') as f:
+            for stanza in f.read().split('\n\n'):
+                m = re.search(r'^Package: (\S+)', stanza, re.M)
+                if m and re.search(r'^Auto-Installed: 1', stanza, re.M):
+                    auto.add(m.group(1).split(':')[0])
+    except OSError:
+        pass
+    return inst, inst - auto
+
+
+def kind(entry):
+    """'window', 'terminal' or '' from the debtags"""
+    tags = entry[6] if entry else ''
+    if 'interface::x11' in tags or 'uitoolkit::' in tags or 'x11::application' in tags:
+        return 'window'
+    if 'interface::commandline' in tags or 'interface::text-mode' in tags:
+        return 'terminal'
+    return ''
+
+
+def simulate(args):
+    """apt-get -s: [(action, package)]"""
+    r = subprocess.run(['apt-get', '-s', '-q', '--no-install-recommends'] + args, capture_output=True, text=True,
+                       env=dict(os.environ, LC_ALL='C'))
+    out = []
+    for line in r.stdout.splitlines():
+        m = re.match(r'(Inst|Remv) (\S+)', line)
+        if m:
+            out.append((m.group(1), m.group(2).split(':')[0]))
+    return out, r.returncode, (r.stderr.strip().splitlines() or [''])[-1]
+
+
+def launchers(pkg):
+    """The program's .desktop files, and its commands"""
+    r = subprocess.run(['dpkg', '-L', pkg], capture_output=True, text=True)
+    files = r.stdout.splitlines()
+    desktops = [f for f in files if f.startswith('/usr/share/applications/') and f.endswith('.desktop')]
+    cmds = [f for f in files if re.match(r'^/usr/(bin|games)/[^/]+$', f) and os.path.isfile(f)]
+    return desktops, cmds
+
+
+def load_mine():
+    try:
+        with open(MINE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_mine(d):
+    os.makedirs(DATA, exist_ok=True)
+    with open(MINE + '.tmp', 'w') as f:
+        json.dump(d, f, indent=1)
+    os.replace(MINE + '.tmp', MINE)
+
+
+# ---- the work, as root ----------------------------------------------------------------------------
+
+def out(*words):
+    print(' '.join(str(w) for w in words), flush=True)
+
+
+def check_init():
+    r = subprocess.run(['dpkg', '-S', '/sbin/init'], capture_output=True, text=True)
+    if 'sysvinit-core' not in r.stdout:
+        out('error', '/sbin/init is not sysvinit any more: do NOT restart the box; reinstall sysvinit-core first.')
+        sys.exit(1)
+
+
+def apt_run(args):
+    env = dict(os.environ, DEBIAN_FRONTEND='noninteractive', LC_ALL='C')
+    cmd = ['apt-get', '-y', '-q', '--no-install-recommends', '-o', 'APT::Status-Fd=1',
+           '-o', 'Dpkg::Options::=--force-confdef', '-o', 'Dpkg::Options::=--force-confold'] + args
+    p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    last = ''
+    for line in p.stdout:
+        line = line.rstrip()
+        m = re.match(r'(dlstatus|pmstatus):([^:]*):([\d.]+):(.*)', line)
+        if m:
+            pct = float(m.group(3)) / 100
+            out('progress', '%.3f' % (pct * 0.4 if m.group(1) == 'dlstatus' else 0.4 + pct * 0.6), m.group(4))
+        elif line.startswith(('E:', 'W:')):
+            last = line
+            out('log', line)
+    p.wait()
+    return p.returncode, last
+
+
+def root_main(args):
+    if os.geteuid() != 0:
+        out('error', 'needs root (sudo)')
+        sys.exit(1)
+    cmd, pkgs = args[0], args[1:]
+    if not pkgs or not all(re.match(r'^[a-z0-9][a-z0-9+.-]+$', p) for p in pkgs):
+        out('error', 'not package names: %s' % ' '.join(pkgs))
+        sys.exit(1)
+    check_init()
+    if cmd == 'install':
+        code, last = apt_run(['install'] + pkgs)
+    elif cmd == 'remove':
+        # only what was installed here (the user's list), and nothing else installed on purpose goes
+        # with it (the window checked; checked again)
+        user = os.environ.get('SUDO_USER', '')
+        try:
+            import pwd
+            with open(os.path.join(pwd.getpwnam(user).pw_dir, '.local/share/ozone-apps/installed.json')) as f:
+                mine = json.load(f)
+        except (KeyError, OSError, ValueError):
+            mine = {}
+        ours = {p for info in mine.values() for p in info.get('pkgs', [])} | set(mine)
+        if any(p not in ours for p in pkgs):
+            out('error', 'Only programs installed in Programs can be removed here.')
+            sys.exit(1)
+        acts, _rc, _e = simulate(['remove', '--autoremove'] + pkgs)
+        _inst, manual = installed_packages()
+        others = sorted(p for a, p in acts if a == 'Remv' and p in manual and p not in pkgs)
+        if others:
+            out('error', 'Removing it would take %s with it: not removed.' % ', '.join(others[:6]))
+            sys.exit(1)
+        code, last = apt_run(['remove', '--autoremove'] + pkgs)
+    else:
+        out('error', 'unknown: %s' % cmd)
+        sys.exit(1)
+    subprocess.call(['apt-get', 'clean'])
+    check_init()
+    if code != 0:
+        out('error', 'apt-get failed (%d): %s' % (code, last or 'see /var/log/apt/term.log'))
+        sys.exit(1)
+    subprocess.call(['sync'])
+    out('done', '')
+
+
+# ---- the window -----------------------------------------------------------------------------------
+
+CSS = b"""
+* { font-family: "DejaVu Sans"; font-size: 13px; color: #cdd6f4; }
+window, scrolledwindow, viewport { background: #11111b; }
+.header { padding: 10px 16px; }
+.logo { font-family: "FontAwesome"; font-size: 24px; color: #cba6f7; }
+.heading { font-size: 18px; font-weight: bold; }
+.status { color: #7f849c; }
+button.close { font-family: "FontAwesome"; font-size: 16px; background: transparent; border: none;
+               padding: 4px 10px; color: #a6adc8; box-shadow: none; }
+button.close:hover { background: #f38ba8; color: #11111b; }
+.sections { border-right: 1px solid #313244; padding-top: 4px; }
+.section { padding: 9px 16px; border-left: 3px solid transparent; }
+.section.current { background: #1e1e2e; }
+.section.chosen { border-left-color: #cba6f7; background: #313244; }
+.section .icon { font-family: "FontAwesome"; font-size: 15px; color: #cba6f7; min-width: 24px; }
+.section .name { font-size: 14px; font-weight: bold; }
+.content { padding: 12px 22px; }
+.title { font-size: 17px; font-weight: bold; padding-bottom: 2px; }
+.big { font-size: 22px; font-weight: bold; }
+.text { color: #a6adc8; }
+.row { padding: 8px 12px; border-radius: 8px; border: 2px solid transparent; }
+.row.chosen { border-color: #cba6f7; background: #313244; }
+.row.armed { border-color: #f38ba8; }
+.row .rtitle { font-size: 14px; font-weight: bold; }
+.row .sub { color: #7f849c; font-size: 12px; }
+.row .ricon { font-family: "FontAwesome"; font-size: 15px; color: #89b4fa; min-width: 24px; }
+.row .side { color: #7f849c; font-size: 12px; }
+.row .have { color: #a6e3a1; font-size: 12px; }
+.good { color: #a6e3a1; }
+.warn { color: #f9e2af; }
+.bad { color: #f38ba8; }
+.mono { font-family: "JetBrains Mono"; font-size: 12px; color: #a6adc8; }
+entry { background: #1e1e2e; border: 1px solid #45475a; border-radius: 6px; padding: 6px 10px;
+        caret-color: #cba6f7; font-size: 15px; }
+progressbar trough { min-height: 10px; background: #313244; border: none; border-radius: 5px; }
+progressbar progress { min-height: 10px; background: #89b4fa; border: none; border-radius: 5px; }
+.hints { background: #181825; padding: 8px 16px; color: #a6adc8; }
+"""
+BLUE = ('Launch4', 'Delete')
+
+
+def setup_gtk():
+    global Gdk, GLib, Gtk, Pango
+    import gi
+    gi.require_version('Gtk', '3.0')
+    gi.require_version('Gdk', '3.0')
+    from gi.repository import Gdk, GLib, Gtk, Pango
+    # GTK's CSS parser loses the first number of the first stylesheet to a stale errno (see yt)
+    try:
+        Gtk.CssProvider().load_from_data(b'* { padding: 0px; }')
+    except GLib.Error:
+        pass
+    style = Gtk.CssProvider()
+    style.load_from_data(CSS)
+    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), style,
+                                             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+
+def label(text='', cls=None, **kw):
+    kw.setdefault('xalign', 0)
+    w = Gtk.Label(label=text, **kw)
+    for c in (cls or '').split():
+        w.get_style_context().add_class(c)
+    return w
+
+
+def classes(widget, *names, on=True):
+    ctx = widget.get_style_context()
+    for n in names:
+        (ctx.add_class if on else ctx.remove_class)(n)
+
+
+def hint_markup(pairs):
+    colours = {'blue': '#89b4fa', 'green': '#a6e3a1'}
+    parts = []
+    for keys, what in pairs:
+        k = GLib.markup_escape_text(keys)
+        for name, c in colours.items():
+            k = k.replace(name, '<span foreground="%s">●</span> %s' % (c, name))
+        parts.append('<b>%s</b>  %s' % (k, GLib.markup_escape_text(what)))
+    return '      '.join(parts)
+
+
+class App:
+    """An entry of the lists: packages, a name, what it is"""
+
+    def __init__(self, pkgs, name, what):
+        self.pkgs, self.name, self.what = pkgs, name, what
+
+    @property
+    def pkg(self):
+        return self.pkgs[0]
+
+
+class Window:
+    def __init__(self):
+        self.sections = [(k, i, n) for k, i, n, _a in CATALOGUE] + EXTRA_SECTIONS
+        self.section = 0
+        self.focus = 'sections'
+        self.chosen = 0
+        self.top = 0             # the first row on the screen
+        self.detail = None       # an App open in the details
+        self.plan = None         # what installing or removing it takes: {'acts', 'size', 'error'}
+        self.armed = None
+        self.job = None
+        self.lines = []
+        self.index = None
+        self.inst, self.manual = installed_packages()
+        self.results = []
+        self.query = ''
+        self.win = Gtk.Window(title='Programs')
+        self.win.set_default_size(1280, 720)
+        self.win.connect('delete-event', lambda *a: bool(self.job))
+        self.win.connect('destroy', Gtk.main_quit)
+        self.win.connect('key-press-event', self.on_key)
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        header = Gtk.Box(spacing=12)
+        classes(header, 'header')
+        header.pack_start(label('', 'logo'), False, False, 0)
+        header.pack_start(label('Programs', 'heading'), False, False, 0)
+        self.status = label('', 'status', ellipsize=Pango.EllipsizeMode.END)
+        header.pack_start(self.status, True, True, 0)
+        close = Gtk.Button(label='', tooltip_text='Close (exit)', can_focus=False)
+        classes(close, 'close')
+        close.connect('clicked', lambda w: self.job or self.win.destroy())
+        header.pack_start(close, False, False, 0)
+        top.pack_start(header, False, False, 0)
+        body = Gtk.Box()
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, width_request=250)
+        classes(side, 'sections')
+        self.section_rows = []
+        for i, (_k, icon, name) in enumerate(self.sections):
+            ev = Gtk.EventBox(visible_window=False)
+            box = Gtk.Box(spacing=10)
+            classes(box, 'section')
+            box.pack_start(label(icon, 'icon', xalign=0.5), False, False, 0)
+            box.pack_start(label(name, 'name'), False, False, 0)
+            ev.add(box)
+            ev.connect('button-press-event', lambda w, e, i=i: self.click_section(i))
+            side.pack_start(ev, False, False, 0)
+            self.section_rows.append(box)
+        body.pack_start(side, False, False, 0)
+        self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        classes(self.content, 'content')
+        body.pack_start(self.content, True, True, 0)
+        top.pack_start(body, True, True, 0)
+        self.hints = label('', 'hints', use_markup=True)
+        top.pack_start(self.hints, False, False, 0)
+        self.win.add(top)
+        self.entry = Gtk.Entry(placeholder_text='A name or a word: chess, paint, radio… (text: keyboard)')
+        self.entry.connect('activate', lambda w: self.search())
+        self.win.show_all()
+        self.status.set_text('reading the list of programs…')
+        self.render()
+        threading.Thread(target=self.load, daemon=True).start()
+
+    def load(self):
+        try:
+            index = load_index()
+        except Exception as e:   # the window still shows the picked programs
+            GLib.idle_add(self.status.set_text, 'could not read the list of programs: %s' % e)
+            return
+        GLib.idle_add(self.loaded, index)
+
+    def loaded(self, index):
+        self.index = index
+        self.status.set_text('%s programs and packages in Debian · %s free on the system disk' % (
+            '{:,}'.format(len(index)).replace(',', ' '), human(free_bytes())))
+        self.render()
+
+    # -- what is shown
+
+    def apps(self):
+        key = self.sections[self.section][0]
+        if key == 'search':
+            return self.results
+        if key == 'mine':
+            mine = load_mine()
+            known = {a.pkg: a for _k, _i, _n, apps in CATALOGUE for a in [App(*x) for x in apps]}
+            out = []
+            for pkg, info in sorted(mine.items(), key=lambda kv: kv[1].get('name', kv[0]).casefold()):
+                if pkg in self.inst:
+                    out.append(known.get(pkg) or App(info.get('pkgs', [pkg]), info.get('name', pkg),
+                                                     info.get('what', '')))
+            return out
+        for k, _i, _n, apps in CATALOGUE:
+            if k == key:
+                found = [App(*a) for a in apps]
+                return [a for a in found if self.index is None or a.pkg in self.index]
+        return []
+
+    def rows_visible(self):
+        return 7 if self.sections[self.section][0] == 'search' else 8   # the search box takes a row
+
+    def render(self):
+        for i, box in enumerate(self.section_rows):
+            classes(box, 'current', on=i == self.section)
+            classes(box, 'chosen', on=i == self.section and self.focus == 'sections')
+        if self.entry.get_parent():
+            self.entry.get_parent().remove(self.entry)
+        for w in self.content.get_children():
+            self.content.remove(w)
+        if self.detail:
+            self.render_detail()
+        else:
+            self.render_list()
+        self.content.show_all()
+        self.render_hints()
+
+    def render_list(self):
+        key, _icon, name = self.sections[self.section]
+        self.content.pack_start(label(name, 'title'), False, False, 0)
+        rows = self.apps()
+        offset = 0
+        if key == 'search':
+            box = Gtk.Box(spacing=10)
+            classes(box, 'row')
+            classes(box, 'chosen', on=self.focus == 'rows' and self.chosen == 0)
+            box.pack_start(label('', 'ricon'), False, False, 0)
+            box.pack_start(self.entry, True, True, 0)
+            self.content.pack_start(box, False, False, 0)
+            offset = 1
+            if self.focus == 'rows' and self.chosen == 0:
+                GLib.idle_add(self.entry.grab_focus_without_selecting)
+            if self.index is None:
+                self.content.pack_start(label('Reading the list of programs…', 'text'), False, False, 0)
+            elif self.query and not rows:
+                self.content.pack_start(label('Nothing found for "%s".' % self.query, 'text'), False, False, 0)
+            elif not self.query:
+                self.content.pack_start(label('Every program in Debian, by its name and what it does. Libraries '
+                                              'are left out. Not all of them suit the box: the picked ones do.',
+                                              'text', wrap=True), False, False, 0)
+        elif key == 'mine' and not rows:
+            self.content.pack_start(label('Nothing yet: what you install here shows up here.', 'text'), False, False, 0)
+        else:
+            if self.focus == 'rows':
+                self.win.set_focus(None)
+        if self.focus == 'rows' and self.chosen >= offset:
+            self.win.set_focus(None)
+        n = self.rows_visible()
+        sel = self.chosen - offset
+        if sel < self.top:
+            self.top = max(0, sel)
+        elif sel >= self.top + n:
+            self.top = sel - n + 1
+        self.top = max(0, min(self.top, max(0, len(rows) - n)))
+        for i, app in enumerate(rows[self.top:self.top + n], self.top):
+            self.content.pack_start(self.app_row(app, i + offset), False, False, 0)
+        if len(rows) > n:
+            self.content.pack_start(label('%d–%d of %d' % (self.top + 1, min(len(rows), self.top + n), len(rows)),
+                                          'text', xalign=1), False, False, 0)
+
+    def app_row(self, app, index):
+        ev = Gtk.EventBox(visible_window=False)
+        box = Gtk.Box(spacing=10)
+        classes(box, 'row')
+        classes(box, 'chosen', on=self.focus == 'rows' and index == self.chosen)
+        e = self.index.get(app.pkg) if self.index else None
+        k = kind(e)
+        box.pack_start(label('' if k == 'window' else '' if k == 'terminal' else '', 'ricon',
+                             yalign=0), False, False, 0)
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        texts.pack_start(label(app.name, 'rtitle', ellipsize=Pango.EllipsizeMode.END), False, False, 0)
+        what = app.what or (e[4] if e else '')
+        texts.pack_start(label(what, 'sub', ellipsize=Pango.EllipsizeMode.END), False, False, 0)
+        box.pack_start(texts, True, True, 0)
+        if app.pkg in self.inst:
+            box.pack_start(label(' installed', 'have'), False, False, 0)
+        elif e:
+            box.pack_start(label(human(e[2] * 1024), 'side'), False, False, 0)
+        ev.add(box)
+        ev.connect('button-press-event', lambda w, ev_, i=index: self.click_row(i, ev_))
+        return ev
+
+    def openable(self, a):
+        """'window', 'terminal' (a command made for one, or picked or installed here) or None"""
+        desktops, cmds = launchers(a.pkg)
+        if desktops:
+            return 'window'
+        picked = any(x[0][0] == a.pkg for _k, _i, _n, apps in CATALOGUE for x in apps)
+        e = self.index.get(a.pkg) if self.index else None
+        if cmds and (kind(e) == 'terminal' or picked or a.pkg in load_mine()):
+            return 'terminal'
+        return None
+
+    def detail_rows(self):
+        a = self.detail
+        if self.job:
+            return []
+        if a.pkg in self.inst:
+            rows = []
+            if self.openable(a):
+                rows.append(('open', '  Open'))
+            if a.pkg in load_mine():
+                rows.append(('remove', '  Remove'))
+            return rows
+        return [('install', '  Install')]
+
+    def render_detail(self):
+        a = self.detail
+        e = self.index.get(a.pkg) if self.index else None
+        self.content.pack_start(label(a.name, 'big'), False, False, 0)
+        self.content.pack_start(label(a.what or (e[4] if e else ''), 'text', wrap=True), False, False, 0)
+        facts = []
+        if e:
+            k = kind(e)
+            facts.append({'window': 'a program with a window', 'terminal': 'a terminal command'}.get(k, 'a package'))
+            facts.append('version ' + e[0])
+            facts.append(human(e[2] * 1024) + ' on its own')
+            if e[5]:
+                facts.append(e[5])
+        facts.append('Debian package: ' + ' '.join(a.pkgs))
+        self.content.pack_start(label(' · '.join(facts), 'mono', wrap=True), False, False, 0)
+        self.content.pack_start(Gtk.Box(height_request=6), False, False, 0)
+        if a.pkg in self.inst:
+            self.content.pack_start(label(' Installed' + ('.' if a.pkg in load_mine() else
+                                    ' as part of the system: it stays.') + (' It has no window: Open runs it in a terminal.'
+                                                                     if self.openable(a) == 'terminal' else ''), 'good'), False, False, 0)
+        p = self.plan
+        if p and p.get('error'):
+            self.content.pack_start(label(p['error'], 'bad', wrap=True), False, False, 0)
+        elif p and p.get('text'):
+            self.content.pack_start(label(p['text'], 'warn' if p.get('tight') else 'text', wrap=True), False, False, 0)
+        elif a.pkg not in self.inst and not self.job:
+            self.content.pack_start(label('Working out what it needs…', 'text'), False, False, 0)
+        for i, (key, text) in enumerate(self.detail_rows()):
+            ev = Gtk.EventBox(visible_window=False)
+            box = Gtk.Box(spacing=10)
+            classes(box, 'row')
+            classes(box, 'chosen', on=i == self.chosen)
+            armed = self.armed == key
+            classes(box, 'armed', on=armed)
+            box.pack_start(label({'install': 'Press OK again to install it', 'remove': 'Press OK again to remove it'}
+                                 .get(key) if armed else text, 'rtitle'), True, True, 0)
+            ev.add(box)
+            ev.connect('button-press-event', lambda w, ev_, i=i: self.click_detail(i))
+            self.content.pack_start(ev, False, False, 0)
+        if self.job:
+            self.content.pack_start(label(self.job['title'], 'title'), False, False, 0)
+            self.bar = Gtk.ProgressBar(margin_top=6, margin_bottom=6)
+            self.content.pack_start(self.bar, False, False, 0)
+            self.job_text = label(self.job.get('text', ''), 'text', ellipsize=Pango.EllipsizeMode.MIDDLE)
+            self.content.pack_start(self.job_text, False, False, 0)
+            self.set_progress(self.job.get('frac', -1), self.job.get('text', ''))
+        for cls, text in self.lines[-8:]:
+            self.content.pack_start(label(text, cls, wrap=True), False, False, 0)
+
+    def render_hints(self):
+        if self.job:
+            pairs = [('', 'Working: please wait')]
+        elif self.detail:
+            pairs = [('↑ ↓', 'choose'), ('OK', 'do it'), ('exit', 'back to the list')]
+        elif self.focus == 'sections':
+            pairs = [('↑ ↓', 'a kind'), ('→ OK', 'its programs'), ('exit', 'close')]
+        elif self.sections[self.section][0] == 'search' and self.chosen == 0:
+            pairs = [('text', 'on-screen keyboard'), ('OK', 'search'), ('↓', 'the results'), ('exit', 'back')]
+        else:
+            pairs = [('↑ ↓ page±', 'choose'), ('OK', 'about it, install'), ('blue', 'remove'), ('←', 'the kinds'),
+                     ('exit', 'back')]
+        self.hints.set_markup(hint_markup(pairs))
+
+    def set_progress(self, frac, text):
+        if not self.job:
+            return False
+        self.job['frac'], self.job['text'] = frac, text
+        if frac < 0:
+            self.bar.pulse()
+        else:
+            self.bar.set_fraction(frac)
+        self.job_text.set_text(text)
+        return False
+
+    # -- doing things
+
+    def search(self):
+        self.query = self.entry.get_text().strip()
+        q = self.query.casefold()
+        if not q or self.index is None:
+            self.results = []
+            self.render()
+            return
+        words = q.split()
+        picked = {a[0][0]: App(*a) for _k, _i, _n, apps in CATALOGUE for a in apps}
+        scored = []
+        for name, e in self.index.items():
+            if e[1] in HIDDEN_SECTIONS or HIDDEN_NAME.search(name):
+                continue
+            hay = name + ' ' + e[4].casefold()
+            if not all(w in hay for w in words):
+                continue
+            score = (0 if name in picked else 1, 0 if name == q else 1 if name.startswith(q) else 2 if q in name else 3,
+                     0 if kind(e) == 'window' else 1 if kind(e) == 'terminal' else 2, name)
+            scored.append((score, name))
+        scored.sort()
+        self.results = [picked.get(n) or App([n], n, '') for _s, n in scored[:SEARCH_MAX]]
+        self.chosen = 1 if self.results else 0
+        self.top = 0
+        self.render()
+
+    def open_detail(self, app):
+        self.detail = app
+        self.chosen = 0
+        self.armed = None
+        self.plan = None
+        self.lines = []
+        self.render()
+        threading.Thread(target=self.make_plan, args=(app,), daemon=True).start()
+
+    def make_plan(self, app):
+        installed = app.pkg in self.inst
+        if installed and app.pkg not in load_mine():
+            GLib.idle_add(self.planned, app, {})
+            return
+        acts, rc, err = simulate(['remove', '--autoremove'] + [p for p in app.pkgs if p in self.inst]
+                                 if installed else ['install'] + app.pkgs)
+        plan = {}
+        if rc != 0:
+            plan['error'] = 'apt says: %s' % err
+        elif installed:
+            gone = [p for a, p in acts if a == 'Remv']
+            others = sorted(p for p in gone if p in self.manual and p not in app.pkgs)
+            if others:
+                plan['error'] = ('It can\'t be removed here: %s, installed on purpose, would go with it.'
+                                 % ', '.join(others[:6]))
+            else:
+                size = sum((self.index.get(p) or (0, 0, 0))[2] for p in gone) * 1024 if self.index else 0
+                plan['text'] = 'Removing it frees about %s (%d package%s).' % (human(size), len(gone),
+                                                                              '' if len(gone) == 1 else 's')
+        else:
+            new = [p for a, p in acts if a == 'Inst' and p not in self.inst]
+            size = sum((self.index.get(p) or (0, 0, 0))[2] for p in new) * 1024 if self.index else 0
+            down = sum((self.index.get(p) or (0, 0, 0, 0))[3] for p in new) if self.index else 0
+            free = free_bytes()
+            need = size + down + MARGIN
+            plan['size'] = need
+            text = 'It needs %s on the system disk (%d package%s with what it uses), %s is free.' % (
+                human(size), len(new), '' if len(new) == 1 else 's', human(free))
+            if need > free:
+                plan['error'] = text + ' Not enough: remove programs you don\'t use (Installed by you) first.'
+            else:
+                plan['text'] = text
+                plan['tight'] = need > free * 0.7
+        GLib.idle_add(self.planned, app, plan)
+
+    def planned(self, app, plan):
+        if self.detail is app:
+            self.plan = plan
+            self.render()
+        return False
+
+    def run_root(self, verb, app):
+        title = '%s %s' % ('Installing' if verb == 'install' else 'Removing', app.name)
+        self.job = {'title': title, 'frac': -1, 'text': ''}
+        self.lines = []
+        self.armed = None
+        self.render()
+        pkgs = app.pkgs if verb == 'install' else [p for p in app.pkgs if p in self.inst]
+
+        def work():
+            p = subprocess.Popen(['sudo', '-n', SELF, 'root', verb] + pkgs, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
+            error = ''
+            for line in p.stdout:
+                w = line.rstrip('\n').split(' ', 2)
+                if w[0] == 'progress' and len(w) >= 2:
+                    GLib.idle_add(self.set_progress, float(w[1]), w[2] if len(w) > 2 else '')
+                elif w[0] == 'log':
+                    GLib.idle_add(self.lines.append, ('mono', line.rstrip('\n')[4:]))
+                elif w[0] == 'error':
+                    error = line.rstrip('\n')[6:]
+            p.wait()
+            if p.returncode != 0 and not error:
+                error = (p.stderr.read().strip().splitlines() or ['failed'])[-1]
+            GLib.idle_add(self.job_done, verb, app, error)
+        threading.Thread(target=work, daemon=True).start()
+
+    def job_done(self, verb, app, error):
+        self.job = None
+        self.inst, self.manual = installed_packages()
+        mine = load_mine()
+        if not error:
+            if verb == 'install':
+                mine[app.pkg] = {'pkgs': app.pkgs, 'name': app.name, 'what': app.what, 'when': time.time()}
+                self.lines = [('good', ' %s is installed%s.' % (app.name, ': OK on Open starts it'
+                                                                      if self.openable(app) else ''))]
+            else:
+                mine.pop(app.pkg, None)
+                self.lines = [('good', ' %s is removed.' % app.name)]
+            save_mine(mine)
+        else:
+            self.lines.append(('bad', error))
+        self.plan = None
+        self.chosen = 0
+        self.status.set_text('%s free on the system disk' % human(free_bytes()))
+        self.render()
+        threading.Thread(target=self.make_plan, args=(app,), daemon=True).start()
+        return False
+
+    def open_app(self, app):
+        desktops, cmds = launchers(app.pkg)
+        if self.openable(app) == 'window':
+            from gi.repository import Gio
+            info = Gio.DesktopAppInfo.new_from_filename(sorted(desktops, key=len)[0])
+            if info:
+                ctx = Gio.AppLaunchContext()
+                ctx.setenv('GTK_THEME', 'Adwaita:dark')   # dark, as the rest of the desktop
+                info.launch([], ctx)
+                return
+        if cmds:
+            name = next((c for c in cmds if os.path.basename(c) == app.pkg), cmds[0])
+            subprocess.Popen(['ozone-terminal', '-e', name])
+
+    def activate_detail(self):
+        rows = self.detail_rows()
+        if not rows:
+            return
+        key = rows[min(self.chosen, len(rows) - 1)][0]
+        if key == 'open':
+            self.open_app(self.detail)
+            return
+        if self.plan is None or self.plan.get('error'):
+            return   # still working it out, or it can't be done
+        if self.armed != key:
+            self.armed = key
+            self.render()
+            return
+        self.run_root(key, self.detail)
+
+    # -- input
+
+    def click_section(self, i):
+        if self.job:
+            return
+        self.section, self.focus, self.chosen, self.top, self.detail = i, 'rows', 0, 0, None
+        self.render()
+
+    def click_row(self, i, ev):
+        if self.job or ev.type != Gdk.EventType.BUTTON_PRESS:
+            return
+        self.focus, self.chosen = 'rows', i
+        offset = 1 if self.sections[self.section][0] == 'search' else 0
+        apps = self.apps()
+        if 0 <= i - offset < len(apps):
+            self.open_detail(apps[i - offset])
+
+    def click_detail(self, i):
+        if self.job:
+            return
+        if self.chosen != i:
+            self.armed = None
+        self.chosen = i
+        self.activate_detail()
+
+    def on_key(self, w, ev):
+        k = Gdk.keyval_name(ev.keyval)
+        if self.job:
+            return True
+        if self.detail:
+            n = len(self.detail_rows())
+            if k == 'Escape' or k in ('Left', 'BackSpace'):
+                self.detail = None
+                self.armed = None
+                self.lines = []
+                self.chosen = self.detail_from if hasattr(self, 'detail_from') else 0
+                self.render()
+            elif k in ('Up', 'Down') and n:
+                self.chosen = (self.chosen + (1 if k == 'Down' else -1)) % n
+                self.armed = None
+                self.render()
+            elif k in ('Return', 'KP_Enter', 'space'):
+                self.activate_detail()
+            return True
+        in_search = self.sections[self.section][0] == 'search'
+        if k == 'Escape':
+            if self.focus == 'rows':
+                self.focus = 'sections'
+                self.win.set_focus(None)
+                self.render()
+            else:
+                self.win.destroy()
+            return True
+        if self.focus == 'sections':
+            if k in ('Up', 'Down'):
+                self.section = (self.section + (1 if k == 'Down' else -1)) % len(self.sections)
+                self.chosen = self.top = 0
+                self.render()
+            elif k in ('Right', 'Return', 'KP_Enter', 'Tab'):
+                self.focus = 'rows'
+                self.chosen = 0
+                self.render()
+            return True
+        offset = 1 if in_search else 0
+        total = len(self.apps()) + offset
+        if in_search and self.chosen > 0 and ev.string and ev.string.isprintable() and not ev.string.isspace():
+            # typing on the results: a new search, starting with this letter
+            self.chosen = 0
+            self.render()
+            self.entry.grab_focus()   # all of the old one selected: the letter replaces it
+            return False
+        if in_search and self.chosen == 0:
+            if k in ('Down', 'Tab') and total > 1:
+                self.chosen = 1
+                self.win.set_focus(None)
+                self.render()
+                return True
+            if k == 'Up':
+                return True
+            return False   # the entry types; its Enter searches
+        step = {'Up': -1, 'Down': 1, 'Page_Up': -self.rows_visible(), 'Page_Down': self.rows_visible()}.get(k)
+        if step:
+            self.chosen = max(0, min(total - 1, self.chosen + step))
+            self.render()
+        elif k in ('Left', 'ISO_Left_Tab'):
+            self.focus = 'sections'
+            self.render()
+        elif k in ('Return', 'KP_Enter', 'space'):
+            apps = self.apps()
+            if 0 <= self.chosen - offset < len(apps):
+                self.detail_from = self.chosen
+                self.open_detail(apps[self.chosen - offset])
+        elif k in BLUE:
+            apps = self.apps()
+            if 0 <= self.chosen - offset < len(apps) and apps[self.chosen - offset].pkg in load_mine():
+                self.detail_from = self.chosen
+                self.open_detail(apps[self.chosen - offset])
+                self.chosen = len(self.detail_rows()) - 1   # on Remove
+                self.render()
+        return True
+
+
+def main():
+    if sys.argv[1:2] == ['root']:
+        root_main(sys.argv[2:])
+        return
+    setup_gtk()
+    GLib.set_prgname('ozone-apps')
+    Window()
+    Gtk.main()
+
+
+if __name__ == '__main__':
+    main()

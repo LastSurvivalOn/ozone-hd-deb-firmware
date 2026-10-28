@@ -20,6 +20,7 @@ tar -C "$HERE/rootfs" -czf - \
     usr/local/bin/ozone-code usr/local/share/applications/ozone-code.desktop usr/local/share/ozone/geany \
     usr/local/bin/ozone-system usr/local/share/applications/ozone-updates.desktop \
     usr/local/bin/ozone-calc usr/local/bin/ozone-math usr/local/share/applications/ozone-calc.desktop \
+    usr/local/bin/ozone-apps usr/local/share/applications/ozone-apps.desktop \
     usr/local/share/applications/ozone-math.desktop usr/local/share/ozone/wxMaxima.conf \
     etc/dpkg/dpkg.cfg.d/ozone-maxima \
     usr/local/share/applications/ozone-backup.desktop etc/init.d/ozone-system \
@@ -94,6 +95,8 @@ ssh_box 'set -e
     # Updates and backups (ozone-system): zstd packs the whole system in four threads; the settings
     # restored and the reset happen at the start, before the network and Bluetooth (ozone-system)
     sudo apt-get install -y -qq --no-install-recommends zstd > /dev/null
+    # Programs (ozone-apps) compares Debian's versions with apt_pkg
+    sudo apt-get install -y -qq --no-install-recommends python3-apt > /dev/null
     # the calculator (Qalculate!) and maths (wxMaxima: Maxima with its share library and its manual,
     # which etc/dpkg/dpkg.cfg.d/ozone-maxima lets in); gnuplot draws the plots of both
     sudo apt-get install -y -qq --no-install-recommends qalculate-gtk gnuplot-x11 wxmaxima maxima \

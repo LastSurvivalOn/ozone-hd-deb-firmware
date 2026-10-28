@@ -26,8 +26,9 @@ mouse work too.
 16. [Calendar](#16-calendar)
 17. [The code editor](#17-the-code-editor)
 18. [The calculator and maths](#18-the-calculator-and-maths)
-19. [Updates, backups and the reset](#19-updates-backups-and-the-reset)
-20. [All key combinations](#20-all-key-combinations)
+19. [Programs](#19-programs)
+20. [Updates, backups and the reset](#20-updates-backups-and-the-reset)
+21. [All key combinations](#21-all-key-combinations)
 
 ---
 
@@ -510,7 +511,7 @@ users: sign in to the site in the browser first, and the player gets the browser
 | Games or videos show a black window, or the desktop looks wrong | The graphics chip may be at fault. ⏻ → **Reboot**: if the desktop fails with it, the box falls back to drawing without it by itself. |
 | No internet (no IP address or WiFi name on the panel) | Click **WiFi** on the panel and choose your network. If it doesn't connect, check the router, then ⏻ → **Reboot**. |
 | "Could not connect …: wrong password?" | Choose the network again and retype the password (letter case matters). |
-| Something stopped working after an update | **Backup and reset** → **Restore**: the whole system backed up "before the updates" takes the box back to how it was (section 19). |
+| Something stopped working after an update | **Backup and reset** → **Restore**: the whole system backed up "before the updates" takes the box back to how it was (section 20). |
 
 ## 10. The remote control
 
@@ -916,7 +917,33 @@ letters and symbols and build plots with the mouse; **Help** (F1) is Maxima's ma
 starts a new line within a command. Files are saved as `.wxmx`. Most answers take a second or two;
 hard ones longer (the red button in the toolbar stops one).
 
-## 19. Updates, backups and the reset
+## 19. Programs
+
+**Programs** in the app menu is a store of Debian's programs (Debian has some 61 000 programs and
+packages, free). On the left: the picked ones by kind (games, learning, internet, music and video,
+graphics, office and reading, programming, tools), chosen to work on the box, then **Search all of
+Debian** and **Installed by you**.
+
+| Button | What it does |
+|---|---|
+| **↑ ↓** on the left, **→** or **OK** | a kind, into its list |
+| **↑ ↓**, **page+ / page−** | choose a program (a window icon: it has a window; a terminal icon: it runs in the terminal) |
+| **OK** | about it: what it is, its size, how much it needs with what comes with it, and how much is free |
+| **OK** on **Install**, pressed twice | installs it: the bar shows the download and the setting up |
+| **OK** on **Open** | starts it (it is also in the app menu from then on) |
+| **OK** on **Remove**, pressed twice (or blue in the list) | removes it, and what only it needed |
+| **exit** | back: from a program to its list, then to the kinds, then closed |
+
+**Search**: type a name or a word (`chess`, `paint`, `radio`, `pdf`) with a keyboard or **text**
+on the remote, then **OK**; **↓** goes to what was found, and typing again starts a new search.
+Programs outside the picked ones may not suit the box: some need a graphics card the desktop
+hasn't got (3D games, for one), or are too big.
+
+The system disk has little room (2 GB in all): the details say how much a program needs, and
+Programs refuses what doesn't fit. Only programs installed here can be removed here: the box's own
+(the desktop, TV, the player…) show "part of the system" and stay.
+
+## 20. Updates, backups and the reset
 
 **Updates** and **Backup and reset** in the app menu open the same window, with four sections on
 the left: **↑ / ↓** choose one, **→** or **OK** goes into it, **exit** goes back and closes. The bar
@@ -968,7 +995,7 @@ files and the TV recordings too. Both first back up the settings onto the box ("
 reset": Restore brings them back), restart the box and do it at the start. The programs, the
 updates installed and the backups stay; so does the way in for the computer (`~/.ssh`).
 
-## 20. All key combinations
+## 21. All key combinations
 
 ### Anywhere
 | Keys | Action |

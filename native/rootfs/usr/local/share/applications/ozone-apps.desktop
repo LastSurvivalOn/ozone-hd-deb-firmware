@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Programs
+Comment=Find, install and remove Debian's programs: games, learning, internet, office and more
+Exec=ozone-apps
+Icon=system-software-install
+Terminal=false
+Categories=System;PackageManager;
