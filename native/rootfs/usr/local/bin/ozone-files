@@ -303,7 +303,8 @@ class Viewer:
                 self.clock.pack_start(self.date_label, False, False, 0)
                 overlay.add_overlay(self.clock)
                 GLib.timeout_add_seconds(1, self.tick_clock)
-                GLib.idle_add(self.tick_clock)
+                # once, at once (tick_clock says True to stay on the timer: as an idle it spun a core)
+                GLib.idle_add(lambda: self.tick_clock() and False)
         self.win.add(overlay)
         self.pixbuf = None
         self.win.show_all()
