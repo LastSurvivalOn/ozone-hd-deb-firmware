@@ -129,7 +129,27 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
 
 - [ ] **Medium**: HDMI-CEC: control the box with the TV's remote, turn the TV on and off with the
   box. The kernel has a `cec_input` device, while Android runs with CEC off (`hdmitx=cec0`,
-  `ro.platform.has.cecmode=false`).
+  `ro.platform.has.cecmode=false`). **Waiting for a TV with CEC**: the box's display now is a
+  Samsung S22F350, a PC monitor with none (2026-10-28: it answers no poll, "tv don't have CEC
+  feature"). What was found then, in the stock kernel's driver (`drivers/amlogic/hdmi/hdmi_tx/
+  hdmi_tx_cec.c`, `hdmi_cec_key.c` in Hardkernel's tree; the stock kernel has the same strings):
+  - `/sys/class/amhdmitx/amhdmitx0/cec_config` (hex, root) turns it on at run time and registers
+    the box (logical address 4, playback device; physical address from the EDID): bit 0 on,
+    1 one-touch play, 2 one-touch standby (the TV's Standby comes as KEY_POWER on `cec_input`),
+    3 the TV switched on. Tried: `b` works, `0` turns it off, nothing broke.
+  - `/sys/class/amhdmitx/amhdmitx0/cec` takes user commands in hex: `d 0` the TV to standby,
+    `e 0` Image View On, `14` Active Source, `15 0` Inactive Source, `2 0` the TV's power status,
+    `1a 4` poll the TV. No raw messages.
+  - **Every write must end with a space and no newline**: both parsers skip with
+    `while (buf[i] != ' ') i++` and no bound, so `echo b` would read past the buffer.
+  - Without bit 3 the registration asks the TV's power status and waits for any message with no
+    timeout, in the writer, or in the HDMI hotplug thread (it runs on every hotplug): with a display
+    that never answers, hotplug handling would stop for good. Keep bit 3 on.
+  - Sleep (Android early suspend, ozone-standby) sends Inactive Source and stops CEC; waking sends
+    Image View On and Active Source. The TV off with the box is our `d 0`, from ozone-standby.
+  - The TV's keys come with codes X can't see (OK is KEY_SELECT, the colours KEY_RED..BLUE): take
+    `cec_input` in ozone-remote and map them to remote.conf's. The kernel maps no key for CEC
+    0x30-0x37 (channel up/down, info, input select): those can't be had.
 - [x] **Medium**: Bluetooth. The box has none (`hw.has.bluetooth=false`) and Android no driver for
   a USB adapter; native Linux takes one now: headphones and speakers, keyboards, mice, gamepads, a
   phone's music on the TV (`install-bluetooth.sh`).
