@@ -657,3 +657,25 @@ prints its progress (`progress FRACTION TEXT`, `log`, `warn`, `restart reboot|de
   deletes the settings files (the tools fall back to their defaults) and the Bluetooth pairings,
   sets Europe/Kyiv and runs `net-apply proxy` and `sound-config`. Both first back up the settings
   onto the box (`auto`, the last four kept).
+
+## Hints, exit, gamepads
+
+- Every window made for the remote says what its buttons do: a hint bar (Calendar, Updates and
+  backups, System info, Files, TV, the equalizer, the browser under the page), rofi's own line
+  (`textbox-keys` in `config.rasi`, under every menu), amplay's info panel ("Buttons: …", for files
+  and TV), the photo viewer under the first photo and after a key it doesn't use.
+- exit (ozone-remote `back()`): Esc for the windows in `ESC_CLASSES` (YouTube now too, whose Esc
+  goes back through its views); `KEY_BACK` (XF86Back) for `BACK_CLASSES` (ozone-web, which goes
+  back a page, then closes the tab, then the window, as Android's Back); anything else is closed.
+- Gamepads (`Gamepads` in ozone-remote): every 3 s it looks for devices with `BTN_SOUTH` (no udev:
+  Bluetooth pads come and go), reads them without grabbing, and feeds their buttons to
+  `Remote.key` as the remote's (D-pad, hat or stick past 60 % = arrows, A OK, B exit...), so mouse
+  mode and the on-screen keyboard work with them too. Nothing while RetroArch runs (`pgrep`, at
+  most once a second). Tested with a uinput gamepad.
+- Panel messages (`ozone-notify`): at most 32 characters, and the processor, memory and
+  temperature modules hide while one shows (polybar's `module_hide`): the panel is full, and a
+  long message pushed the clock and the power button off the screen. Only the newest message's
+  timer clears it (a stamp in `/tmp/ozone-notify.UID`); before, the first message's timer cut the
+  second one short.
+- Logs: there is no logrotate; `/etc/init.d/ozone-system` cuts a `/var/log/*.log` over 1 MB to its
+  last 256 KB at each start (`miracast.log` had reached 3.3 MB).

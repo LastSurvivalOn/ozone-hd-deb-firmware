@@ -34,7 +34,14 @@ window {
     padding: 18px;
 }
 
-mainbox { spacing: 12px; }
+mainbox { spacing: 12px; children: [ inputbar, message, listview, textbox-keys ]; }
+/* the keys, under every menu */
+textbox-keys {
+    expand: false;
+    str: "↑ ↓ choose    OK select    type to search    exit back";
+    text-color: @subtext;
+    padding: 2px 4px 0px 4px;
+}
 
 inputbar {
     background-color: @surface0;

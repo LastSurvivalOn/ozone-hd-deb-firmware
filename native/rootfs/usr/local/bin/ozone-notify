@@ -1,4 +1,23 @@
-#!/bin/sh
-# Short message in the polybar panel (status module); disappears after 6 seconds
-polybar-msg action "#status.send.$*" > /dev/null 2>&1
-( sleep 6; polybar-msg action "#status.send." > /dev/null 2>&1 ) &
+#!/bin/bash
+# Short message in the polybar panel (status module), for 6 seconds. The panel has no room to
+# spare: while it shows, the processor, memory and temperature make way for it, and a long one is
+# cut (it pushed the right half of the panel off the screen). Only the newest message's timer
+# clears it, so a message right after another stays its 6 seconds.
+export LC_ALL=C.UTF-8
+msg="$*"
+[ ${#msg} -gt 32 ] && msg="${msg:0:31}…"
+stamp=/tmp/ozone-notify.$(id -u)
+now=$(date +%s%N)
+echo "$now" > "$stamp"
+for m in cpu memory temperature; do
+    polybar-msg action "#$m.module_hide" > /dev/null 2>&1
+done
+polybar-msg action "#status.send.$msg" > /dev/null 2>&1
+(
+    sleep 6
+    [ "$(cat "$stamp" 2> /dev/null)" = "$now" ] || exit 0
+    polybar-msg action "#status.send." > /dev/null 2>&1
+    for m in cpu memory temperature; do
+        polybar-msg action "#$m.module_show" > /dev/null 2>&1
+    done
+) > /dev/null 2>&1 &

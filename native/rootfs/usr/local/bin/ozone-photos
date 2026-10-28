@@ -53,6 +53,10 @@ ZOOM_MAX = 4             # times its pixels 1:1
 FADE_MS, SLIDE_FADE_MS = 220, 1100
 THUMB_W, THUMB_H = 216, 152   # the thumbnail inside its cell
 CELL_W, CELL_H, GAP = 232, 168, 14
+# what the keys do: under the first photo's name, and after a key that does nothing here
+PHOTO_KEYS = '← → photos   page+ page− zoom   ↑ ↓ turn   OK slideshow   blue thumbnails   info details   exit close'
+ZOOM_KEYS = 'arrows move about it   0 the whole photo   1 its pixels   exit back'
+GALLERY_KEYS = 'arrows choose   page+ page− a page   OK open   play slideshow   exit close'
 HEAD_H, FOOT_H = 64, 40
 BG = (0x11 / 255, 0x11 / 255, 0x1b / 255)
 CELL_BG = (0x1e / 255, 0x1e / 255, 0x2e / 255)
@@ -271,6 +275,7 @@ class App:
         self.slide_timer = None
         self.anim_iter = self.anim_timer = None
         self.caption_timer = None
+        self.caption_loading = False
         self.drag = None
         self.top = 0                          # the gallery's first row on the screen
         self.sel = index
@@ -303,7 +308,7 @@ class App:
         self.foot.get_style_context().add_class('bar')
         self.foot_name = label('', ellipsize=Pango.EllipsizeMode.MIDDLE)
         self.foot.pack_start(self.foot_name, True, True, 0)
-        self.foot.pack_end(label('OK open   play: slideshow   exit: close', 'hint'), False, False, 0)
+        self.foot.pack_end(label(GALLERY_KEYS, 'hint'), False, False, 0)
         for w in (self.head, self.foot):
             overlay.add_overlay(w)
         self.caption = label('', 'caption', halign=Gtk.Align.CENTER, valign=Gtk.Align.END, margin_bottom=24,
@@ -358,6 +363,7 @@ class App:
         return self.photos.setdefault(self.files[self.index], Photo(self.files[self.index]))
 
     def say(self, text, seconds=3):
+        self.caption_loading = False
         self.caption.set_text(text)
         self.caption.show()
         if self.caption_timer:
@@ -439,7 +445,12 @@ class App:
         if p.anim:
             self.start_anim(p)
         if not self.screensaver:
-            self.say('%d / %d   %s' % (self.index + 1, len(self.files), os.path.basename(p.path)))
+            text = '%d / %d   %s' % (self.index + 1, len(self.files), os.path.basename(p.path))
+            if not getattr(self, 'hinted', False):
+                self.hinted = True
+                self.say(text + '\n' + PHOTO_KEYS, 6)
+            else:
+                self.say(text)
         self.tick_fade()
 
     def want_fit(self, p):
@@ -474,12 +485,14 @@ class App:
         self.loader.want(('full', p.path, p.turn), lambda: load_full(p.path, p.turn),
                          lambda key, r: self.got_full(p, key, r))
         self.say('Loading the whole photo…', 2)
+        self.caption_loading = True
 
     def got_full(self, p, key, result):
         if key[2] == p.turn and result is not None:
             p.full = self.to_screen(result)
             if p is self.current():
-                self.caption_off()
+                if self.caption_loading:   # not what was said since (the keys)
+                    self.caption_off()
                 self.area.queue_draw()
 
     def start_anim(self, p):
@@ -593,7 +606,12 @@ class App:
             self.cx = self.cy = 0.5
         else:
             self.want_full(p)
-            self.say('%d %%' % round(100 * z * self.fit_scale(p)), 1)
+            pct = '%d %%' % round(100 * z * self.fit_scale(p))
+            if not getattr(self, 'zoom_hinted', False):   # the first time: how to move about
+                self.zoom_hinted = True
+                self.say(pct + '\n' + ZOOM_KEYS, 4)
+            else:
+                self.say(pct, 1)
         self.clamp()
         self.area.queue_draw()
 
@@ -840,6 +858,8 @@ class App:
             self.show_info()
         elif k in ('g', 'Launch4', 'Tab'):
             self.open_gallery()
+        elif not k.startswith(('Shift', 'Control', 'Alt', 'Super', 'ISO_', 'Caps', 'Num')):
+            self.say(ZOOM_KEYS if zoomed else PHOTO_KEYS, 5)
         return True
 
     def on_button(self, w, ev):

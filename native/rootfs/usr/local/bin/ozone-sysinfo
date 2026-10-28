@@ -52,6 +52,7 @@ progressbar trough { min-height: 8px; background: #313244; border: none; border-
 progressbar progress { min-height: 8px; background: #89b4fa; border: none; border-radius: 4px; }
 progressbar.warn progress { background: #fab387; }
 progressbar.full progress { background: #f38ba8; }
+.hints { background: #181825; padding: 8px 16px; color: #a6adc8; }
 """
 
 
@@ -571,13 +572,18 @@ class Window:
         self.scroll.get_style_context().add_class('content')
         body.pack_start(self.scroll, True, True, 0)
         top.pack_start(body, True, True, 0)
+        # what the keys do, in the section list and in a section
+        self.hints = label('', 'hints', use_markup=True)
+        top.pack_start(self.hints, False, False, 0)
         self.win.add(top)
+        self.win.connect('set-focus', lambda *a: GLib.idle_add(self.show_hints))
 
         self.index = 0
         self.win.show_all()
         self.list.select_row(self.list.get_row_at_index(0))
         self.list.get_row_at_index(0).grab_focus()
         GLib.timeout_add(REFRESH, self.tick)
+        self.show_hints()
         threading.Thread(target=self.versions, daemon=True).start()
 
     def versions(self):
@@ -640,6 +646,15 @@ class Window:
         # a refresh keeps the place; a new section starts at the top
         GLib.idle_add(adj.set_value, keep if old and getattr(self, 'shown', None) == index else 0)
         self.shown = index
+        return False
+
+    def show_hints(self):
+        if self.win.get_focus() is self.scroll:
+            pairs = [('↑ ↓', 'scroll'), ('page+ page−', 'a page'), ('←', 'the sections'), ('exit', 'close')]
+        else:
+            pairs = [('↑ ↓', 'a section'), ('→', 'into it'), ('exit', 'close')]
+        self.hints.set_markup('      '.join('<b>%s</b>  %s' % (GLib.markup_escape_text(k), GLib.markup_escape_text(w))
+                                           for k, w in pairs))
         return False
 
     def copy_all(self):

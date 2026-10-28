@@ -11,12 +11,17 @@ which kbd-merge merges into X's keyboard like any other. On the way it adds:
   text     the on-screen keyboard, for typing: the arrows move over it, OK types the key, delete
            erases, exit hides it; it can be clicked with the mouse too. In the TV player: teletext.
   exit     back: closes menus, the on-screen keyboard, the channel list, stops the player and
-           closes the TV window (Esc); any other window it closes.
+           closes the TV window (Esc); in the browser the page before (XF86Back); any other
+           window it closes.
   info     the panel, over a fullscreen window too (ozone-panel); in mouse mode the right button.
            In the player: the video's info (TV: the channel's, and the signal); in Files a file's.
   phone    the same remote as a web page, http://BOX:8080 from a phone on the home network
            (ozone-phone shows the address and a QR code): every button, a touchpad for the
            pointer, and text typed on the phone's own keyboard.
+  gamepad  a USB or Bluetooth gamepad is a remote too: the D-pad or the stick the arrows, A OK, B
+           exit, X and Y info and text, Start home, Select mouse mode, the shoulder buttons
+           page- / page+, the triggers the volume. Not while RetroArch runs:
+           it is the games' then.
   Power    sleep (ozone-standby) when let go; any button wakes the box (ozone-standby can't see
            the remote, which is held here, so this wakes it). Held for 2 s: power off (the box's
            deep sleep, red LED; Power turns it on again).
@@ -340,8 +345,17 @@ DIGITS = {E.KEY_1: 1, E.KEY_2: 2, E.KEY_3: 3, E.KEY_4: 4, E.KEY_5: 5, E.KEY_6: 6
 ARROWS = (E.KEY_UP, E.KEY_DOWN, E.KEY_LEFT, E.KEY_RIGHT)
 # windows where exit means Esc (they handle it); other windows it closes
 ESC_CLASSES = ('ozone-tv', 'ozone-screen', 'ozone-files', 'ozone-equalizer', 'ozone-photos', 'ozone-calendar',
-               'ozone-reminder', 'ozone-system')
+               'ozone-reminder', 'ozone-system', 'yt')
 INFO_CLASSES = ('ozone-files', 'ozone-photos')   # info is their own key (a file's details), not the panel
+BACK_CLASSES = ('ozone-web',)   # exit is Back there: the page before, then the tab, then the window
+# a gamepad's buttons as the remote's. BTN_NORTH and BTN_WEST are the top and left buttons by the
+# kernel's documents, but xpad sends Xbox Y as BTN_WEST (= BTN_Y): which of info and text is which
+# depends on the pad
+PAD_KEYS = {E.BTN_SOUTH: E.KEY_ENTER, E.BTN_EAST: E.KEY_ESC, E.BTN_NORTH: INFO_KEY, E.BTN_WEST: OSK_KEY,
+            E.BTN_START: E.KEY_HOMEPAGE, E.BTN_MODE: E.KEY_HOMEPAGE, E.BTN_SELECT: MOUSE_KEY,
+            E.BTN_TL: E.KEY_PAGEDOWN, E.BTN_TR: E.KEY_PAGEUP, E.BTN_TL2: E.KEY_VOLUMEDOWN,
+            E.BTN_TR2: E.KEY_VOLUMEUP, E.BTN_DPAD_UP: E.KEY_UP, E.BTN_DPAD_DOWN: E.KEY_DOWN,
+            E.BTN_DPAD_LEFT: E.KEY_LEFT, E.BTN_DPAD_RIGHT: E.KEY_RIGHT}
 
 
 class Remote:
@@ -562,7 +576,9 @@ class Remote:
             self.kbd.tap(E.KEY_ESC)
             return
         cls = subprocess.run(['xprop', '-id', node, 'WM_CLASS'], capture_output=True, text=True).stdout
-        if any('"%s"' % c in cls for c in ESC_CLASSES):
+        if any('"%s"' % c in cls for c in BACK_CLASSES):
+            self.kbd.tap(E.KEY_BACK)
+        elif any('"%s"' % c in cls for c in ESC_CLASSES):
             self.kbd.tap(E.KEY_ESC)
         else:
             log('exit closes %s %s' % (node, cls.strip()))
@@ -806,6 +822,106 @@ class PhoneServer:
         return True
 
 
+class Gamepads:
+    """Gamepads as remotes: their buttons go through Remote.key as the remote's would. They are
+    read alongside whoever else reads them (not grabbed), and ignored while RetroArch runs. No udev
+    here: the devices are looked for every few seconds (a Bluetooth pad comes and goes)."""
+    LOOK = 3            # s between looks for new gamepads
+    STICK = 0.6         # of the way to the edge: a stick pushed that far is an arrow
+
+    def __init__(self, remote):
+        self.remote = remote
+        self.pads = {}            # path: (device, watch)
+        self.held = {}            # (path, axis): the arrow it holds down
+        self.games_at = 0
+        self.games = False
+        self.look()
+        GLib.timeout_add_seconds(self.LOOK, self.look)
+
+    def look(self):
+        for path in list_devices():
+            if path in self.pads:
+                continue
+            try:
+                dev = InputDevice(path)
+            except OSError:
+                continue
+            caps = dev.capabilities()
+            if E.BTN_SOUTH not in caps.get(E.EV_KEY, []) or dev.name.startswith(('ozone-', 'aml_')):
+                dev.close()
+                continue
+            log('gamepad %s (%s)' % (path, dev.name))
+            watch = GLib.io_add_watch(dev.fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_ERR | GLib.IO_HUP,
+                                      self.on_input, path)
+            self.pads[path] = (dev, watch)
+        return True
+
+    def drop(self, path):
+        dev, _watch = self.pads.pop(path)
+        for key in [k for k in self.held if k[0] == path]:
+            self.remote.key(self.held.pop(key), 0)
+        try:
+            dev.close()
+        except OSError:   # 3.10: an unplugged device fails even that (see kbd-merge)
+            pass
+        log('gamepad %s gone' % path)
+
+    def playing(self):
+        """RetroArch runs: the pad is the game's (asked at most once a second)"""
+        now = time.monotonic()
+        if now - self.games_at > 1:
+            self.games_at = now
+            self.games = Remote.running('retroarch')
+        return self.games
+
+    def on_input(self, fd, cond, path):
+        dev = self.pads[path][0]
+        if cond & (GLib.IO_ERR | GLib.IO_HUP):
+            self.drop(path)
+            return False
+        try:
+            events = list(dev.read())
+        except BlockingIOError:
+            return True
+        except OSError:
+            self.drop(path)
+            return False
+        if self.playing():
+            return True
+        for ev in events:
+            try:
+                if ev.type == E.EV_KEY and ev.code in PAD_KEYS and ev.value in (0, 1):
+                    self.remote.key(PAD_KEYS[ev.code], ev.value)
+                elif ev.type == E.EV_ABS:
+                    self.axis(dev, path, ev.code, ev.value)
+            except Exception as e:   # never stop
+                log('gamepad event %d %d: %r' % (ev.type, ev.code, e))
+        return True
+
+    def axis(self, dev, path, code, value):
+        if code in (E.ABS_HAT0X, E.ABS_HAT0Y):
+            where = (value > 0) - (value < 0)
+        elif code in (E.ABS_X, E.ABS_Y):
+            info = dev.absinfo(code)
+            mid = (info.max + info.min) / 2
+            half = (info.max - info.min) / 2 or 1
+            pos = (value - mid) / half
+            where = 1 if pos > self.STICK else -1 if pos < -self.STICK else 0
+        else:
+            return
+        horizontal = code in (E.ABS_HAT0X, E.ABS_X)
+        arrow = {(True, -1): E.KEY_LEFT, (True, 1): E.KEY_RIGHT, (False, -1): E.KEY_UP,
+                 (False, 1): E.KEY_DOWN}.get((horizontal, where))
+        key = (path, code)
+        if self.held.get(key) == arrow:
+            return
+        if key in self.held:
+            self.remote.key(self.held.pop(key), 0)
+        if arrow:
+            self.held[key] = arrow
+            self.remote.key(arrow, 1)
+
+
 def main():
     if daemon_pid():
         sys.exit('%s is already running' % NAME)
@@ -819,6 +935,7 @@ def main():
                                              Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
     remote = Remote()
     PhoneServer(remote)
+    Gamepads(remote)
     try:
         Gtk.main()
     finally:

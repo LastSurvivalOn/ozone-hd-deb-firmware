@@ -2716,7 +2716,7 @@ static void tv_command(char *line)
 /* Lines of its own for the info panel: the picture, the sound, the buffer */
 static void tv_info_extra(void)
 {
-    char t[512];
+    char t[1024];
     int w = sysfs_int(SYS "video/frame_width"), h = sysfs_int(SYS "video/frame_height");
     int n = 0;
     if (P.svc.vpid && w > 0 && h > 0)
@@ -2728,7 +2728,10 @@ static void tv_info_extra(void)
     n += snprintf(t + n, sizeof t - n, "Signal: %d%%\n", P.signal);
     double s = tv_shift();
     if (s > 0)
-        snprintf(t + n, sizeof t - n, "Timeshift: %d:%02d behind the broadcast\n", (int)s / 60, (int)s % 60);
+        n += snprintf(t + n, sizeof t - n, "Timeshift: %d:%02d behind the broadcast\n", (int)s / 60, (int)s % 60);
+    snprintf(t + n, sizeof t - n, "\nButtons: page+ page\u2212 channel, 0-9 a number, OK the list, red the next list, "
+             "yellow sound, green subtitles, blue picture shape, text teletext, record, pause, << back 10 s, "
+             "stop live, exit close");
     osd_info_extra(t);
 }
 
@@ -3170,15 +3173,18 @@ static void file_info(const char *url)
 
 static void file_info_extra(void)
 {
-    char t[512], mode[32] = "", a[160] = "none", sub[160];
+    char t[1024], mode[32] = "", a[160] = "none", sub[160];
     int w = sysfs_int(SYS "video/frame_width"), h = sysfs_int(SYS "video/frame_height");
     read_text(SYS "display/mode", mode, sizeof mode);
     if (P.ast)
         track_name(P.ast, a, sizeof a);
     subs_name(P.ssel, sub, sizeof sub);
-    snprintf(t, sizeof t, "Playing: %dx%d, %s\nSound: %s%s\nSubtitles: %s\nOutput: %s%s\n%s", w, h,
+    snprintf(t, sizeof t, "Playing: %dx%d, %s\nSound: %s%s\nSubtitles: %s\nOutput: %s%s\n%s\n\n"
+             "Buttons: OK pause, \u2190 \u2192 10 s, page+ page\u2212 a minute%s, \u2191 \u2193 volume, "
+             "yellow sound, green subtitles, blue picture shape, red repeat, info this, exit stop", w, h,
              ASPECTS[P.aspect >= 0 && P.aspect < 4 ? P.aspect : 0].name, a,
-             P.raw ? " (passed through)" : "", sub, mode, P.saved_mode ? " (matched to the video)" : "", P.flags);
+             P.raw ? " (passed through)" : "", sub, mode, P.saved_mode ? " (matched to the video)" : "", P.flags,
+             P.nchap > 1 ? " (a chapter)" : "");
     osd_info_extra(t);
 }
 

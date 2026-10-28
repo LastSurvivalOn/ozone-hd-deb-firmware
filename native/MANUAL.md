@@ -429,6 +429,10 @@ DuckDuckGo.
 | **F8** | fast mode for this site |
 | **F9** | reader view |
 | **F11** | full screen |
+| **exit** on the remote (or a keyboard's Back key) | the page before; on a tab's first page, the tab closes; the last one closes the browser |
+
+The line under the page says what the remote's buttons do in the browser (it is hidden in full
+screen).
 
 **The toolbar buttons** are, from left to right: back, forward, reload, home, then the address bar,
 and then:
@@ -507,7 +511,7 @@ The box's own remote can run everything by itself: point it at the box.
 |---|---|
 | **Power** | sleep; any button wakes the box again |
 | **↑ ↓ ← →**, **OK** | move and choose, like the arrows and Enter |
-| **exit** | back: closes a menu, the on-screen keyboard or the channel list, stops the player, closes the TV window; any other window (YouTube, the browser) it closes |
+| **exit** | back: closes a menu, the on-screen keyboard or the channel list, stops the player, closes the TV window; in YouTube back to the search or the home tab, then closed; in the browser the page before (on a tab's first page it closes the tab, then the browser); any other window it closes |
 | **home** | the open windows and all the apps (YouTube, TV, the browser, Power, Screen size, WiFi…) |
 | **browse** | the browser |
 | **usb** | the drives and network folders (section 11) |
@@ -544,6 +548,24 @@ address bar. It can be clicked with the mouse too.
 
 The **>>**, **|<<**, **>>|** and **menu** buttons send exactly the same signal as **<<** (the
 remote is made that way), so they all go back 10 s.
+
+**A gamepad as the remote.** A USB gamepad, or a Bluetooth one (section 15), runs the box like
+the remote, everywhere but in games (in RetroArch it is the game's):
+
+| Gamepad | Remote |
+|---|---|
+| D-pad or left stick | arrows |
+| A (the bottom button) | OK |
+| B (the right one) | exit |
+| X and Y (the left and top ones) | info and text (the on-screen keyboard), one each: which is which depends on the gamepad |
+| Start, the guide button | home |
+| Select (Back) | mouse mode |
+| LB / RB | page− / page+ |
+| LT / RT | volume − / + |
+
+**Hints.** Most windows have a line at the bottom saying which buttons do what at that moment
+(the menus too: ↑ ↓ choose, OK select, exit back). The video player lists its buttons in its info
+panel (**info**), the photo viewer under the first photo and after a button it doesn't use.
 
 **With the mouse alone** everything works too: the panel buttons start YouTube, the browser, TV,
 the app menu and the power menu; a click on the window title in the middle of the panel lists the

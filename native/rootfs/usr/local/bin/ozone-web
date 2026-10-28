@@ -167,7 +167,12 @@ entry progress { background: none; border: none; border-bottom: 2px solid #cba6f
 notebook header tab { background: #181825; color: #a6adc8; padding: 2px 4px; border: none; }
 notebook header tab:checked { background: #1e1e2e; color: #cdd6f4; box-shadow: inset 0 -2px #cba6f7; }
 notebook header tab button.flat { padding: 0 4px; min-height: 18px; }
+.hints { background: #181825; color: #7f849c; font-family: "DejaVu Sans"; font-size: 11px; padding: 3px 12px; }
 '''
+
+# the remote's keys for the browser, under the page (not in full screen)
+HINTS = ('<b>mouse</b>  the pointer, OK clicks      <b>page+ page−</b>  scroll      <b>text</b>  keyboard      '
+         '<b>pause</b>  play the page\'s video      <b>info</b>  the panel      <b>exit</b>  back')
 
 # Reader view: the element holding most paragraph text, cleaned of everything but content.
 # Runs in its own script world; on a fast-mode page JavaScript is switched on just for this call
@@ -381,9 +386,13 @@ class Browser(Gtk.ApplicationWindow):
         new.show()
         self.notebook.connect('switch-page', lambda _n, page, _i: self.sync(page))
 
+        self.hints = Gtk.Label(xalign=0)
+        self.hints.set_markup(HINTS)
+        self.hints.get_style_context().add_class('hints')
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         box.pack_start(bar, False, False, 0)
         box.pack_start(self.notebook, True, True, 0)
+        box.pack_start(self.hints, False, False, 0)
         self.add(box)
         self.connect('key-press-event', self.on_key)
         self.connect('delete-event', self.on_quit)
@@ -746,6 +755,8 @@ class Browser(Gtk.ApplicationWindow):
             (0, 0, 'F8'): self.toggle_fast,
             (0, 0, 'F9'): self.toggle_reader,
             (0, 0, 'F11'): self.toggle_fullscreen,
+            # the remote's exit (ozone-remote), or a keyboard's Back key
+            (0, 0, 'Back'): self.back_key,
         }
         if (int(ctrl), int(alt), k) in actions:
             actions[(int(ctrl), int(alt), k)]()
@@ -762,7 +773,30 @@ class Browser(Gtk.ApplicationWindow):
 
     def toggle_fullscreen(self):
         st = self.get_window().get_state()
-        self.unfullscreen() if st & Gdk.WindowState.FULLSCREEN else self.fullscreen()
+        if st & Gdk.WindowState.FULLSCREEN:
+            self.unfullscreen()
+            self.hints.show()
+        else:
+            self.fullscreen()
+            self.hints.hide()
+
+    def back_key(self):
+        """What Back is on Android: out of the search, out of full screen, the page before, and on
+        a tab's first page that tab, then the window"""
+        st = self.get_window().get_state()
+        v = self.tab.view
+        if self.find.get_visible():
+            self.find.set_text('')
+            self.find.hide()
+            v.grab_focus()
+        elif st & Gdk.WindowState.FULLSCREEN:
+            self.toggle_fullscreen()
+        elif v.can_go_back():
+            v.go_back()
+        elif self.notebook.get_n_pages() > 1:
+            self.close_tab(self.tab)
+        else:
+            self.close()
 
 
 class App(Gtk.Application):

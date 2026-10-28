@@ -6,7 +6,7 @@
 # X-Start-Before:    ozone-wifi bluetooth ozone-bluetooth ozone-media ozone-dtv
 # Default-Start:     2 3 4 5
 # Default-Stop:
-# Short-Description: Settings restored or reset in "Updates and backups", before they are used
+# Short-Description: Settings restored or reset in "Updates and backups"; long logs cut
 ### END INIT INFO
 # ozone-system leaves the job in /var/lib/ozone/pending.json and restarts the box; it is done here,
 # before the network, Bluetooth and the desktop read the files.
@@ -15,6 +15,11 @@ start)
     if [ -e /var/lib/ozone/pending.json ]; then
         /usr/local/bin/ozone-system root pending >> /var/log/ozone-system.log 2>&1
     fi
+    # No logrotate here: a log over 1 MB keeps its last 256 KB, at each start
+    find /var/log -maxdepth 2 -type f -name '*.log' -size +1M | while read -r f; do
+        tail -c 262144 "$f" > "$f.ozone-trim" && cat "$f.ozone-trim" > "$f"
+        rm -f "$f.ozone-trim"
+    done
     ;;
 stop|restart|force-reload|status) ;;
 *)

@@ -871,7 +871,7 @@ def check_service():
         try:
             r = check_all()
             if updates_count(r):
-                subprocess.call(['ozone-notify', ' Updates are ready: Updates in the apps menu'],
+                subprocess.call(['ozone-notify', ' Updates are ready'],
                                 stderr=subprocess.DEVNULL)
         except Exception as e:   # the network may be down: try again tomorrow
             print('check failed: %r' % e, file=sys.stderr, flush=True)

@@ -707,7 +707,7 @@ def window(query):
             self.save_list.get_style_context().add_class('tab')
             self.save_list.connect('clicked', lambda w: self.save_remote_list())
             tabs.pack_start(self.save_list, False, False, 0)
-            hint = Gtk.Label(label='green: add to a playlist   blue / Delete: remove   yellow: next tab', xalign=1)
+            hint = Gtk.Label(label='green: add to a playlist   blue / Delete: remove   yellow: next tab   exit: back', xalign=1)
             hint.get_style_context().add_class('hint')
             tabs.pack_start(hint, True, True, 0)
             top.pack_start(tabs, False, False, 0)
