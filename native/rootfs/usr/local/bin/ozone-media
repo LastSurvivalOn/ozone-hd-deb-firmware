@@ -8,10 +8,17 @@ are mounted whenever the network is up, and come back by themselves after the se
 network was away.
 
   ozone-media              the panel's indicator
-  ozone-media menu         the drives and folders: eject, open in Files or a terminal, add a network
-                           folder
+  ozone-media menu         the drives and folders: eject, open in Files or a terminal, format a drive
+                           (unreadable ones too), add a network folder
+  ozone-media format-menu PATH|DISK
+                           format that drive, asking how (Files' "Format the drive…"); prints where
+                           the new one is mounted
   ozone-media daemon       the daemon (root)
   ozone-media eject PATH   unmount PATH and everything else on its drive (root)
+  ozone-media format PATH|DISK TYPE [LABEL]
+                           erase the drive with PATH mounted from it (or DISK: sda, mmcblk0), give it
+                           one partition with TYPE (vfat, exfat, ntfs, ext4), mount it and print where
+                           (root)
   ozone-media forget PATH  unmount a network folder and forget it (or by its name; root)
   ozone-media add          mount a network folder and remember it: JSON on stdin, from menu (root)
   ozone-media stop         unmount everything, at shutdown (root)
@@ -34,6 +41,21 @@ PAUSED = RUN + '/disconnected'   # network folders disconnected from the menu, u
 LOG = '/var/log/ozone-media.log'
 DRIVES = re.compile(r'^(sd[a-z]+[0-9]*|mmcblk[0-9]+(p[0-9]+)?)$')   # not the NAND, not loops
 SHARE_RETRY = 20    # s between attempts at a network folder that isn't mounted
+FORMATTING = RUN + '/formatting'   # disks being formatted (a file each, with the pid): left alone
+# What a drive can be formatted as: the menu's line, MBR type, the longest label, mkfs (the label
+# and the partition are added)
+FILESYSTEMS = {
+    'exfat': ('exFAT: files of any size; computers, phones, newer TVs', '7', 15, ['mkfs.exfat']),
+    'vfat': ('FAT32: everything reads it (TVs, car radios, cameras); files up to 4 GB', 'c', 11,
+             ['mkfs.vfat']),
+    'ntfs': ('NTFS: for Windows; Macs only read it', '7', 32, ['mkfs.ntfs', '-Q']),
+    # not the features newer than the box's kernel 3.10, which then can't mount it
+    'ext4': ('ext4: Linux only (not Windows, not TVs)', '83', 16,
+             ['mkfs.ext4', '-F', '-q', '-m', '0', '-O', '^metadata_csum,^metadata_csum_seed,^orphan_file']),
+}
+GPT_DATA = 'EBD0A0A2-B9E5-4433-87C0-68B6B72699C7'    # Microsoft basic data
+GPT_LINUX = '0FC63DAF-8483-4772-8E79-3D69D8477DE4'
+MBR_MAX = 2 ** 41   # bytes: MBR's 2 TiB, GPT beyond
 NET_TYPES = ('cifs', 'fuse.rclone')
 AID_INET = 3003
 
@@ -163,9 +185,10 @@ def kind(name):
     return 'SD card' if name.startswith('mmcblk') else 'USB drive'
 
 
-def mount_drive(name):
+def mount_drive(name, formatted=False):
+    """formatted: the format command's own mount, while its marker still keeps the daemon off"""
     dev = '/dev/' + name
-    if any(src == dev for src, _ in mounts().values()):
+    if any(src == dev for src, _ in mounts().values()) or (formatting(disk_of(name)) and not formatted):
         return
     # the device node (devtmpfs) and the partition table can lag the uevent a little
     info = {}
@@ -197,6 +220,44 @@ def disk_of(name):
     """sda1 -> sda, mmcblk0p1 -> mmcblk0"""
     m = re.match(r'^(mmcblk[0-9]+)p[0-9]+$', name) or re.match(r'^(sd[a-z]+)[0-9]+$', name)
     return m.group(1) if m else name
+
+
+def formatting(disk):
+    """The disk is being formatted (by a format command still running): its partitions come and go,
+    and one mounted before its filesystem is finished would be a broken one"""
+    try:
+        with open(os.path.join(FORMATTING, disk)) as f:
+            os.kill(int(f.read()), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def read_sys(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ''
+
+
+def disks():
+    """{disk: (size in bytes, what it is)} of the USB drives and SD cards in the box, whatever is on
+    them (an empty card reader has size 0)"""
+    out = {}
+    for name in sorted(os.listdir('/sys/class/block')):
+        if not DRIVES.match(name) or disk_of(name) != name or os.path.exists('/sys/class/block/%s/partition' % name):
+            continue
+        size = int(read_sys('/sys/class/block/%s/size' % name) or 0) * 512
+        if size:
+            dev = '/sys/class/block/%s/device/' % name
+            what = ' '.join(read_sys(dev + f) for f in ('vendor', 'model', 'name') if read_sys(dev + f))
+            out[name] = (size, what or kind(name))
+    return out
+
+
+def size_text(n):
+    return '%.1f GB' % (n / 1e9) if n >= 1e9 else '%d MB' % (n // 10 ** 6)
 
 
 def scan(disk=None):
@@ -240,6 +301,104 @@ def eject(point):
     log('ejected %s' % ', '.join(points))
     notify('%s: safe to remove' % os.path.basename(point) if src.startswith('/dev/')
            else '%s disconnected' % os.path.basename(point))
+
+
+def label_for(fstype, label):
+    """What the filesystem takes as a label: FAT's are short, ASCII and upper case (as DOS kept
+    them), the others are cut to their length"""
+    label = ''.join(c for c in label if c.isprintable() and c != '/').strip()
+    if fstype == 'vfat':
+        label = ''.join(c for c in label.upper() if c.isascii() and c not in '*?.,;:\\|+=<>[]"')
+    longest = FILESYSTEMS[fstype][2]
+    # FAT's and ext4's lengths are in bytes, exFAT's and NTFS's in characters
+    size = (lambda t: len(t.encode())) if fstype in ('vfat', 'ext4') else len
+    while size(label) > longest:
+        label = label[:-1]
+    return label.strip()
+
+
+def format_drive(target, fstype, label=''):
+    """Erase a whole USB drive or SD card and give it one partition of fstype; prints where it is
+    mounted then"""
+    if fstype not in FILESYSTEMS:
+        sys.exit('no such type: %s (%s)' % (fstype, ', '.join(FILESYSTEMS)))
+    have = mounts()
+    point = os.path.realpath(target)
+    if point in have and have[point][0].startswith('/dev/'):
+        disk = disk_of(os.path.basename(have[point][0]))
+    else:
+        disk = os.path.basename(target)
+    if disk not in disks():
+        sys.exit('%s is not a USB drive or an SD card in the box' % target)
+    dev = '/dev/' + disk
+    parts = [n for n in os.listdir('/sys/class/block') if disk_of(n) == disk]
+    # nothing of it may be in use beyond /media: a swap, a mount made by hand
+    with open('/proc/swaps') as f:
+        swaps = [line.split()[0] for line in f.readlines()[1:]]
+    with open('/proc/mounts') as f:
+        elsewhere = [line.split()[1] for line in f if line.split()[0] in ['/dev/' + n for n in parts]]
+    if any(sw in ['/dev/' + n for n in parts] for sw in swaps) or \
+            any(not unescape(m).startswith(MEDIA + '/') for m in elsewhere):
+        sys.exit('%s is in use outside /media: not formatted' % dev)
+    label = label_for(fstype, label)
+    os.makedirs(FORMATTING, mode=0o700, exist_ok=True)
+    marker = os.path.join(FORMATTING, disk)
+    with open(marker, 'w') as f:
+        f.write(str(os.getpid()))
+    try:
+        for p, (src, _) in sorted(have.items()):
+            if src.startswith('/dev/') and disk_of(os.path.basename(src)) == disk:
+                code, err = unmount(p)
+                if code:
+                    sys.exit('%s is in use: close what has files open there' % os.path.basename(p)
+                             if 'busy' in err else '%s: %s' % (os.path.basename(p), err))
+        size = disks()[disk][0]
+        _, mbr, _, mkfs = FILESYSTEMS[fstype]
+        if size > MBR_MAX:
+            table = 'label: gpt\n,,%s\n' % (GPT_LINUX if fstype == 'ext4' else GPT_DATA)
+        else:
+            table = 'label: dos\n,,%s\n' % ('e' if fstype == 'vfat' and size < 512 * 2 ** 20 else mbr)
+        for n in sorted(parts, reverse=True):   # the old filesystems' signatures, so nothing finds them
+            run('wipefs', '-q', '-a', '/dev/' + n)
+        r = subprocess.run(['sfdisk', '-q', '--wipe', 'always', '--wipe-partitions', 'always', dev],
+                           input=table, capture_output=True, text=True)
+        if r.returncode:
+            sys.exit('%s: partitioning failed: %s' % (dev, (r.stderr or r.stdout).strip()))
+        part = disk + ('p1' if disk[-1].isdigit() else '1')
+        for _ in range(50):   # the kernel's new partition, and its node
+            if os.path.exists('/dev/' + part) and os.path.exists('/sys/class/block/' + part):
+                break
+            time.sleep(0.2)
+        else:
+            sys.exit('%s: the new partition did not appear' % dev)
+        cmd = list(mkfs)
+        if fstype == 'vfat':
+            # FAT32 needs some 65,000 clusters: a small card gets FAT16
+            cmd += ['-F', '32' if size >= 512 * 2 ** 20 else '16']
+        if label:
+            cmd += ['-n' if fstype == 'vfat' else '-L', label]
+        code, err = run(*cmd, '/dev/' + part)
+        if code:
+            sys.exit('%s: %s failed: %s' % (dev, cmd[0], err.splitlines()[-1] if err else code))
+        run('sync')
+        log('formatted %s: %s %s' % (dev, fstype, label))
+        # mounted while the marker is there: the daemon, busy with the partition's uevents, mounted
+        # it a second time when the marker went first
+        mount_drive(part, formatted=True)
+    finally:
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+    point = next((p for p, (src, _) in mounts().items() if src == '/dev/' + part), None)
+    if not point:
+        sys.exit('%s: formatted, but it does not mount' % dev)
+    if fstype == 'ext4':   # its root belongs to root: the user's, as on the other types
+        u = desktop_user()
+        os.chown(point, u.pw_uid, u.pw_gid)
+        os.chmod(point, 0o755)
+    as_user('polybar-msg', 'action', '#media.hook.0')
+    print(point)
 
 
 # ---- network folders -----------------------------------------------------------------------------
@@ -577,19 +736,30 @@ def say(text):
 
 def menu():
     items = describe()
-    labels = [label for label, _, _ in items] + ['  Add a network folder…']
-    choice = rofi('  Drives', labels,
-                  message=None if items else 'No drives: plug in a USB drive or an SD card')
+    mounted = {disk_of(os.path.basename(src)) for src, _ in mounts().values() if src.startswith('/dev/')}
+    # drives with nothing that mounts: new, broken, or of a type the box doesn't read
+    blank = [(disk, size, what) for disk, (size, what) in disks().items() if disk not in mounted]
+    labels = [label for label, _, _ in items] + \
+        ['%s  %s (%s): nothing readable on it' % (ICON_USB, what, size_text(size)) for _, size, what in blank] + \
+        ['  Add a network folder…']
+    choice = rofi('  Drives', labels,
+                  message=None if items or blank else 'No drives: plug in a USB drive or an SD card')
     if choice is None:
         return
     if choice.endswith('network folder…'):
         add_menu()
         return
+    for (disk, size, what), label in zip(blank, labels[len(items):]):
+        if label == choice:
+            if rofi(what, ['  Format it…']):
+                format_menu(disk)
+            return
     for label, point, drive in items:
         if label == choice:
-            what = rofi(os.path.basename(point), ['  Open in Files', '  Open in a terminal',
-                                                   '  Eject' if drive else '  Disconnect',
-                                                   ] + ([] if drive else ['  Forget this folder']))
+            what = rofi(os.path.basename(point), ['  Open in Files', '  Open in a terminal',
+                                                   '  Eject' if drive else '  Disconnect',
+                                                   ] + (['  Format the drive…'] if drive else
+                                                        ['  Forget this folder']))
             if what is None:
                 return
             if 'Files' in what:
@@ -598,11 +768,58 @@ def menu():
                 subprocess.Popen(['ozone-terminal', '--working-directory=' + point])
             elif 'Forget' in what:
                 subprocess.run(['sudo', '-n', sys.argv[0], 'forget', point])
+            elif 'Format' in what:
+                new = format_menu(point)
+                if new:
+                    subprocess.Popen(['ozone-files', new])
             else:
                 r = subprocess.run(['sudo', '-n', sys.argv[0], 'eject', point], capture_output=True, text=True)
                 if r.returncode:
                     say(r.stderr.strip() or 'Could not eject')
             return
+
+
+def format_menu(target):
+    """How to format the drive (a mount point on it, or the disk), asked in rofi; the new mount point,
+    or None"""
+    have = mounts()
+    point = os.path.realpath(target)
+    disk = disk_of(os.path.basename(have[point][0])) if point in have else os.path.basename(target)
+    info = disks().get(disk)
+    if not info:
+        say('%s is not a USB drive or an SD card' % target)
+        return None
+    size, what = info
+    names = [os.path.basename(p) for p, (src, _) in sorted(have.items())
+             if src.startswith('/dev/') and disk_of(os.path.basename(src)) == disk]
+    types = list(FILESYSTEMS)
+    # exFAT for big drives (FAT32 can't hold a file of 4 GB or more), FAT32 for small ones
+    first = 'exfat' if size > 32e9 else 'vfat'
+    types.remove(first)
+    types.insert(0, first)
+    choice = rofi('  Format as', [FILESYSTEMS[t][0] for t in types],
+                  message='%s, %s. Not sure: the first one' % (what, size_text(size)))
+    if choice is None:
+        return None
+    fstype = next(t for t in types if FILESYSTEMS[t][0] == choice)
+    label = rofi('  Name', message='What computers and the box will call it (up to %d letters; may be '
+                 'empty)' % FILESYSTEMS[fstype][2])
+    if label is None:
+        return None
+    label = label_for(fstype, label)
+    gone_ = ('%s' % ', '.join(names)) if names else 'it'
+    sure = rofi('  Erase it?', ['No, keep it', 'Yes, erase everything on it'],
+                message='Everything on %s (%s, %s) will be deleted, for good' % (gone_, what, size_text(size)))
+    if sure != 'Yes, erase everything on it':
+        return None
+    subprocess.Popen(['ozone-notify', 'Formatting %s (%s)…' % (what, size_text(size))])
+    r = subprocess.run(['sudo', '-n', sys.argv[0], 'format', disk, fstype, label], capture_output=True, text=True)
+    if r.returncode:
+        say('Not formatted: %s' % (r.stderr.strip() or 'unknown error'))
+        return None
+    new = r.stdout.strip().splitlines()[-1]
+    subprocess.Popen(['ozone-notify', 'Formatted: %s, %s' % (os.path.basename(new), choice.split(':')[0])])
+    return new
 
 
 def add_menu():
@@ -631,7 +848,7 @@ def add_menu():
 
 def main():
     args = sys.argv[1:]
-    root_only = {'daemon', 'eject', 'add', 'forget', 'stop'}
+    root_only = {'daemon', 'eject', 'add', 'forget', 'stop', 'format'}
     if args and args[0] in root_only and os.geteuid():
         sys.exit('%s %s: run as root' % (os.path.basename(sys.argv[0]), args[0]))
     if not args:
@@ -648,6 +865,13 @@ def main():
         add_share()
     elif args[0] == 'forget' and len(args) == 2:
         forget(args[1])
+    elif args[0] == 'format' and len(args) in (3, 4):
+        format_drive(args[1], args[2], args[3] if len(args) == 4 else '')
+    elif args[0] == 'format-menu' and len(args) == 2:
+        new = format_menu(args[1])
+        if not new:
+            sys.exit(1)
+        print(new)
     else:
         sys.exit(__doc__)
 

@@ -56,9 +56,13 @@ ssh_box 'set -e
     # WiFi (wpa_supplicant; the networks are chosen with ozone-wifi)
     sudo apt-get install -y -qq --no-install-recommends wpasupplicant > /dev/null
     sudo update-rc.d ozone-wifi defaults
-    # drives and network folders (ozone-media: FAT, NTFS, exFAT, ext; cifs-utils for SMB1 servers)
-    sudo apt-get install -y -qq --no-install-recommends ntfs-3g exfat-fuse cifs-utils > /dev/null
+    # drives and network folders (ozone-media: FAT, NTFS, exFAT, ext; cifs-utils for SMB1 servers;
+    # sfdisk, mkfs.vfat and mkfs.exfat to format a drive)
+    sudo apt-get install -y -qq --no-install-recommends ntfs-3g exfat-fuse cifs-utils fdisk dosfstools \
+        exfatprogs > /dev/null
     sudo update-rc.d ozone-media defaults
+    # a daemon still running keeps its old code (an old one mounts a drive while it is formatted)
+    if /etc/ozone/is-native; then sudo /etc/init.d/ozone-media restart; fi
     # the equalizer (sound-config puts it in /etc/asound.conf when it is turned on)
     sudo apt-get install -y -qq --no-install-recommends libasound2-plugin-equal caps > /dev/null
     # the folders Files starts with

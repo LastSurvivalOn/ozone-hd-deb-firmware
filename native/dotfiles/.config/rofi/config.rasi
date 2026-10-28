@@ -44,7 +44,10 @@ inputbar {
 }
 
 prompt { text-color: @mauve; }
-entry { placeholder: "search…"; placeholder-color: @subtext; }
+/* the text typed: rofi's built-in theme gives it normal-foreground, which this one doesn't set
+   (dark on dark: WiFi passwords, names were hard to read) */
+entry { placeholder: "search…"; placeholder-color: @subtext; text-color: @text; }
+case-indicator { text-color: @text; }
 
 listview { lines: 10; spacing: 4px; fixed-height: false; }
 

@@ -78,9 +78,9 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
 - [x] **Easy**: NTFS and exFAT (`ntfs-3g`, `exfat-fuse`; the kernel has fuse and vfat).
 - [x] **Easy**: network shares (Samba). Done with rclone for SMB2/3: the kernel's CIFS turned out
   to speak SMB1 only, which it still does for old servers.
-- [ ] **Easy or Medium**: a file browser for the remote (files on USB / SD / shares that open in
-  the player or the photo viewer), with formatting a drive. Files (ozone-files) does all but the
-  formatting.
+- [x] **Easy or Medium**: a file browser for the remote (files on USB / SD / shares that open in
+  the player or the photo viewer), with formatting a drive. Files (ozone-files) does it all;
+  formatting (FAT32, exFAT, NTFS, ext4) is in its menu and the drives menu, unreadable drives too.
 
 ## 4. Network and phones
 

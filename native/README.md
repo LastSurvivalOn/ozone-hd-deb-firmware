@@ -552,6 +552,19 @@ has no ffprobe) for videos and music, GdkPixbuf and a small EXIF reader (IFD0, t
 sub-IFDs) for photos. ozone-remote passes **exit** to Files as Esc (it closed the window before) and
 **info** to it as its own key.
 
+Formatting (`ozone-media format DISK|PATH TYPE [LABEL]`, root; asked in rofi by
+`ozone-media format-menu`, which the drives menu and Files' menu run): the whole disk, never the
+NAND (only `sd*` and `mmcblk*` whole disks, nothing of them used outside `/media`). It unmounts
+the disk's partitions, `wipefs` them, writes one partition with sfdisk (MBR, GPT past 2 TiB; type
+c / e for FAT32 / FAT16 under 512 MB, 7 for exFAT and NTFS, 83 for ext4), runs mkfs.vfat,
+mkfs.exfat (exfatprogs), mkfs.ntfs -Q or mkfs.ext4 and mounts the result. ext4 goes without
+`metadata_csum`, `metadata_csum_seed` and `orphan_file`, newer than kernel 3.10, and its root
+is given to the user. Meanwhile `/run/ozone-media/formatting/DISK` (with the pid) keeps the daemon
+off the disk until the format has mounted it itself: the partition's uevents came while mkfs ran,
+and a daemon mounting at the same time mounted the new drive twice. Tested on loop devices (each
+type, a drive in use, the GPT way) and on a USB stick (exFAT and back to FAT32, from the menu too):
+1-2 s for 16 GB.
+
 `ozone-screensaver` (started by bspwmrc) reads X's idle time from the MIT-SCREEN-SAVER extension
 (libXss through ctypes) every 15 s and starts `ozone-files --screensaver` after the minutes set,
 unless amplay, mpv or RetroArch runs or the box is in standby. The saver grabs the keyboard and

@@ -180,6 +180,20 @@ def places():
     return out
 
 
+def drive_of(path):
+    """The mount point in /media of the USB drive or SD card that path is on, or None"""
+    try:
+        with open('/proc/mounts') as f:
+            mounts = [line.split()[:2] for line in f]
+    except OSError:
+        return None
+    for dev, mnt in mounts:
+        mnt = mnt.replace('\\040', ' ')
+        if dev.startswith('/dev/') and mnt.startswith(MEDIA + '/') and (path == mnt or path.startswith(mnt + '/')):
+            return mnt
+    return None
+
+
 def prepare_label(text='', cls=None, **kw):
     kw.setdefault('xalign', 0)
     w = Gtk.Label(label=text, **kw)
@@ -1189,6 +1203,9 @@ class Window:
             items += [None, ('Delete %s…' % ('%d marked' % len(self.marked) if self.marked else 'it'),
                              lambda: self.delete(row))]
         items += [None, ('Screensaver…', self.saver_dialog)]
+        drive = drive_of(self.folder) if self.folder != DLNA else None
+        if drive:
+            items.append(('Format the drive (%s)…' % os.path.basename(drive), lambda: self.format_drive(drive)))
         m = Gtk.Menu()
         for item in items:
             if item is None:
@@ -1469,6 +1486,20 @@ class Window:
         if errors:
             self.say('Not deleted: ' + '; '.join(errors), 8)
         self.open_folder(self.folder, focus=True)
+
+    def format_drive(self, point):
+        """ozone-media asks how (rofi) and does it; then the new drive opens"""
+        def work():
+            r = subprocess.run(['ozone-media', 'format-menu', point], capture_output=True, text=True)
+            new = r.stdout.strip().splitlines()[-1] if r.returncode == 0 and r.stdout.strip() else None
+            GLib.idle_add(done, new)
+
+        def done(new):
+            self.refresh_places()
+            if new and os.path.isdir(new):
+                self.open_folder(new, focus=True)
+            return False
+        threading.Thread(target=work, daemon=True).start()
 
     def saver_folder(self, path):
         s = saver_settings()

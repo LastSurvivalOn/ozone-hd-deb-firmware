@@ -562,13 +562,28 @@ folders are open, and grey when there are none. Click it, press **usb** on the r
 
 | In the list | What it does |
 |---|---|
-| a drive | **Eject** (wait for "NAME: safe to remove", then pull it out), or **Open in a terminal** |
+| a drive | **Eject** (wait for "NAME: safe to remove", then pull it out), **Open in a terminal**, or **Format the drive…** (below) |
+| a drive "nothing readable on it" | a drive that doesn't open: new, damaged, or of a kind the box doesn't read. **Format it…** makes it usable (below) |
 | a network folder | **Disconnect** (until the box restarts), **Forget this folder** (disconnect it for good), **Open in a terminal** |
 | **Add a network folder…** | see below |
 
 Pull a USB stick out only after **Eject**. Pulled out without it, the panel says "…was removed
 without Eject": what was being written at that moment may be lost. If Eject says "NAME is in use",
 close the program that has a file open there (the player, a terminal standing in that folder).
+
+**Formatting** erases a USB drive or an SD card, all of it, and makes it new: in the drives
+menu, or in **Files** with the drive open, **blue** → **Format the drive…**. It asks three things:
+1. **What kind**: **FAT32** (the first one for drives up to 32 GB) is read by everything: TVs,
+   car radios, cameras, computers; its files can't be 4 GB or bigger. **exFAT** (the first one for
+   bigger drives) takes files of any size, for computers, phones and newer TVs. **NTFS** is for
+   Windows. **ext4** is for Linux only. Not sure: the first one.
+2. **The name** the drive will have on computers and on the box (it may stay empty).
+3. **Erase it?** It says which drive (its maker and size): **No, keep it** is the default;
+   **Yes, erase everything on it** formats it. Everything on the drive is gone for good.
+
+It takes a few seconds; then the drive opens with its new name ("Formatted: NAME, exFAT"). If it
+says the drive "is in use", stop what plays from it or close what has a file open there first.
+Only USB drives and SD cards can be formatted, never the box's own memory.
 
 **Network folders** are the shared folders of a computer or a NAS on the home network (Windows
 "sharing", Samba, a router with a USB disk). **Add a network folder…** asks three things:
@@ -599,7 +614,7 @@ Everything works with the remote:
 | **← / →** | | between the places and the files |
 | **OK** | **Enter** | open: a folder, a video, a piece of music, a photo |
 | **exit** | **Esc** | unmark, up a folder, then the places, then close |
-| **blue** | **Menu**, a right click | the menu: play from the start, a slideshow, info, mark, copy, cut, rename, paste, new folder, mark all, delete, the screensaver |
+| **blue** | **Menu**, a right click | the menu: play from the start, a slideshow, info, mark, copy, cut, rename, paste, new folder, mark all, delete, the screensaver; on a USB drive or SD card, formatting it (section 11) |
 | **green** | **Insert** | mark / unmark, and on to the next: for copying, moving or deleting several |
 | **red** | **Ctrl+C** | copy the marked files (or the one chosen); **Ctrl+X** cuts them, to move |
 | **yellow** | **Ctrl+V** | paste them into the folder open now |
