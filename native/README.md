@@ -583,5 +583,20 @@ type, a drive in use, the GPT way) and on a USB stick (exFAT and back to FAT32, 
 `ozone-screensaver` (started by bspwmrc) reads X's idle time from the MIT-SCREEN-SAVER extension
 (libXss through ctypes) every 15 s and starts `ozone-photos --screensaver` after the minutes set,
 unless amplay, mpv or RetroArch runs or the box is in standby. The saver grabs the keyboard and
-pointer once it is mapped, so the first key ends it wherever the focus was.
+pointer once it is mapped, so the first key ends it wherever the focus was. A window opening on the
+desktop ends it too: bspwm takes full screen away from a fullscreen window when another one is
+added, which left the saver tiled beside it.
+
+## Calendar
+
+`ozone-calendar` (GTK): the month grid, the chosen day's events beside it, and an event's form in
+the same place (no dialogs: everything is moved through with the arrows, and a hint bar says what
+the keys do). Events are kept in `~/.local/share/ozone-calendar/events.json` (date, time or all
+day, repeat weekly / monthly / yearly, minutes of reminder before). Holidays are Ukraine's, by
+the 2023 laws from 2024 on (Christmas on 25 December, 8 May, 15 July, 1 October), Easter and
+Trinity by the Julian reckoning. `ozone-calendar reminders` (bspwmrc) looks at the events every
+20 s, keeps what it showed in `reminded.json` (and what was put off by 10 minutes), wakes the box
+from standby as TV timers do, and starts `ozone-calendar popup`, a dialog in bspwm's `above` layer
+(`bspc rule -a Ozone-reminder`), over fullscreen windows. A GTK entry moved between rows is taken
+out of its row first: a container dropped with it inside destroys it, and its text with it.
 

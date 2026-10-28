@@ -17,6 +17,8 @@ pgrep -f "^/usr/bin/python3 /usr/local/bin/ozone-tv timer[s]" > /dev/null || ozo
 ozone-dlna renderer &
 # Bluetooth: pairing codes on the screen, the sound to headphones while they are connected
 pgrep -f "^/usr/bin/python3 /usr/local/bin/ozone-bluetooth agen[t]" > /dev/null || ozone-bluetooth agent &
+# the calendar's reminders, waking the screen from sleep
+pgrep -f "^/usr/bin/python3 /usr/local/bin/ozone-calendar reminder[s]" > /dev/null || ozone-calendar reminders &
 
 bspc monitor -d 1 2 3 4 5
 
@@ -37,6 +39,8 @@ bspc rule -a mpv state=fullscreen
 # the photo viewer asks for full screen, but bspwm mapped it floating, in a small square
 bspc rule -a Ozone-photos state=fullscreen
 bspc rule -a Rofi state=floating
+# a reminder comes over everything, the player and full-screen windows too
+bspc rule -a Ozone-reminder state=floating layer=above
 
 feh --no-fehbg --bg-fill ~/.local/share/wallpapers/ozone.png
 ~/.config/polybar/launch.sh

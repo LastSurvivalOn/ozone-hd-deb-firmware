@@ -16,6 +16,7 @@ tar -C "$HERE/rootfs" -czf - \
     usr/local/share/applications/ozone-display.desktop usr/local/share/applications/ozone-equalizer.desktop \
     usr/local/share/applications/ozone-files.desktop usr/local/bin/ozone-photos \
     usr/local/share/applications/ozone-photos.desktop \
+    usr/local/bin/ozone-calendar usr/local/share/applications/ozone-calendar.desktop \
     usr/local/bin/yt usr/local/bin/ozone-web usr/local/bin/ozone-web-show usr/local/share/applications/ozone-web.desktop usr/local/bin/ozone-power usr/local/bin/ozone-screen usr/local/share/applications/ozone-screen.desktop usr/local/bin/ozone-standby usr/local/bin/ozone-notify etc/init.d/ozone-input etc/ozone/remote.conf etc/ozone/native-only \
     usr/local/bin/ozone-wifi usr/local/bin/ozone-volume usr/local/bin/ozone-remote usr/local/bin/ozone-panel usr/local/bin/ozone-media usr/local/share/applications/ozone-media.desktop usr/local/bin/ozone-terminal usr/local/share/applications/ozone-terminal.desktop usr/local/bin/ozone-sysinfo usr/local/share/applications/ozone-sysinfo.desktop etc/init.d/ozone-media usr/local/share/applications/ozone-wifi.desktop usr/local/share/applications/yt.desktop usr/local/share/applications/ozone-tv.desktop usr/local/share/applications/ozone-power.desktop etc/init.d/ozone-wifi usr/local/lib/ozone/wifi-event usr/local/lib/ozone/netwatch \
     usr/local/lib/ozone/gen-xorg-screen etc/X11/Xwrapper.config etc/asound.conf |

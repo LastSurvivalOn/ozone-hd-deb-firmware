@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Calendar
+Comment=The month with Ukraine's holidays, events, birthdays and reminders
+Exec=ozone-calendar
+Icon=x-office-calendar
+Terminal=false
+Categories=Office;Calendar;

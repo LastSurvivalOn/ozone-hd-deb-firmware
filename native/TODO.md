@@ -99,7 +99,8 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
 ## 5. Apps and system
 
 - [ ] **Easy**: date, time and time zone settings in a menu (now set in files: Europe/Kyiv, chrony).
-- [ ] **Easy or Medium**: small apps for the remote: clock / alarm, calculator, calendar.
+- [ ] **Easy or Medium**: small apps for the remote: clock / alarm, calculator, calendar. The
+  calendar is done (`ozone-calendar`: events, birthdays, reminders, Ukraine's holidays).
 - [ ] **Medium**: YouTube features SmartTube has and `yt` doesn't: account sign-in, subscriptions,
   history, the home feed, channel pages, playlists, SponsorBlock, YouTube's own subtitles, speed,
   chapters. Starting a video also takes ~10 s.

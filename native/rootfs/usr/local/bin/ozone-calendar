@@ -1,0 +1,925 @@
+#!/usr/bin/python3
+"""ozone-calendar: a month calendar for the remote, with events, reminders and Ukraine's holidays.
+
+  ozone-calendar               the window
+  ozone-calendar reminders     the reminder service (bspwmrc starts it): shows a reminder when one
+                               is due, waking the screen from sleep
+  ozone-calendar popup ID DAY  one reminder's window (the service starts it)
+
+The month: the arrows choose a day, page+ / page- the month, 0 today; OK opens the day (its events,
+or a new one if it has none), green (or N) a new event on it, exit closes. The day: up / down
+choose an event, OK edits it, blue (or Delete) removes it (pressed twice), exit back to the month.
+An event: up / down choose a line, left / right change it (the date, the time, how it repeats, the
+reminder), the digits type a time, OK on Save saves it, exit cancels. The bar at the bottom always
+says which keys do what.
+
+Events are kept in ~/.local/share/ozone-calendar/events.json: {"id", "date": "YYYY-MM-DD",
+"time": "HH:MM" or "" (all day), "title", "repeat": "" / "weekly" / "monthly" / "yearly",
+"remind": minutes before or null}. An all-day event reminds at 9:00.
+"""
+import calendar
+import datetime
+import json
+import os
+import subprocess
+import sys
+import time
+import uuid
+
+HOME = os.path.expanduser('~')
+DATA = os.path.join(os.environ.get('XDG_DATA_HOME') or os.path.join(HOME, '.local/share'), 'ozone-calendar')
+EVENTS = os.path.join(DATA, 'events.json')
+REMINDED = os.path.join(DATA, 'reminded.json')
+ALL_DAY_AT = 9 * 60          # minutes after midnight: when an all-day event reminds
+CHECK = 20                   # s between the service's looks at the clock
+LATE = 6 * 3600              # s: a reminder missed by more than this (the box was off) is dropped
+
+REPEATS = [('', 'Once'), ('weekly', 'Every week'), ('monthly', 'Every month'), ('yearly', 'Every year')]
+REMINDS = [(None, 'No reminder'), (0, 'At the time'), (10, '10 minutes before'), (30, '30 minutes before'),
+           (60, '1 hour before'), (180, '3 hours before'), (1440, 'The day before'), (10080, 'A week before')]
+WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+MONTHS = [None, 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September',
+          'October', 'November', 'December']
+
+
+# ---- the events -----------------------------------------------------------------------------------
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def load_events():
+    return [e for e in load(EVENTS, []) if isinstance(e, dict) and e.get('date')]
+
+
+def occurs(ev, day):
+    """The event happens on this day (a datetime.date)"""
+    try:
+        first = datetime.date.fromisoformat(ev['date'])
+    except ValueError:
+        return False
+    if day < first:
+        return False
+    rep = ev.get('repeat', '')
+    if rep == 'weekly':
+        return (day - first).days % 7 == 0
+    if rep == 'monthly':
+        # the 31st of a month: the last day of shorter ones
+        return day.day == min(first.day, calendar.monthrange(day.year, day.month)[1])
+    if rep == 'yearly':
+        if (first.month, first.day) == (2, 29) and not calendar.isleap(day.year):
+            return (day.month, day.day) == (2, 28)
+        return (day.month, day.day) == (first.month, first.day)
+    return day == first
+
+
+def minutes(ev):
+    """When in the day the event is, in minutes; None all day"""
+    t = ev.get('time') or ''
+    try:
+        h, m = t.split(':')
+        return int(h) * 60 + int(m)
+    except ValueError:
+        return None
+
+
+def on_day(events, day):
+    out = [e for e in events if occurs(e, day)]
+    return sorted(out, key=lambda e: (minutes(e) is not None, minutes(e) or 0, e.get('title', '').casefold()))
+
+
+def when_text(ev):
+    m = minutes(ev)
+    return 'all day' if m is None else '%02d:%02d' % divmod(m, 60)
+
+
+def orthodox_easter(year):
+    """Easter by the Julian reckoning (Meeus), as a Gregorian date"""
+    a, b, c = year % 4, year % 7, year % 19
+    d = (19 * c + 15) % 30
+    e = (2 * a + 4 * b - d + 34) % 7
+    month, day = divmod(d + e + 114, 31)
+    return datetime.date(year, month, day + 1) + datetime.timedelta(days=13)
+
+
+def holidays(year):
+    """Ukraine's public holidays: {date: name}. Since 2024 they follow the new church calendar
+    (Christmas on 25 December) and the new days of 2023's laws. Under martial law they are
+    working days, but still the holidays."""
+    easter = orthodox_easter(year)
+    d = datetime.date
+    out = {d(year, 1, 1): "New Year's Day", d(year, 3, 8): "International Women's Day",
+           easter: 'Easter', easter + datetime.timedelta(days=49): 'Trinity',
+           d(year, 5, 1): "International Workers' Day", d(year, 6, 28): 'Constitution Day',
+           d(year, 8, 24): 'Independence Day', d(year, 12, 25): 'Christmas'}
+    if year >= 2024:
+        out.update({d(year, 5, 8): 'Day of Remembrance and Victory over Nazism',
+                    d(year, 7, 15): 'Statehood Day', d(year, 10, 1): 'Defenders Day'})
+    else:
+        out.update({d(year, 1, 7): 'Christmas (old calendar)', d(year, 5, 9): 'Victory Day',
+                    d(year, 10, 14): 'Defenders Day'})
+        if year >= 2022:
+            out[d(year, 7, 28)] = 'Statehood Day'
+    return out
+
+
+_HOLIDAYS = {}
+
+
+def holiday(day):
+    if day.year not in _HOLIDAYS:
+        _HOLIDAYS[day.year] = holidays(day.year)
+    return _HOLIDAYS[day.year].get(day)
+
+
+def long_date(day):
+    return '%s, %d %s %d' % (calendar.day_name[day.weekday()], day.day, MONTHS[day.month], day.year)
+
+
+# ---- reminders ------------------------------------------------------------------------------------
+
+def due_at(ev, day):
+    """The time (epoch) the event on this day reminds at, or None"""
+    before = ev.get('remind')
+    if before is None:
+        return None
+    m = minutes(ev)
+    at = datetime.datetime.combine(day, datetime.time()) + datetime.timedelta(
+        minutes=(ALL_DAY_AT if m is None else m) - before)
+    return at.timestamp()
+
+
+def reminder_service():
+    """Looks at the clock every CHECK s; a reminder due since the last look (or missed by less than
+    LATE, as after a power off) opens its window. Each one once: reminded.json keeps them."""
+    env = dict(os.environ)
+    env.setdefault('DISPLAY', ':0')
+    while True:
+        now = time.time()
+        done = load(REMINDED, {})
+        changed = False
+        today = datetime.date.today()
+        events = load_events()
+        # a reminder is due at most a week before the day (the longest choice)
+        for offset in range(-1, 8):
+            day = today + datetime.timedelta(days=offset)
+            for ev in events:
+                if not occurs(ev, day):
+                    continue
+                at = due_at(ev, day)
+                key = '%s@%s' % (ev.get('id'), day.isoformat())
+                if at is None or at > now or now - at > LATE or key in done:
+                    continue
+                done[key] = now
+                changed = True
+                show_reminder(ev['id'], day.isoformat(), env)
+        snoozed = done.get('snoozed') if isinstance(done.get('snoozed'), dict) else {}
+        for key, at in list(snoozed.items()):
+            if at <= now:
+                del snoozed[key]
+                changed = True
+                ev_id, day = key.split('@', 1)
+                show_reminder(ev_id, day, env)
+        # forget the old ones
+        for key in [k for k, v in done.items() if k != 'snoozed' and isinstance(v, (int, float)) and v < now - 9 * 86400]:
+            del done[key]
+            changed = True
+        if changed:
+            save(REMINDED, done)
+        time.sleep(CHECK)
+
+
+def show_reminder(ev_id, day, env):
+    print('%s: reminder %s %s' % (time.strftime('%F %T'), ev_id, day), flush=True)
+    if os.path.exists('/run/ozone-standby.lock'):   # asleep: the screen on first
+        subprocess.call(['sudo', '-n', '/usr/local/bin/ozone-standby', 'wake'])
+    subprocess.Popen([sys.argv[0], 'popup', ev_id, day], env=env, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+# ---- the windows ----------------------------------------------------------------------------------
+
+CSS = b"""
+* { font-family: "DejaVu Sans"; font-size: 13px; color: #cdd6f4; }
+window { background: #11111b; }
+.header { padding: 10px 16px; }
+.logo { font-family: "FontAwesome"; font-size: 24px; color: #cba6f7; }
+.heading { font-size: 18px; font-weight: bold; }
+.month { font-size: 20px; font-weight: bold; padding: 0 12px; }
+.clock { color: #a6adc8; font-size: 15px; padding: 0 8px; }
+button { background: #1e1e2e; border: 1px solid #313244; border-radius: 16px; padding: 4px 14px;
+         box-shadow: none; }
+button:hover { border-color: #cba6f7; }
+button.close { font-family: "FontAwesome"; font-size: 16px; background: transparent; border: none;
+               padding: 4px 10px; color: #a6adc8; }
+button.close:hover { background: #f38ba8; color: #11111b; }
+button.nav { font-family: "FontAwesome"; padding: 4px 12px; }
+.weekday { color: #7f849c; font-weight: bold; padding: 4px 0; }
+.weekday.weekend { color: #f38ba8; }
+.cell { background: #1e1e2e; border-radius: 8px; padding: 4px 8px; border: 2px solid #1e1e2e; }
+.cell.other { background: #181825; border-color: #181825; }
+.cell.other .num { color: #585b70; }
+.cell.today { border-color: #89b4fa; }
+.cell.today .num { color: #89b4fa; }
+.cell.selected { border-color: #cba6f7; background: #313244; }
+.num { font-size: 17px; font-weight: bold; }
+.weekend .num { color: #f38ba8; }
+.holiday .num { color: #f38ba8; }
+.mark { font-size: 11px; color: #a6adc8; }
+.mark.hol { color: #f38ba8; }
+.side { background: #181825; border-radius: 12px; padding: 16px 18px; }
+.dayname { font-size: 15px; color: #a6adc8; }
+.daynum { font-size: 22px; font-weight: bold; }
+.dayhol { color: #f38ba8; }
+.row { padding: 8px 10px; border-radius: 8px; border: 2px solid transparent; }
+.row.chosen { border-color: #cba6f7; background: #313244; }
+.row .time { font-family: "JetBrains Mono"; color: #89b4fa; min-width: 64px; }
+.row .rep { color: #7f849c; font-size: 12px; }
+.add { color: #a6e3a1; }
+.key { color: #a6adc8; min-width: 92px; }
+.value { font-weight: bold; }
+.arrows { font-family: "FontAwesome"; color: #585b70; }
+.row.chosen .arrows { color: #cba6f7; }
+entry { background: #11111b; border: 1px solid #45475a; border-radius: 6px; padding: 4px 8px;
+        caret-color: #cba6f7; }
+.save { color: #a6e3a1; font-weight: bold; }
+.danger { color: #f38ba8; }
+.warn { color: #f9e2af; }
+.hints { background: #181825; padding: 8px 16px; color: #a6adc8; }
+.popup { background: #1e1e2e; border: 2px solid #cba6f7; }
+.bell { font-family: "FontAwesome"; font-size: 40px; color: #f9e2af; }
+.ptitle { font-size: 22px; font-weight: bold; }
+.pwhen { font-size: 15px; color: #a6adc8; }
+.pbtn { padding: 8px 22px; border-radius: 16px; background: #313244; border: 2px solid #313244; }
+.pbtn.chosen { border-color: #cba6f7; }
+"""
+
+# the remote's colour buttons and what a keyboard has for them
+GREEN = ('Launch2', 'n', 'N', 'Insert')
+BLUE = ('Launch4', 'Delete')
+
+
+def hint_markup(pairs):
+    """[(keys, what)] as the hint bar's text; a colour name becomes a dot of its colour"""
+    colours = {'red': '#f38ba8', 'green': '#a6e3a1', 'yellow': '#f9e2af', 'blue': '#89b4fa'}
+    out = []
+    for keys, what in pairs:
+        k = GLib.markup_escape_text(keys)
+        for name, c in colours.items():
+            k = k.replace(name, '<span foreground="%s">●</span> %s' % (c, name))
+        out.append('<b>%s</b>  %s' % (k, GLib.markup_escape_text(what)))
+    return '      '.join(out)
+
+
+def setup_gtk():
+    global Gdk, GLib, Gtk, Pango
+    import gi
+    gi.require_version('Gtk', '3.0')
+    gi.require_version('Gdk', '3.0')
+    from gi.repository import Gdk, GLib, Gtk, Pango
+    # GTK's CSS parser loses the first number of the first stylesheet to a stale errno (see yt)
+    try:
+        Gtk.CssProvider().load_from_data(b'* { padding: 0px; }')
+    except GLib.Error:
+        pass
+    style = Gtk.CssProvider()
+    style.load_from_data(CSS)
+    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), style,
+                                             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+
+def label(text='', cls=None, **kw):
+    kw.setdefault('xalign', 0)
+    w = Gtk.Label(label=text, **kw)
+    for c in (cls or '').split():
+        w.get_style_context().add_class(c)
+    return w
+
+
+def classes(widget, *names, on=True):
+    ctx = widget.get_style_context()
+    for n in names:
+        (ctx.add_class if on else ctx.remove_class)(n)
+
+
+class Calendar:
+    def __init__(self):
+        self.events = load_events()
+        self.today = datetime.date.today()
+        self.day = self.today
+        self.mode = 'month'      # month, day (its list of events), form (an event)
+        self.chosen = 0          # the row in the day's list or the form
+        self.armed = None        # a delete waiting for its second press
+        self.win = Gtk.Window(title='Calendar')
+        self.win.set_default_size(1280, 720)
+        self.win.connect('destroy', Gtk.main_quit)
+        self.win.connect('key-press-event', self.on_key)
+
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        header = Gtk.Box(spacing=8)
+        classes(header, 'header')
+        header.pack_start(label('\uf073', 'logo'), False, False, 0)
+        header.pack_start(label('Calendar', 'heading'), False, False, 0)
+        prev = Gtk.Button(label='\uf053', tooltip_text='The previous month (page-)')
+        classes(prev, 'nav')
+        prev.connect('clicked', lambda w: self.move_month(-1))
+        self.month_label = label('', 'month')
+        nxt = Gtk.Button(label='\uf054', tooltip_text='The next month (page+)')
+        classes(nxt, 'nav')
+        nxt.connect('clicked', lambda w: self.move_month(1))
+        today = Gtk.Button(label='Today', tooltip_text='Today (0)')
+        today.connect('clicked', lambda w: self.go(datetime.date.today()))
+        header.pack_start(Gtk.Box(), True, True, 0)
+        for w in (prev, self.month_label, nxt, today):
+            header.pack_start(w, False, False, 0)
+        header.pack_start(Gtk.Box(), True, True, 0)
+        self.clock = label('', 'clock')
+        header.pack_start(self.clock, False, False, 0)
+        close = Gtk.Button(label='\uf00d', tooltip_text='Close (exit)')
+        classes(close, 'close')
+        close.connect('clicked', lambda w: self.win.destroy())
+        header.pack_start(close, False, False, 0)
+        for w in header.get_children():
+            w.set_can_focus(False)
+        top.pack_start(header, False, False, 0)
+
+        body = Gtk.Box(spacing=16, margin_start=16, margin_end=16, margin_bottom=12)
+        grid = Gtk.Grid(row_spacing=6, column_spacing=6, row_homogeneous=False, column_homogeneous=True)
+        for c, name in enumerate(WEEKDAYS):
+            w = label(name, 'weekday', xalign=0.5)
+            classes(w, 'weekend', on=c >= 5)
+            grid.attach(w, c, 0, 1, 1)
+        self.cells = []
+        for r in range(6):
+            for c in range(7):
+                box = Gtk.EventBox(visible_window=True, hexpand=True, vexpand=True)
+                classes(box, 'cell')
+                inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+                num = label('', 'num')
+                marks = label('', 'mark', ellipsize=Pango.EllipsizeMode.END, max_width_chars=1,
+                              hexpand=True, yalign=0, lines=3, wrap=True)
+                inner.pack_start(num, False, False, 0)
+                inner.pack_start(marks, True, True, 0)
+                box.add(inner)
+                box.connect('button-press-event', self.on_cell, len(self.cells))
+                grid.attach(box, c, r + 1, 1, 1)
+                self.cells.append((box, num, marks))
+        body.pack_start(grid, True, True, 0)
+
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, width_request=380)
+        classes(side, 'side')
+        self.side_name = label('', 'dayname')
+        self.side_num = label('', 'daynum')
+        self.side_hol = label('', 'dayhol', wrap=True)
+        for w in (self.side_name, self.side_num, self.side_hol):
+            side.pack_start(w, False, False, 0)
+        side.pack_start(Gtk.Box(height_request=8), False, False, 0)
+        self.rows_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True, can_focus=False)
+        scroll.add(self.rows_box)
+        self.scroll = scroll
+        side.pack_start(scroll, True, True, 0)
+        self.message = label('', 'warn', wrap=True)
+        side.pack_start(self.message, False, False, 0)
+        body.pack_start(side, False, False, 0)
+        top.pack_start(body, True, True, 0)
+
+        self.hints = label('', 'hints', use_markup=True)
+        top.pack_start(self.hints, False, False, 0)
+        self.win.add(top)
+
+        self.entry = Gtk.Entry(placeholder_text='What is it (text on the remote types)')
+        self.entry.connect('activate', lambda w: self.form_move(1))
+        self.win.show_all()
+        self.render()
+        self.tick()
+        GLib.timeout_add_seconds(20, self.tick)
+
+    # -- drawing
+
+    def tick(self):
+        now = datetime.datetime.now()
+        self.clock.set_text(now.strftime('%H:%M'))
+        if now.date() != self.today:   # past midnight
+            self.today = now.date()
+            self.render()
+        return True
+
+    def month_days(self):
+        first = self.day.replace(day=1)
+        start = first - datetime.timedelta(days=first.weekday())
+        return [start + datetime.timedelta(days=i) for i in range(42)]
+
+    def render(self):
+        self.month_label.set_text('%s %d' % (MONTHS[self.day.month], self.day.year))
+        for (box, num, marks), d in zip(self.cells, self.month_days()):
+            num.set_text(str(d.day))
+            hol = holiday(d)
+            evs = on_day(self.events, d)
+            lines = []
+            if hol:
+                lines.append('<span foreground="#f38ba8">%s</span>' % GLib.markup_escape_text(hol))
+            for e in evs:
+                m = minutes(e)
+                lines.append(GLib.markup_escape_text(('%02d:%02d ' % divmod(m, 60) if m is not None else '• ')
+                                                     + e.get('title', '')))
+            marks.set_markup('\n'.join(lines))
+            classes(box, 'other', on=d.month != self.day.month)
+            classes(box, 'today', on=d == self.today)
+            classes(box, 'selected', on=d == self.day)
+            classes(box, 'weekend', on=d.weekday() >= 5)
+            classes(box, 'holiday', on=bool(hol))
+        self.side_name.set_text(calendar.day_name[self.day.weekday()] +
+                                ('  · today' if self.day == self.today else ''))
+        self.side_num.set_text('%d %s %d' % (self.day.day, MONTHS[self.day.month], self.day.year))
+        hol = holiday(self.day)
+        self.side_hol.set_text(hol or '')
+        self.side_hol.set_visible(bool(hol))
+        if self.mode == 'form':
+            self.render_form()
+        else:
+            self.render_day()
+        self.render_hints()
+
+    def clear_rows(self):
+        # the entry first: a row dropped with it inside destroys it, and its text
+        if self.entry.get_parent():
+            self.entry.get_parent().remove(self.entry)
+        for w in self.rows_box.get_children():
+            self.rows_box.remove(w)
+
+    def row(self, index, cls=''):
+        box = Gtk.EventBox(visible_window=False)
+        inner = Gtk.Box(spacing=10)
+        classes(inner, 'row', *cls.split())
+        classes(inner, 'chosen', on=self.mode != 'month' and index == self.chosen)
+        box.add(inner)
+        box.connect('button-press-event', self.on_row, index)
+        self.rows_box.pack_start(box, False, False, 0)
+        return inner
+
+    def render_day(self):
+        self.clear_rows()
+        self.day_events = on_day(self.events, self.day)
+        r = self.row(0)
+        r.pack_start(label('\uf067  New event', 'add'), True, True, 0)
+        for i, e in enumerate(self.day_events, 1):
+            r = self.row(i)
+            r.pack_start(label(when_text(e), 'time', yalign=0), False, False, 0)
+            texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            texts.pack_start(label(e.get('title', ''), wrap=True, max_width_chars=26), False, False, 0)
+            extra = [t for v, t in REPEATS if v == e.get('repeat', '') and v] + \
+                    ['\uf0f3 ' + t.lower() for v, t in REMINDS if v == e.get('remind') and v is not None]
+            if extra:
+                texts.pack_start(label(' · '.join(extra), 'rep'), False, False, 0)
+            r.pack_start(texts, True, True, 0)
+        if not self.day_events:
+            self.rows_box.pack_start(label('Nothing on this day.', 'rep', margin_start=10, margin_top=8),
+                                     False, False, 0)
+        self.rows_box.show_all()
+
+    FORM = ['title', 'date', 'time', 'repeat', 'remind', 'save', 'delete', 'cancel']
+
+    def render_form(self):
+        self.clear_rows()
+        f = self.form
+        for i, name in enumerate(self.FORM):
+            if name == 'delete' and not f.get('id_old'):
+                continue
+            r = self.row(i)
+            if name == 'title':
+                r.pack_start(label('Event', 'key'), False, False, 0)
+                r.pack_start(self.entry, True, True, 0)
+                continue
+            if name in ('save', 'delete', 'cancel'):
+                text = {'save': '\uf00c  Save', 'cancel': '\uf05e  Cancel',
+                        'delete': '\uf1f8  Press OK again to delete it' if self.armed == 'form' else '\uf1f8  Delete'}[name]
+                r.pack_start(label(text, {'save': 'save', 'delete': 'danger', 'cancel': ''}[name]), True, True, 0)
+                continue
+            key = {'date': 'Date', 'time': 'Time', 'repeat': 'Repeats', 'remind': 'Reminder'}[name]
+            r.pack_start(label(key, 'key'), False, False, 0)
+            r.pack_start(label('\uf104', 'arrows'), False, False, 0)
+            r.pack_start(label(self.form_value(name), 'value', ellipsize=Pango.EllipsizeMode.END), True, True, 0)
+            r.pack_start(label('\uf105', 'arrows'), False, False, 0)
+        self.rows_box.show_all()
+        if self.FORM[self.chosen] == 'title':
+            self.entry.grab_focus_without_selecting()
+        else:
+            self.win.set_focus(None)
+
+    def form_value(self, name):
+        f = self.form
+        if name == 'date':
+            d = datetime.date.fromisoformat(f['date'])
+            return '%s %d %s %d' % (WEEKDAYS[d.weekday()], d.day, MONTHS[d.month][:3], d.year)
+        if name == 'time':
+            if f.get('typed'):
+                t = f['typed'].ljust(4, '_')
+                return '%s:%s' % (t[:2], t[2:])
+            return when_text(f)
+        if name == 'repeat':
+            return dict(REPEATS)[f['repeat']]
+        if name == 'remind':
+            return dict(REMINDS)[f['remind']]
+        return ''
+
+    def render_hints(self):
+        if self.mode == 'month':
+            pairs = [('← → ↑ ↓', 'day'), ('page+ page−', 'month'), ('OK', 'the day'), ('green', 'new event'),
+                     ('0', 'today'), ('exit', 'close')]
+        elif self.mode == 'day':
+            pairs = [('↑ ↓', 'choose'), ('OK', 'open'), ('blue', 'delete'), ('green', 'new event'),
+                     ('exit', 'back to the month')]
+        else:
+            name = self.FORM[self.chosen]
+            pairs = [('↑ ↓', 'line')]
+            if name == 'title':
+                pairs += [('text', 'on-screen keyboard'), ('OK', 'next line')]
+            elif name == 'time':
+                pairs += [('← →', '15 minutes'), ('0–9', 'type the time'), ('delete', 'all day')]
+            elif name == 'date':
+                pairs += [('← →', 'day'), ('page+ page−', 'month')]
+            elif name in ('repeat', 'remind'):
+                pairs += [('← →', 'change')]
+            else:
+                pairs += [('OK', name)]
+            pairs += [('exit', 'cancel')]
+        self.hints.set_markup(hint_markup(pairs))
+
+    # -- moving about
+
+    def go(self, day):
+        self.day = day
+        self.armed = None
+        if self.mode == 'day':
+            self.chosen = 0
+        self.message.set_text('')
+        self.render()
+
+    def move_month(self, n):
+        y, m = divmod(self.day.year * 12 + self.day.month - 1 + n, 12)
+        self.go(self.day.replace(year=y, month=m + 1, day=min(self.day.day, calendar.monthrange(y, m + 1)[1])))
+
+    def on_cell(self, box, ev, index):
+        if self.mode == 'form':
+            return False
+        if ev.type == Gdk.EventType._2BUTTON_PRESS:
+            self.open_day()
+        else:
+            self.go(self.month_days()[index])
+        return True
+
+    def on_row(self, box, ev, index):
+        if ev.type != Gdk.EventType.BUTTON_PRESS:
+            return False
+        if self.mode == 'month':
+            self.mode = 'day'
+        if self.mode == 'form' and self.FORM[index] in ('date', 'time', 'repeat', 'remind'):
+            self.chosen = index
+            self.form_change(1 if ev.button == 1 else -1)
+            return True
+        self.chosen = index
+        self.activate()
+        return True
+
+    def open_day(self):
+        self.day_events = on_day(self.events, self.day)
+        if not self.day_events:
+            self.new_event()
+            return
+        self.mode = 'day'
+        self.chosen = 1
+        self.render()
+
+    def new_event(self, ev=None):
+        if ev is None:
+            ev = {'date': self.day.isoformat(), 'time': '', 'title': '', 'repeat': '', 'remind': None}
+        self.form = dict(ev)
+        self.form['id_old'] = ev.get('id')
+        self.form['date_shown'] = self.day.isoformat()
+        self.entry.set_text(ev.get('title', ''))
+        self.mode = 'form'
+        self.chosen = 0
+        self.armed = None
+        self.message.set_text('')
+        self.render()
+
+    def activate(self):
+        if self.mode == 'day':
+            if self.chosen == 0:
+                self.new_event()
+            else:
+                e = self.day_events[self.chosen - 1]
+                # a repeating event is edited as a whole, from its first day
+                self.new_event(e)
+            return
+        name = self.FORM[self.chosen]
+        if name == 'save':
+            self.form_save()
+        elif name == 'cancel':
+            self.close_form()
+        elif name == 'delete':
+            if self.armed == 'form':
+                self.delete(self.form['id_old'])
+                self.close_form()
+            else:
+                self.armed = 'form'
+                self.render()
+        else:
+            self.form_move(1)
+
+    def close_form(self):
+        self.mode = 'day' if on_day(self.events, self.day) else 'month'
+        self.chosen = 0
+        self.armed = None
+        self.win.set_focus(None)
+        self.render()
+
+    def form_move(self, n):
+        rows = [i for i, name in enumerate(self.FORM) if name != 'delete' or self.form.get('id_old')]
+        pos = rows.index(self.chosen) if self.chosen in rows else 0
+        self.finish_typing()
+        self.chosen = rows[max(0, min(len(rows) - 1, pos + n))]
+        self.armed = None
+        self.render()
+
+    def finish_typing(self):
+        typed = self.form.pop('typed', '')
+        if typed:
+            typed = typed.ljust(4, '0')
+            h, m = int(typed[:2]), int(typed[2:])
+            if h < 24 and m < 60:
+                self.form['time'] = '%02d:%02d' % (h, m)
+            else:
+                self.message.set_text('No such time: %s:%s' % (typed[:2], typed[2:]))
+
+    def form_change(self, n, big=False):
+        f = self.form
+        name = self.FORM[self.chosen]
+        if name == 'date':
+            d = datetime.date.fromisoformat(f['date'])
+            if big:
+                y, m = divmod(d.year * 12 + d.month - 1 + n, 12)
+                d = d.replace(year=y, month=m + 1, day=min(d.day, calendar.monthrange(y, m + 1)[1]))
+            else:
+                d += datetime.timedelta(days=n)
+            f['date'] = d.isoformat()
+        elif name == 'time':
+            self.finish_typing()
+            m = minutes(f)
+            if m is None:
+                m = 9 * 60
+            else:
+                m = (m // 15 + n) * 15 if m % 15 == 0 or n > 0 else m // 15 * 15
+                if m < 0 or m >= 24 * 60:
+                    m = None
+            f['time'] = '' if m is None else '%02d:%02d' % divmod(m, 60)
+        elif name in ('repeat', 'remind'):
+            options = [v for v, _t in (REPEATS if name == 'repeat' else REMINDS)]
+            i = options.index(f[name]) if f[name] in options else 0
+            f[name] = options[(i + n) % len(options)]
+        else:
+            return
+        self.render()
+
+    def form_save(self):
+        self.finish_typing()
+        f = self.form
+        title = self.entry.get_text().strip()
+        if not title:
+            self.message.set_text('Give the event a name first (the first line).')
+            self.chosen = 0
+            self.render()
+            return
+        ev = {'id': f.get('id_old') or uuid.uuid4().hex[:12], 'date': f['date'], 'time': f.get('time', ''),
+              'title': title, 'repeat': f.get('repeat', ''), 'remind': f.get('remind')}
+        self.events = [e for e in load_events() if e.get('id') != ev['id']] + [ev]
+        save(EVENTS, self.events)
+        # its reminders come again for the new time, but not the ones already past
+        done = load(REMINDED, {})
+        for k in [k for k in done if k.startswith(ev['id'] + '@')]:
+            del done[k]
+        now = time.time()
+        for offset in range(-1, 8):
+            day = datetime.date.today() + datetime.timedelta(days=offset)
+            at = due_at(ev, day) if occurs(ev, day) else None
+            if at is not None and at <= now:
+                done['%s@%s' % (ev['id'], day.isoformat())] = now
+        save(REMINDED, done)
+        d = datetime.date.fromisoformat(f['date'])
+        if not occurs(ev, self.day):
+            self.day = d
+        self.close_form()
+        self.message.set_text('Saved.')
+
+    def delete(self, ev_id):
+        self.events = [e for e in load_events() if e.get('id') != ev_id]
+        save(EVENTS, self.events)
+        self.message.set_text('Deleted.')
+
+    # -- keys
+
+    def on_key(self, w, ev):
+        k = Gdk.keyval_name(ev.keyval)
+        if self.mode == 'form':
+            return self.form_key(k, ev)
+        if k in GREEN:
+            self.mode = 'month'
+            self.new_event()
+            return True
+        if k == 'Escape':
+            if self.mode == 'day':
+                self.mode = 'month'
+                self.armed = None
+                self.render()
+            else:
+                self.win.destroy()
+            return True
+        if self.mode == 'day':
+            n = len(self.day_events) + 1
+            if k in ('Up', 'Down'):
+                self.chosen = max(0, min(n - 1, self.chosen + (1 if k == 'Down' else -1)))
+                self.armed = None
+                self.message.set_text('')
+                self.render()
+            elif k in ('Return', 'KP_Enter', 'space'):
+                self.activate()
+            elif k in BLUE and self.chosen > 0:
+                e = self.day_events[self.chosen - 1]
+                if self.armed == e.get('id'):
+                    self.delete(e['id'])
+                    self.armed = None
+                    self.chosen = min(self.chosen, len(on_day(self.events, self.day)))
+                    if not on_day(self.events, self.day):
+                        self.mode = 'month'
+                    self.render()
+                else:
+                    self.armed = e.get('id')
+                    what = e.get('title', '') + (' (every time it repeats)' if e.get('repeat') else '')
+                    self.message.set_text('Delete %s? Press blue again.' % what)
+            elif k in ('Left', 'BackSpace'):
+                self.mode = 'month'
+                self.render()
+            elif k in ('Page_Up', 'Page_Down'):
+                self.mode = 'month'
+                self.move_month(-1 if k == 'Page_Down' else 1)
+            return True
+        step = {'Left': -1, 'Right': 1, 'Up': -7, 'Down': 7}.get(k)
+        if step:
+            self.go(self.day + datetime.timedelta(days=step))
+        elif k in ('Page_Up', 'Page_Down'):
+            self.move_month(1 if k == 'Page_Up' else -1)
+        elif k in ('0', 'KP_0', 'Home', 't', 'T'):
+            self.go(datetime.date.today())
+        elif k in ('Return', 'KP_Enter', 'space'):
+            self.open_day()
+        else:
+            return False
+        return True
+
+    def form_key(self, k, ev):
+        name = self.FORM[self.chosen]
+        if k == 'Escape':
+            self.close_form()
+            return True
+        if k in ('Up', 'Down'):
+            self.form_move(1 if k == 'Down' else -1)
+            return True
+        if name == 'title':
+            if k == 'Tab':
+                self.form_move(1)
+                return True
+            return False     # the entry types, and its OK moves on
+        if k in ('Return', 'KP_Enter', 'space'):
+            self.activate()
+        elif k in ('Left', 'Right'):
+            self.form_change(1 if k == 'Right' else -1)
+        elif k in ('Page_Up', 'Page_Down') and name == 'date':
+            self.form_change(1 if k == 'Page_Up' else -1, big=True)
+        elif name == 'time' and (k.isdigit() or k.startswith('KP_') and k[3:].isdigit()):
+            typed = self.form.get('typed', '') + k[-1]
+            self.form['typed'] = typed
+            if len(typed) == 4:
+                self.finish_typing()
+            self.render()
+        elif name == 'time' and k in ('BackSpace', 'Delete'):
+            self.form.pop('typed', None)
+            self.form['time'] = ''
+            self.render()
+        elif k == 'Tab':
+            self.form_move(1)
+        elif k in GREEN:
+            self.form_save()
+        else:
+            return k not in ('Super_L', 'Super_R')
+        return True
+
+
+class Popup:
+    """A reminder: the event, when, OK and "In 10 minutes" """
+
+    def __init__(self, ev_id, day):
+        ev = next((e for e in load_events() if e.get('id') == ev_id), None)
+        if not ev:
+            raise SystemExit(0)
+        self.key = '%s@%s' % (ev_id, day)
+        d = datetime.date.fromisoformat(day)
+        today = datetime.date.today()
+        rel = {0: 'Today', 1: 'Tomorrow'}.get((d - today).days) or long_date(d)
+        when = rel + ('' if minutes(ev) is None else ' at ' + when_text(ev))
+        self.win = Gtk.Window(title='Reminder: ' + ev.get('title', ''))
+        self.win.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        self.win.set_keep_above(True)
+        self.win.set_position(Gtk.WindowPosition.CENTER)
+        self.win.set_default_size(560, -1)
+        classes(self.win, 'popup')
+        self.win.connect('destroy', Gtk.main_quit)
+        self.win.connect('key-press-event', self.on_key)
+        box = Gtk.Box(spacing=22, margin=26)
+        box.pack_start(label('\uf0f3', 'bell', yalign=0), False, False, 0)
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        texts.pack_start(label(ev.get('title', ''), 'ptitle', wrap=True, max_width_chars=34), False, False, 0)
+        texts.pack_start(label(when, 'pwhen'), False, False, 0)
+        hol = holiday(d)
+        if hol:
+            texts.pack_start(label(hol, 'dayhol'), False, False, 0)
+        buttons = Gtk.Box(spacing=12, margin_top=14)
+        self.buttons = []
+        for i, text in enumerate(('OK', 'In 10 minutes')):
+            b = Gtk.EventBox(visible_window=False)
+            inner = label(text, 'pbtn')
+            b.add(inner)
+            b.connect('button-press-event', lambda w, e, i=i: self.press(i))
+            buttons.pack_start(b, False, False, 0)
+            self.buttons.append(inner)
+        texts.pack_start(buttons, False, False, 0)
+        texts.pack_start(label('← → choose, OK presses, exit closes', 'rep'), False, False, 0)
+        box.pack_start(texts, True, True, 0)
+        self.win.add(box)
+        self.chosen = 0
+        self.show_chosen()
+        self.win.show_all()
+        self.win.present()
+        subprocess.call(['ozone-notify', '\uf0f3 ' + ev.get('title', '') + ': ' + when.lower()],
+                        stderr=subprocess.DEVNULL)
+
+    def show_chosen(self):
+        for i, b in enumerate(self.buttons):
+            classes(b, 'chosen', on=i == self.chosen)
+
+    def press(self, i):
+        if i == 1:
+            done = load(REMINDED, {})
+            if not isinstance(done.get('snoozed'), dict):
+                done['snoozed'] = {}
+            done['snoozed'][self.key] = time.time() + 600
+            save(REMINDED, done)
+        self.win.destroy()
+
+    def on_key(self, w, ev):
+        k = Gdk.keyval_name(ev.keyval)
+        if k in ('Left', 'Right', 'Tab'):
+            self.chosen = 1 - self.chosen
+            self.show_chosen()
+        elif k in ('Return', 'KP_Enter', 'space'):
+            self.press(self.chosen)
+        elif k == 'Escape':
+            self.win.destroy()
+        return True
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ['reminders']:
+        reminder_service()
+        return
+    if args[:1] == ['popup'] and len(args) == 3:
+        name = 'ozone-reminder'
+    elif not args:
+        name = 'ozone-calendar'
+    else:
+        print(__doc__.split('\n\n')[1], file=sys.stderr)
+        sys.exit(2)
+    setup_gtk()
+    GLib.set_prgname(name)
+    if args:
+        Popup(args[1], args[2])
+    else:
+        Calendar()
+    Gtk.main()
+
+
+if __name__ == '__main__':
+    main()

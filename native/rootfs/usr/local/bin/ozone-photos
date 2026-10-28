@@ -316,6 +316,9 @@ class App:
         self.clock = None
         if screensaver:
             self.win.connect('map-event', self.grab)
+            # bspwm takes full screen away when another window opens on the desktop (a TV timer's,
+            # a program started over ssh): something wants to be seen, so the screensaver ends
+            self.win.connect('window-state-event', self.on_state)
             if not files:
                 self.clock = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, halign=Gtk.Align.START,
                                      valign=Gtk.Align.START)
@@ -390,6 +393,14 @@ class App:
     def grab(self, w, ev):
         seat = Gdk.Display.get_default().get_default_seat()
         seat.grab(self.win.get_window(), Gdk.SeatCapabilities.ALL, True, None, None, None, None)
+        return False
+
+    def on_state(self, w, ev):
+        full = bool(ev.new_window_state & Gdk.WindowState.FULLSCREEN)
+        if full:
+            self.was_full = True
+        elif getattr(self, 'was_full', False):
+            self.win.destroy()
         return False
 
     def tick_clock(self):

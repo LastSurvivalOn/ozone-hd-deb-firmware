@@ -23,7 +23,8 @@ mouse work too.
 13. [Games](#13-games)
 14. [The network, the hotspot, VPN, phones](#14-the-network-the-hotspot-vpn-phones)
 15. [Bluetooth](#15-bluetooth)
-16. [All key combinations](#16-all-key-combinations)
+16. [Calendar](#16-calendar)
+17. [All key combinations](#17-all-key-combinations)
 
 ---
 
@@ -792,7 +793,35 @@ If a device doesn't connect: it may be connected to a phone or a computer (turn 
 off for a moment), or too far away; **Forget it**, then add it again. A phone that refuses
 pairing ("incorrect PIN") was given **No** or waited too long on the TV: try again.
 
-## 16. All key combinations
+## 16. Calendar
+
+**Calendar** in the app menu: the month, with Ukraine's public holidays in red (under martial law
+they are working days, but still marked), and your own events: appointments, birthdays, what is on
+TV. Today has a blue frame, the chosen day a lilac one. The bar at the bottom of the window always
+shows which buttons do what at that moment.
+
+| Button | The month | A day's list | An event |
+|---|---|---|---|
+| **← → ↑ ↓** | choose a day | ↑ ↓ choose an event | ↑ ↓ the line; ← → change it |
+| **page+ / page−** | next / previous month | | on Date: a month |
+| **OK** | the day: its events, or a new one if it has none | open the event to change it | the next line; on Save, save |
+| green (or **N**) | a new event on the chosen day | a new event | save |
+| blue (or **Delete**) | | delete the event (press twice) | |
+| **0** | today | | on Time: the digits type the time, 1 9 3 0 is 19:30 |
+| **exit** | close the window | back to the month | cancel |
+
+An event has a name (type it with a keyboard, or press **text** on the remote for the on-screen
+keyboard), a date, a time (or **all day**: **delete** on the Time line), how it repeats (once, every
+week, every month, every year: birthdays) and a reminder (at the time, 10 or 30 minutes, 1 or 3
+hours, a day or a week before). A repeating event is changed and deleted as a whole.
+
+**Reminders** come as a window over everything, the player and TV too, with a bell, also when the
+box is asleep (it wakes the screen; not after **Power off**). **OK** closes it, **In 10 minutes**
+shows it again 10 minutes later. An all-day event reminds at 9:00. A reminder missed because the
+box was off comes when it is turned on, if that is within 6 hours. With the mouse: a click chooses
+a day, a double click opens it, the arrows at the top change the month.
+
+## 17. All key combinations
 
 ### Anywhere
 | Keys | Action |
