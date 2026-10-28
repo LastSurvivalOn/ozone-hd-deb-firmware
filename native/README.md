@@ -200,8 +200,8 @@ firmware loading this btusb doesn't have.
 - **`ozone-bluetooth`** (rofi menu; the user is in the `bluetooth` group for BlueZ's D-Bus policy,
   and `audio` for BlueALSA's): the paired devices (connect, disconnect, forget), **Add a device**
   (discovery, with found devices added to the open rofi list as they come, `-async-pre-read 0`;
-  only those with a class, an LE appearance or HID: the LE side of headphones, "JBL ...-LE", for
-  their app, is left out) and **Let a phone find the box** (discoverable for 3 minutes).
+  all with a name, LE ones too, such as the side of headphones for their app, "JBL ...-LE") and
+  **Let a phone find the box** (discoverable for 3 minutes).
   `ozone-bluetooth agent` (bspwmrc) is BlueZ's default agent, KeyboardDisplay: codes to type
   (`rofi -e`), yes/no questions in rofi, one at a time (a new one, or BlueZ's Cancel, closes the
   last). It closes the screensaver first and resets X's idle time: the screensaver's grab kept rofi

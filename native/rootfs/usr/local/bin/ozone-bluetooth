@@ -155,16 +155,6 @@ def kind(d):
     return KINDS.get(d.get('Icon', ''), ('', ''))
 
 
-def pairable(d):
-    """Worth listing to pair: classic Bluetooth (it has a class), or Bluetooth LE that says what it
-    is (an appearance: a keyboard, a mouse...) or offers HID. Left out: nameless ones (beacons,
-    other people's phones) and the LE side of headphones, for their app ("JBL TUNE520BT-LE":
-    the sound is on their classic side, listed beside it in pairing mode)"""
-    if not d.get('Name'):
-        return False
-    return 'Class' in d or 'Icon' in d or any(u.startswith('00001812-') for u in d.get('UUIDs', []))
-
-
 def label(d):
     glyph, what = kind(d)
     return '%s  %s%s' % (glyph, name_of(d), ' (%s)' % what if what else '')
@@ -271,7 +261,9 @@ def add_device(bus, ad_path):
         while p.poll() is None:
             objs = objects(bus) or {}
             for path, d in devices(objs, ad_path):
-                if path in shown or d.get('Paired') or not pairable(d):
+                # nameless ones are mostly beacons and other people's phones, nothing to pair; the
+                # rest all, LE ones too ("JBL TUNE520BT-LE", the side of headphones for their app)
+                if path in shown or d.get('Paired') or not d.get('Name'):
                     continue
                 shown.append(path)
                 try:
