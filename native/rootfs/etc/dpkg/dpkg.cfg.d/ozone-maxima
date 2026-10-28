@@ -1,0 +1,5 @@
+# The rootfs comes from Debian's docker image, whose "docker" here leaves out /usr/share/doc. Maxima's
+# help needs its index from there, and wxMaxima's help is the manual in maxima-doc (read after
+# "docker": the last rule that matches wins).
+path-include /usr/share/doc/maxima/*
+path-include /usr/share/doc/maxima-doc/*

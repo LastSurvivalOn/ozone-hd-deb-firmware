@@ -19,6 +19,9 @@ tar -C "$HERE/rootfs" -czf - \
     usr/local/bin/ozone-calendar usr/local/share/applications/ozone-calendar.desktop \
     usr/local/bin/ozone-code usr/local/share/applications/ozone-code.desktop usr/local/share/ozone/geany \
     usr/local/bin/ozone-system usr/local/share/applications/ozone-updates.desktop \
+    usr/local/bin/ozone-calc usr/local/bin/ozone-math usr/local/share/applications/ozone-calc.desktop \
+    usr/local/share/applications/ozone-math.desktop usr/local/share/ozone/wxMaxima.conf \
+    etc/dpkg/dpkg.cfg.d/ozone-maxima \
     usr/local/share/applications/ozone-backup.desktop etc/init.d/ozone-system \
     usr/local/bin/yt usr/local/bin/ozone-web usr/local/bin/ozone-web-show usr/local/share/applications/ozone-web.desktop usr/local/bin/ozone-power usr/local/bin/ozone-screen usr/local/share/applications/ozone-screen.desktop usr/local/bin/ozone-standby usr/local/bin/ozone-notify etc/init.d/ozone-input etc/ozone/remote.conf etc/ozone/native-only \
     usr/local/bin/ozone-wifi usr/local/bin/ozone-volume usr/local/bin/ozone-remote usr/local/bin/ozone-panel usr/local/bin/ozone-media usr/local/share/applications/ozone-media.desktop usr/local/bin/ozone-terminal usr/local/share/applications/ozone-terminal.desktop usr/local/bin/ozone-sysinfo usr/local/share/applications/ozone-sysinfo.desktop etc/init.d/ozone-media usr/local/share/applications/ozone-wifi.desktop usr/local/share/applications/yt.desktop usr/local/share/applications/ozone-tv.desktop usr/local/share/applications/ozone-power.desktop etc/init.d/ozone-wifi usr/local/lib/ozone/wifi-event usr/local/lib/ozone/netwatch \
@@ -91,6 +94,12 @@ ssh_box 'set -e
     # Updates and backups (ozone-system): zstd packs the whole system in four threads; the settings
     # restored and the reset happen at the start, before the network and Bluetooth (ozone-system)
     sudo apt-get install -y -qq --no-install-recommends zstd > /dev/null
+    # the calculator (Qalculate!) and maths (wxMaxima: Maxima with its share library and its manual,
+    # which etc/dpkg/dpkg.cfg.d/ozone-maxima lets in); gnuplot draws the plots of both
+    sudo apt-get install -y -qq --no-install-recommends qalculate-gtk gnuplot-x11 wxmaxima maxima \
+        maxima-share maxima-doc > /dev/null
+    # GCL compiles Maxima'"'"'s draw package the first time it loads: 4 minutes, once
+    [ -d ~/.maxima/binary ] || maxima --very-quiet --batch-string="load(draw)\$" > /dev/null 2>&1
     sudo update-rc.d ozone-system defaults
     # the folders Files starts with
     mkdir -p ~/Videos ~/Music ~/Pictures

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Calculator
+Comment=Qalculate!: expressions, units and currencies, equations, functions and their plots
+Exec=ozone-calc
+Icon=accessories-calculator
+Terminal=false
+Categories=Utility;Calculator;

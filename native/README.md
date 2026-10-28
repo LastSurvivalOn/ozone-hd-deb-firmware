@@ -679,3 +679,21 @@ prints its progress (`progress FRACTION TEXT`, `log`, `warn`, `restart reboot|de
   second one short.
 - Logs: there is no logrotate; `/etc/init.d/ozone-system` cuts a `/var/log/*.log` over 1 MB to its
   last 256 KB at each start (`miracast.log` had reached 3.3 MB).
+
+## Calculator and maths
+
+- `ozone-calc`: Qalculate! 4.5.1 (Debian's; qalculate-gtk, libqalculate, gnuplot-x11 for its
+  plots), dark, the exchange rates updated weekly (`auto_update_exchange_rates=7`, seeded on the
+  first run). This version gets some indefinite integrals wrong (`integrate(x^2*sin(x), x)` comes
+  out as zero) and crashed on `integrate(ln(x)/(1+x^2), 0, inf)`; it also reads `inf` as inches
+  (`infinity` works). The newest (5.13 on GitHub) has no ARM build.
+- `ozone-math`: wxMaxima 22.12 on Maxima 5.46 (GCL), with maxima-share (ode2, draw...) and
+  maxima-doc. Debian's docker image leaves `/usr/share/doc` out of every package
+  (`/etc/dpkg/dpkg.cfg.d/docker`), where Maxima keeps its help index: without it every start
+  printed "unable to set up the help system"; `etc/dpkg/dpkg.cfg.d/ozone-maxima` lets those two
+  folders in. The first run seeds `~/.config/wxMaxima.conf` (no tips, Enter evaluates,
+  `invertBackground` for a dark sheet, zoom 1.2). GCL compiles the draw package on its first load
+  (4 min on the box, then 1 s, cached in `~/.maxima/binary`): install-desktop.sh does it once, and
+  ozone-math in the background when it is missing. Plots go through gnuplot into the sheet; the
+  examples in the manual take 1-2 s each. Both together take about 110 MB of the root
+  filesystem.

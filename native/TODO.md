@@ -101,7 +101,8 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
 
 - [ ] **Easy**: date, time and time zone settings in a menu (now set in files: Europe/Kyiv, chrony).
 - [ ] **Easy or Medium**: small apps for the remote: clock / alarm, calculator, calendar. The
-  calendar is done (`ozone-calendar`: events, birthdays, reminders, Ukraine's holidays).
+  calendar is done (`ozone-calendar`: events, birthdays, reminders, Ukraine's holidays), and the
+  calculator (Qalculate!, and Maxima for real maths).
 - [ ] **Medium**: YouTube features SmartTube has and `yt` doesn't: account sign-in, subscriptions,
   history, the home feed, channel pages, playlists, SponsorBlock, YouTube's own subtitles, speed,
   chapters. Starting a video also takes ~10 s.
@@ -142,7 +143,8 @@ Linux doesn't:
   the box stays on until Power.
 - [ ] **Easy**: a clock with alarms, a timer and a stopwatch (DeskClock): the calendar's reminders
   already wake the screen, an alarm needs a sound too.
-- [ ] **Easy**: a calculator for the remote.
+- [x] **Easy**: a calculator: Qalculate! (Calculator) and wxMaxima on Maxima (Maths), a computer
+  algebra system with plots.
 - [ ] **Easy**: screenshots: a key (Print, or a remote combination) saves the screen into Pictures.
 - [ ] **Easy**: choosing the wallpaper (Android has a picker and live wallpapers): now one picture.
 - [ ] **Easy**: the messages of the last hours in one place (Android's notification shade): now

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Maths (Maxima)
+Comment=wxMaxima: integrals, limits, series, equations, differential equations, matrices, 2D and 3D plots
+Exec=ozone-math %f
+Icon=wxmaxima
+Terminal=false
+Categories=Education;Science;Math;
+MimeType=application/x-wxmathml;application/x-wxmaxima-batch;text/x-wxmaxima-batch;

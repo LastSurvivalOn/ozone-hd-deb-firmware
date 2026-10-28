@@ -14,3 +14,5 @@ text/x-python3=ozone-code.desktop
 application/x-shellscript=ozone-code.desktop
 text/markdown=ozone-code.desktop
 application/json=ozone-code.desktop
+application/x-wxmathml=ozone-math.desktop
+application/x-wxmaxima-batch=ozone-math.desktop

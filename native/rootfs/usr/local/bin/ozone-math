@@ -1,0 +1,14 @@
+#!/bin/sh
+# ozone-math [FILE.wxmx]: maths with Maxima in wxMaxima: symbolic integrals, limits, series,
+# equations, differential equations, matrices, and plots (gnuplot). The first run gets our settings
+# (/usr/local/share/ozone/wxMaxima.conf): no tips, Enter (the remote's OK) evaluates, a dark sheet.
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}/wxMaxima.conf
+[ -f "$CONF" ] || cp /usr/local/share/ozone/wxMaxima.conf "$CONF"
+# Maxima's GCL compiles the draw package the first time it is loaded, 4 minutes on the box (then 1 s):
+# done in the background if install-desktop.sh hasn't (or the reset took ~/.maxima away)
+if [ ! -d "$HOME/.maxima/binary" ] && ! pgrep -f "^maxima.*load.draw" > /dev/null; then
+    nice maxima --very-quiet --batch-string='load(draw)$' > /dev/null 2>&1 &
+fi
+# dark menus; the session's POSIX locale would garble the maths symbols
+export GTK_THEME=Adwaita:dark LANG=C.UTF-8
+exec wxmaxima "$@"

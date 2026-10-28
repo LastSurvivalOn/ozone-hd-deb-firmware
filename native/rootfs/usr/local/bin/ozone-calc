@@ -1,0 +1,11 @@
+#!/bin/sh
+# ozone-calc: the calculator, Qalculate! (expressions as typed, units and currencies, equations,
+# derivatives and integrals, plots through gnuplot), dark like the rest. The first run gets the
+# exchange rates updated once a week by themselves, not a question each time.
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}/qalculate/qalculate-gtk.cfg
+if [ ! -f "$CONF" ]; then
+    mkdir -p "${CONF%/*}"
+    printf '[General]\nauto_update_exchange_rates=7\n' > "$CONF"
+fi
+export GTK_THEME=Adwaita:dark LANG=C.UTF-8
+exec qalculate-gtk "$@"

@@ -25,8 +25,9 @@ mouse work too.
 15. [Bluetooth](#15-bluetooth)
 16. [Calendar](#16-calendar)
 17. [The code editor](#17-the-code-editor)
-18. [Updates, backups and the reset](#18-updates-backups-and-the-reset)
-19. [All key combinations](#19-all-key-combinations)
+18. [The calculator and maths](#18-the-calculator-and-maths)
+19. [Updates, backups and the reset](#19-updates-backups-and-the-reset)
+20. [All key combinations](#20-all-key-combinations)
 
 ---
 
@@ -501,7 +502,7 @@ users: sign in to the site in the browser first, and the player gets the browser
 | Games or videos show a black window, or the desktop looks wrong | The graphics chip may be at fault. ⏻ → **Reboot**: if the desktop fails with it, the box falls back to drawing without it by itself. |
 | No internet (no IP address or WiFi name on the panel) | Click **WiFi** on the panel and choose your network. If it doesn't connect, check the router, then ⏻ → **Reboot**. |
 | "Could not connect …: wrong password?" | Choose the network again and retype the password (letter case matters). |
-| Something stopped working after an update | **Backup and reset** → **Restore**: the whole system backed up "before the updates" takes the box back to how it was (section 18). |
+| Something stopped working after an update | **Backup and reset** → **Restore**: the whole system backed up "before the updates" takes the box back to how it was (section 19). |
 
 ## 10. The remote control
 
@@ -871,7 +872,43 @@ quick for programs of a few files (a small C program takes under a second); a bi
 too, only slowly (the box's processor is about a fifth of a laptop's). The **Build** menu has
 **Set Build Commands** to change what F8, F9 and F5 run (to add `-lm`, say, or to run `make`).
 
-## 18. Updates, backups and the reset
+## 18. The calculator and maths
+
+Two programs, both for a keyboard (or the on-screen one, or the phone remote's typing) and the mouse:
+
+**Calculator** (Qalculate!) is for everyday sums, written as you would on paper: `2400 × 15%` (or `2400 + 15%`),
+`250 USD to UAH` (the exchange rates update themselves once a week), `100 km/h to m/s`,
+`5 feet 11 inches to cm`, `sqrt(2)^10`, `solve(x^2 - 5x + 6 = 0)`, `diff(sin(x)^2, x)`,
+`integrate(sqrt(1 - x^2), -1, 1)`, dates (`today + 90 days`). Enter calculates; the buttons below
+do the same with the mouse; **History** keeps what was calculated; **File → Plot Functions/Data**
+draws graphs. Its integrals without limits can come out wrong (this version's bug): use Maths for
+those.
+
+**Maths (Maxima)** is a computer algebra system, for real mathematics: exact integrals, limits,
+series, sums, equations and their systems, differential equations, matrices, Laplace transforms,
+and graphs in 2D and 3D, all shown as formulas. Type a command and press **Enter** (**OK** on the
+remote); each answer comes under its command. A command ends with `;`. Examples:
+
+| Type | Gives |
+|---|---|
+| `integrate(x^2*sin(x), x);` | 2x sin x + (2 − x²) cos x |
+| `integrate(exp(-x^2)*cos(x), x, minf, inf);` | √π e^(−1/4) |
+| `sum(1/n^2, n, 1, inf), simpsum;` | π²/6 |
+| `limit(sin(x)/x, x, 0);` | 1 |
+| `taylor(exp(sin(x)), x, 0, 5);` | the series to x⁵ |
+| `solve([x + y = 3, x - y = 1], [x, y]);` | x = 2, y = 1 |
+| `ode2('diff(y, x, 2) + y = x, y, x);` | y = k₁ sin x + k₂ cos x + x |
+| `eigenvalues(matrix([2, 1], [1, 2]));` | 3 and 1 |
+| `wxplot2d([sin(x)/x, cos(x)], [x, -15, 15]);` | a graph of both |
+| `wxdraw3d(enhanced3d=true, explicit(sin(x)*cos(y), x, -3, 3, y, -3, 3));` | a coloured surface |
+
+`inf` is infinity, `%pi` π, `%e` e, `%i` the imaginary unit. The menus (**Calculus**, **Equations**,
+**Matrix**, **Plot**) ask for what they need in a form, and the panes on the left type Greek
+letters and symbols and build plots with the mouse; **Help** (F1) is Maxima's manual. **Shift+Enter**
+starts a new line within a command. Files are saved as `.wxmx`. Most answers take a second or two;
+hard ones longer (the red button in the toolbar stops one).
+
+## 19. Updates, backups and the reset
 
 **Updates** and **Backup and reset** in the app menu open the same window, with four sections on
 the left: **↑ / ↓** choose one, **→** or **OK** goes into it, **exit** goes back and closes. The bar
@@ -923,7 +960,7 @@ files and the TV recordings too. Both first back up the settings onto the box ("
 reset": Restore brings them back), restart the box and do it at the start. The programs, the
 updates installed and the backups stay; so does the way in for the computer (`~/.ssh`).
 
-## 19. All key combinations
+## 20. All key combinations
 
 ### Anywhere
 | Keys | Action |
