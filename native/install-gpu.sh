@@ -73,3 +73,6 @@ ssh_box 'set -e
         echo ">> GPU ready: restart X (or reboot) for the desktop to use it"
     fi
     sync'
+
+# desktop OpenGL (most 3D games) on the GPU: gl4es, for ozone-gl --gl
+"$HERE/gpu/build-gl4es.sh" "$IP"

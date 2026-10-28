@@ -727,6 +727,13 @@ Put the game files in the **Games** folder of your home folder, or on a USB driv
 
 A USB gamepad works too: plug it in before starting RetroArch.
 
+**3D games.** **Programs** (section 19) has a list of them, **3D games**: Neverball, Neverputt,
+SuperTux, Extreme Tux Racer, Armagetron, Chromium B.S.U. They are drawn by the graphics chip
+(through a translator from the OpenGL they are written for to the chip's own), smoothly: Neverball
+at about 50 frames a second, where the processor alone manages one. Programs installs them so that
+the app menu starts them that way. Most need a keyboard or a mouse (or a gamepad, section 10). Other
+3D programs from Debian can be started the same way from the terminal: `ozone-gl --gl PROGRAM`.
+
 ## 14. The network, the hotspot, VPN, phones
 
 **Network** in the app menu, or a click on the address or WiFi on the panel. The line at the top
@@ -921,7 +928,8 @@ hard ones longer (the red button in the toolbar stops one).
 
 **Programs** in the app menu is a store of Debian's programs (Debian has some 61 000 programs and
 packages, free). On the left: the picked ones by kind (games, learning, internet, music and video,
-graphics, office and reading, programming, tools), chosen to work on the box, then **Search all of
+graphics, office and reading, programming, tools, and 3D games on the graphics chip), chosen to
+work on the box, then **Search all of
 Debian** and **Installed by you**.
 
 | Button | What it does |

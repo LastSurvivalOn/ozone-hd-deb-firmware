@@ -380,3 +380,32 @@ Risks:
 | `scrolltest.sh` | ozone-web wheel scrolling (`MODE URL CLICKS INTERVAL`, modes cpu, debian, pixmap) |
 | `long.html`, `spinner.html` | a static page to scroll; static text with a small CSS animation |
 | `xpixmap2conn.c` | rendering into another X connection's pixmap, and its row order (our WebKit's case) |
+
+## Desktop OpenGL: gl4es (`build-gl4es.sh`, on the box)
+
+The Mali-450 has OpenGL ES 2.0 only; programs written for desktop OpenGL (most 3D games) get
+llvmpipe, Mesa on the CPU: Neverball at 0.9 frames a second. gl4es (github.com/ptitSeb/gl4es,
+v1.1.6) is a libGL.so.1 that turns OpenGL 2.1 into GLES 2.0 calls, and GLX into EGL on the X11
+window. `build-gl4es.sh` builds it on the box (cmake for the build only: a plain X11 build, not
+`-DODROID`, which is for fbdev) into `/usr/local/lib/gl4es`; `ozone-gl --gl PROGRAM` puts it in
+front of glvnd's libGL for that program, with `/usr/local/lib/mali` for its EGL and GLES (never
+system-wide: WebKit and GTK stay on Mesa). Measured with `LIBGL_FPS=1`, against Mesa's
+`GALLIUM_HUD`:
+
+| Program | gl4es on the Mali | llvmpipe |
+|---|---|---|
+| glxgears | 120 fps | 70 fps |
+| Neverball (menu flyover, 800x600) | 49 fps (the 50 Hz screen) | 0.9 fps |
+| SuperTux 0.6 | 64 fps (its GL 3.3 shaders fail; it falls back to GL 2.0) | |
+| Armagetron | 88 fps | |
+| Chromium B.S.U. | 31 fps | |
+
+Extreme Tux Racer runs too (full screen, SFML). glmark2's desktop build finds no GLX FBConfig
+through gl4es on the 16-bit screen and doesn't start. SDL games open libGL at run time, which
+LD_LIBRARY_PATH still covers. Programs (ozone-apps) gives the OpenGL programs it installs (linked
+with libGL / libOpenGL / GLEW, or its picked 3D games) a menu entry of the user's that starts them
+with `ozone-gl --gl`.
+
+A screenshot of the X root window doesn't show a GL window that swaps fast: DRI2 swaps go
+straight to the framebuffer, and X's shadow catches up only after 150 ms without one. Read
+`/dev/fb0` instead (RGB565, `stride` from sysfs).

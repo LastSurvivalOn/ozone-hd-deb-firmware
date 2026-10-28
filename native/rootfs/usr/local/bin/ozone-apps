@@ -68,6 +68,16 @@ CATALOGUE = [
         (['freeciv-client-gtk3', 'freeciv-server'], 'Freeciv', 'Civilization: build an empire'),
         (['pychess'], 'PyChess', 'Chess with lessons, puzzles and online play'),
     ]),
+    # tried on the box through gl4es (gpu/build-gl4es.sh): frames a second on the GPU, against ~1 in
+    # software (Neverball 49 against 0.9)
+    ('3d', '', '3D games', [
+        (['neverball'], 'Neverball', 'Tilt the floor to roll the ball to the goal (49 frames a second)'),
+        (['neverputt'], 'Neverputt', 'Miniature golf, by Neverball\'s makers'),
+        (['supertux'], 'SuperTux', 'Jump and run with Tux, as Mario (64 frames a second)'),
+        (['extremetuxracer'], 'Extreme Tux Racer', 'Race Tux down snowy mountains'),
+        (['armagetronad'], 'Armagetron', 'Tron light cycles (88 frames a second)'),
+        (['chromium-bsu'], 'Chromium B.S.U.', 'A space shooter (31 frames a second)'),
+    ]),
     ('learning', '', 'Learning', [
         (['tuxmath'], 'Tux Math', 'Arithmetic for children, as a space game'),
         (['tuxtype'], 'Tux Typing', 'Typing for children, as a game'),
@@ -260,7 +270,10 @@ USER_APPS = os.path.join(os.environ.get('XDG_DATA_HOME') or os.path.join(HOME, '
 
 
 def uses_gl(pkg):
-    """Its programs are linked with desktop OpenGL (most 3D games)"""
+    """Its programs are linked with desktop OpenGL (most 3D games), or it is a picked 3D game (SDL
+    ones open libGL at run time, which ldd doesn't see)"""
+    if any(a[0][0] == pkg for k, _i, _n, apps in CATALOGUE if k == '3d' for a in apps):
+        return True
     _desktops, cmds = launchers(pkg)
     for c in cmds[:8]:
         r = subprocess.run(['ldd', c], capture_output=True, text=True)

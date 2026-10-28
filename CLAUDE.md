@@ -88,7 +88,10 @@ Several of these were found by bricking or hanging the box. Don't undo them.
     and their last frame is redone through X after 150 ms: the software cursor restores from the
     shadow, and a stale shadow left trails of the old screen on still GL windows.
   - Programs get the GPU through `ozone-gl` (`/usr/local/lib/mali` first in the library path), never
-    system-wide: WebKit/GTK keep Mesa. `/usr/local/bin/mpv` and `retroarch` wrap the real ones.
+    system-wide: WebKit/GTK keep Mesa. Desktop OpenGL programs (3D games) go through gl4es with
+    `ozone-gl --gl` (`/usr/local/lib/gl4es`, `gpu/build-gl4es.sh`): ~50 times llvmpipe's speed.
+  - A screenshot through X misses a GL window that swaps fast (DRI2 swaps go to the framebuffer,
+    X's shadow lags): read `/dev/fb0` (RGB565) to see what the screen shows. `/usr/local/bin/mpv` and `retroarch` wrap the real ones.
   - Mali's own EGL is 1.4 with bugs that our `libEGL.so.1` covers (NULL version pointers, no
     platform displays, no core functions from GetProcAddress, DirectColor visuals). The screen is
     16-bit: 8888 configs take 32-bit visuals, which X converts on the CPU, so 565 comes first.
