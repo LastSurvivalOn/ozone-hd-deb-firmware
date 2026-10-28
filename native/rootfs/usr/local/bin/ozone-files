@@ -51,11 +51,16 @@ VIDEO = {'mkv', 'mp4', 'm4v', 'avi', 'mov', 'ts', 'm2ts', 'mts', 'webm', 'mpg', 
 AUDIO = {'mp3', 'flac', 'ogg', 'oga', 'opus', 'm4a', 'aac', 'wav', 'wma', 'ape', 'aiff', 'aif', 'mka', 'ac3', 'dts'}
 IMAGE = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tif', 'tiff', 'webp'}
 SUBS = {'srt', 'ass', 'ssa', 'vtt'}
+# text and code: the code editor (ozone-code)
+TEXT = {'txt', 'md', 'c', 'h', 'cc', 'cpp', 'hpp', 'py', 'sh', 'fish', 'js', 'json', 'html', 'htm', 'css',
+        'xml', 'conf', 'cfg', 'ini', 'log', 'csv', 'yaml', 'yml', 'toml', 'nfo', 'm3u', 'm3u8'}
+TEXT_NAMES = {'Makefile', 'README', 'LICENSE', 'CMakeLists.txt'}
 # FontAwesome 4
 ICONS = {'folder': '', 'video': '', 'audio': '', 'image': '', 'file': '',
          'up': '', 'usb': '', 'net': '', 'home': '', 'drive': '', 'tv': '',
          'download': ''}
 ICONS['dlna'] = ICONS['net']
+ICONS['text'] = '\uf0f6'
 SAVER_DEFAULTS = {'enabled': True, 'minutes': 10, 'folder': os.path.join(HOME, 'Pictures'), 'seconds': 8}
 RESUME_MIN = 30   # s: videos stopped before this, or this close to the end, start from the beginning
 
@@ -108,7 +113,7 @@ def kind(path):
         return 'folder'
     ext = path.rsplit('.', 1)[-1].lower() if '.' in os.path.basename(path) else ''
     return 'video' if ext in VIDEO else 'audio' if ext in AUDIO else 'image' if ext in IMAGE else \
-        'subs' if ext in SUBS else 'file'
+        'subs' if ext in SUBS else 'text' if ext in TEXT or os.path.basename(path) in TEXT_NAMES else 'file'
 
 
 def natural(name):
@@ -851,8 +856,10 @@ class Window:
             self.view_photos(row.path)
         elif row.kind == 'dlna':
             subprocess.Popen(['ozone-dlna', 'browse'])
+        elif row.kind == 'text':
+            subprocess.Popen(['ozone-code', row.path])
         else:
-            self.flash('Not a video, music or photo')
+            self.flash('Not a video, music, photo or text')
 
     @staticmethod
     def view_photos(path, how=None):

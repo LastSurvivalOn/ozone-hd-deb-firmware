@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Geany
+Exec=geany %F
+NoDisplay=true

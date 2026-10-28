@@ -24,7 +24,8 @@ mouse work too.
 14. [The network, the hotspot, VPN, phones](#14-the-network-the-hotspot-vpn-phones)
 15. [Bluetooth](#15-bluetooth)
 16. [Calendar](#16-calendar)
-17. [All key combinations](#17-all-key-combinations)
+17. [The code editor](#17-the-code-editor)
+18. [All key combinations](#18-all-key-combinations)
 
 ---
 
@@ -821,7 +822,32 @@ shows it again 10 minutes later. An all-day event reminds at 9:00. A reminder mi
 box was off comes when it is turned on, if that is within 6 hours. With the mouse: a click chooses
 a day, a double click opens it, the arrows at the top change the month.
 
-## 17. All key combinations
+## 17. The code editor
+
+**Code editor** in the app menu is Geany: for writing programs in C, C++, Python, shell scripts,
+web pages and the like, with colours for the code, completion of names, a list of the file's
+functions on the left, and building and running. It needs a keyboard. The first time it opens two
+examples from the **Code** folder in your home (`hello.c`, `hello.py`); text files and code chosen
+in Files open in it too.
+
+| Keys | Action |
+|---|---|
+| **F9** | build (C and C++ with gcc / g++; the program is put beside the file) |
+| **F8** | compile only, or check a Python file |
+| **F5** | run the program (or the Python file) in a terminal window; Enter closes it afterwards |
+| **Ctrl+S** / **Ctrl+O** / **Ctrl+N** | save / open / new |
+| **Ctrl+F** / **Ctrl+H** | find / replace |
+| **Ctrl+Space** | complete the name being typed |
+| **Ctrl+E** | comment / uncomment the lines |
+| **Ctrl+PgUp** / **Ctrl+PgDn** | previous / next file |
+| **Ctrl+Z** / **Ctrl+Shift+Z** | undo / redo |
+
+Errors from the compiler show at the bottom; a double click on one goes to its line. Building is
+quick for programs of a few files (a small C program takes under a second); a big project builds
+too, only slowly (the box's processor is about a fifth of a laptop's). The **Build** menu has
+**Set Build Commands** to change what F8, F9 and F5 run (to add `-lm`, say, or to run `make`).
+
+## 18. All key combinations
 
 ### Anywhere
 | Keys | Action |

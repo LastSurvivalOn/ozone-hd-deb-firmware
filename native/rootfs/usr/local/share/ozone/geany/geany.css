@@ -1,0 +1,8 @@
+/* Geany's message colours for a dark theme (its own are dark red and dark blue) */
+#geany-compiler-error { color: #f38ba8; }
+#geany-compiler-context { color: #fab387; }
+#geany-compiler-message { color: #89b4fa; }
+#geany-document-status-changed { color: #f38ba8; }
+#geany-document-status-disk-changed { color: #fab387; }
+#geany-document-status-readonly { color: #a6e3a1; }
+#geany-terminal-dirty { color: #f38ba8; }

@@ -1,0 +1,11 @@
+# Debian has no "python", only python3; and no pep8 for Lint
+[build-menu]
+FT_00_LB=_Check
+FT_00_CM=python3 -m py_compile "%f"
+FT_00_WD=
+FT_02_LB=
+FT_02_CM=
+FT_02_WD=
+EX_00_LB=_Execute
+EX_00_CM=python3 "%f"
+EX_00_WD=

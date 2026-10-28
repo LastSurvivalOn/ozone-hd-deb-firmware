@@ -600,3 +600,14 @@ from standby as TV timers do, and starts `ozone-calendar popup`, a dialog in bsp
 (`bspc rule -a Ozone-reminder`), over fullscreen windows. A GTK entry moved between rows is taken
 out of its row first: a container dropped with it inside destroys it, and its text with it.
 
+
+## Code editor
+
+`ozone-code` runs Geany (1.38, GTK 3; about 3 MB with its file tree plugin; `g++` beside the gcc
+amplay needs) in the dark GTK theme and the POSIX session's `LANG` switched to C.UTF-8. The first
+run writes `~/.config/geany/geany.conf` from `/usr/local/share/ozone/geany` (Catppuccin Mocha
+colours, JetBrains Mono, spaces, the terminal is `ozone-terminal -e`, as Debian's
+`x-terminal-emulator` is urxvt) and copies two examples into `~/Code`; every run refreshes the colour
+scheme and `geany.css` (Geany's message colours are dark red and blue). Debian has no `python`:
+`filedefs/filetypes.python` builds and runs with python3. Files opens text and code in it (`TEXT` in
+ozone-files), and `mimeapps.list` makes it the default for text. A small C file builds in 0.3 s.

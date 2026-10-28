@@ -1,0 +1,21 @@
+#!/bin/sh
+# ozone-code [FILE...]: the code editor, Geany (C, Python, shell, HTML…: highlighting, completion,
+# building with gcc, running in a terminal), in the box's colours. Geany keeps its settings in
+# ~/.config/geany; the first run gets ours (/usr/local/share/ozone/geany) and two examples in ~/Code.
+SHARE=/usr/local/share/ozone/geany
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}/geany
+mkdir -p "$CONF/colorschemes" "$CONF/filedefs"
+cp "$SHARE/catppuccin-mocha.conf" "$CONF/colorschemes/"
+cp "$SHARE/geany.css" "$CONF/"
+[ -f "$CONF/filedefs/filetypes.python" ] || cp "$SHARE/filetypes.python" "$CONF/filedefs/"
+if [ ! -f "$CONF/geany.conf" ]; then
+    sed "s|@HOME@|$HOME|g" "$SHARE/geany.conf" > "$CONF/geany.conf"
+    if [ ! -d "$HOME/Code" ]; then
+        mkdir -p "$HOME/Code"
+        cp "$SHARE/hello.c" "$SHARE/hello.py" "$HOME/Code/"
+        [ $# -gt 0 ] || set -- "$HOME/Code/hello.py" "$HOME/Code/hello.c"
+    fi
+fi
+# dark menus and dialogs; the session's POSIX locale would garble Ukrainian file names
+export GTK_THEME=Adwaita:dark LANG=C.UTF-8
+exec geany "$@"
