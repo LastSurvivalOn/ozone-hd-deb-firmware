@@ -768,6 +768,7 @@ keyboard (or type on the phone, below).
 | **Proxy** | a proxy server (`http://host:port`, with `user:password@` if it needs one) for the browser, YouTube and the player at once; the rest of the programs use it from the next start of the desktop |
 | **Remote control on the phone** | below |
 | **Receive videos from a phone (DLNA)** | below |
+| **Share the box's files** | below |
 | **Show a phone's screen (Miracast)** | below |
 
 **The WiFi hotspot** shares the box's internet (the cable, PPPoE, or its own WiFi) over WiFi.
@@ -795,6 +796,20 @@ player, music and photos full screen; the phone pauses, winds and stops them, an
 and the remote works as usual (**exit** stops). **Receive videos from a phone** turns it off or on,
 and gives it another name. (YouTube's own cast button needs Google's protocol, which the box
 doesn't have.)
+
+**Sharing the box's files** with the computers, phones and TVs at home: **Network → Share the
+box's files**, two switches (both off at first):
+- **Folders for computers and phones (SMB)**: Videos, Music, Pictures, Downloads, TV recordings and
+  Drives (the USB drives and SD card plugged in). On Windows they are under **Network** as
+  **OZONETV** (or type `\\OZONETV` in the Explorer's address bar); on a Mac, Finder → Go →
+  Connect to Server, `smb://` and the box's address; on Android, a file manager's network or SMB
+  place (Solid Explorer, CX File Explorer, X-plore), or VLC and Kodi directly. No password: only the
+  home network can reach them.
+- **Media for TVs and players (DLNA)**: TVs, VLC, Kodi, BubbleUPnP list **Ozone TV** among their
+  media servers, with the videos, music and photos (by folder), the TV recordings too.
+
+At first the others can only look and copy; **They may change and add files** lets them put files
+on the box and delete them too.
 
 **A phone's screen on the TV (Miracast)**: open **Screen mirroring** (in the app menu, or
 **Network → Show a phone's screen**). While it says "Waiting for a phone or a computer", the box is

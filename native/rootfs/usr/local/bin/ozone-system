@@ -62,7 +62,7 @@ LOG = '/var/log/ozone-system.log'
 # fall back to their defaults)
 SYSTEM_SETTINGS = ['/etc/ozone/display', '/etc/ozone/screen', '/etc/ozone/network.json', '/etc/ozone/proxy',
                    '/etc/ozone/hotspot.json', '/etc/ozone/shares.json', '/etc/ozone/alsaequal.bin',
-                   '/etc/ozone/vpn', '/etc/wpa_supplicant/ozone.conf', '/var/lib/bluetooth']
+                   '/etc/ozone/vpn', '/etc/wpa_supplicant/ozone.conf', '/var/lib/bluetooth', '/etc/ozone/share.json']
 SYSTEM_KEPT = ['/etc/timezone', '/etc/localtime', '/etc/environment', '/etc/apt/apt.conf.d/80ozone-proxy',
                '/etc/ppp/pap-secrets', '/etc/ppp/chap-secrets']
 # the home's hidden entries a settings backup leaves out, and the reset leaves alone

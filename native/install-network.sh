@@ -18,9 +18,11 @@ ssh_box 'set -e
     # pppoe: the kernel has PPP but no PPPoE, so the user-space one runs under pppd
     sudo apt-get install -y -qq --no-install-recommends iw hostapd dnsmasq-base iptables openvpn ppp pppoe \
         wireguard-tools qrencode > /dev/null
+    # sharing the box'"'"'s files (ozone-share): Samba, wsdd for Windows 10 and 11, MiniDLNA
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends samba wsdd minidlna > /dev/null
     sudo apt-get clean
-    # the hotspot and VPN start their own daemons, when chosen in the menu
-    for s in hostapd openvpn; do [ -e /etc/init.d/$s ] && sudo update-rc.d $s disable > /dev/null 2>&1 || true; done
+    # the hotspot, VPN and sharing start their own daemons, when chosen in the menu
+    for s in hostapd openvpn smbd nmbd samba-ad-dc minidlna; do [ -e /etc/init.d/$s ] && sudo update-rc.d $s disable > /dev/null 2>&1 || true; done
     dpkg -S /sbin/init | grep -q sysvinit-core || { echo "!! /sbin/init is not sysvinit any more" >&2; exit 1; }'
 
 echo ">> files"
@@ -29,13 +31,15 @@ tar -C "$HERE/rootfs" -czf - usr/local/bin/ozone-network usr/local/bin/ozone-wif
     usr/local/bin/ozone-vpn usr/local/bin/ozone-phone usr/local/bin/ozone-dlna usr/local/bin/ozone-remote \
     usr/local/bin/ozone-files usr/local/bin/yt usr/local/bin/ozone-web usr/local/lib/ozone/net-apply \
     usr/local/lib/ozone/netwatch usr/local/lib/ozone/wifi-event usr/local/lib/ozone/vpn-updown \
-    usr/local/share/applications/ozone-network.desktop usr/local/share/applications/ozone-dlna.desktop |
+    usr/local/share/applications/ozone-network.desktop usr/local/share/applications/ozone-dlna.desktop \
+    usr/local/bin/ozone-share etc/init.d/ozone-share |
     ssh_box 'sudo tar -C / --no-same-owner -xzf -'
 tar -C "$HERE/dotfiles" -czf - .config/bspwm/bspwmrc .config/polybar/config.ini .config/rofi/config.rasi | ssh_box 'tar -C ~ -xzf -'
 
 echo ">> amplay (--control, for DLNA), built on the box"
 tar -C "$HERE/amplay" -czf - amplay.c osd.c osd.h ttx.c ttx.h Makefile |
     ssh_box 'set -e; d=$(mktemp -d); tar -C $d -xzf -; make -s -C $d; sudo make -s -C $d install; rm -r $d'
+ssh_box 'sudo update-rc.d ozone-share defaults > /dev/null'
 # netwatch again, now applying the cable's settings (its init script would restart WiFi too)
 ssh_box '/etc/ozone/is-native || exit 0
     sudo start-stop-daemon --stop --quiet --pidfile /run/ozone-netwatch.pid --remove-pidfile || true

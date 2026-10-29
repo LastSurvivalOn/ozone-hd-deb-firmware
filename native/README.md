@@ -747,3 +747,20 @@ like by section and by name.
 - `ozone-screenshot`: fb0 itself (RGB565 through a 65 536-entry table, then GdkPixbuf's PNG): 1.7 s
   for 1280x720. X's copy lags behind GL windows that swap straight to the framebuffer; the video
   layer is in neither.
+
+## Sharing (ozone-share)
+
+`/etc/ozone/share.json` (smb, dlna, write) and `/etc/init.d/ozone-share` (`ozone-share apply`);
+Debian's smbd, nmbd, samba-ad-dc and minidlna services are disabled by install-network.sh and run by
+it instead.
+- Samba: `smb.conf` written whole (standalone, `map to guest = Bad User` with the box's user as the
+  guest account, `force user`, SMB2 and newer, `hosts allow` the private ranges), a share per folder
+  that exists. A guest could list but create nothing (`check_parent_access_fsp` refused the folder)
+  until the user had a passdb entry: `smbpasswd -a -n` (no password; empty passwords are refused at
+  logon, checked). `wsdd -4 -u nobody:aid_inet` announces it to Windows 10 and 11, which no longer
+  browse NetBIOS; start-stop-daemon tracks it by its pid file, as it is a python script.
+- MiniDLNA as the user through `start-stop-daemon --chuid USER:aid_inet` (the paranoid network
+  check), `/etc/ozone/minidlna.conf`, its database in `/var/cache/ozone-minidlna`; SSDP's 1900
+  shared with ozone-dlna's renderer (both SO_REUSEADDR).
+- Tested from the laptop: `smbclient -L` as a guest, reading, writing only when allowed, the DLNA
+  server found by M-SEARCH (`Ozone TV`, port 8200).

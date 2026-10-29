@@ -157,8 +157,8 @@ Linux doesn't:
   desktop that the scaler stretches: everything bigger).
 - [ ] **Medium**: the calendar synced with Google Calendar or a calendar's ICS address, as
   Android's Calendar with its Google sync adapter.
-- [ ] **Medium**: sharing the box's own files with the network (a DLNA media server, or a Windows
-  share), so a phone or a TV plays the box's recordings and videos.
+- [x] **Medium**: sharing the box's own files with the network: Network → Share the box's files
+  (`ozone-share`: Samba with wsdd, a MiniDLNA server).
 - [ ] **Low value**: e-mail (Email, Gmail: web mail in the browser does it), printing (CUPS is
   heavy), a USB webcam (Camera2), text to speech and a screen reader (PicoTts, TalkBack).
 

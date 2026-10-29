@@ -1,0 +1,228 @@
+#!/usr/bin/python3
+"""ozone-share: the box's files for the other devices of the home network.
+
+  ozone-share            the menu (rofi; the Network menu's Sharing)
+  ozone-share status     "on: …" or "off", for the Network menu
+  ozone-share set KEY VALUE   (root) smb / dlna / write: 1 or 0; and applies it
+  ozone-share apply      (root) the services as set (/etc/init.d/ozone-share at boot)
+
+Two ways, each on or off (/etc/ozone/share.json):
+- SMB, Windows' file sharing (Samba): the folders Videos, Music, Pictures, Downloads, TV recordings
+  and Drives (every USB drive and SD card) as \\\\OZONETV, smb://ADDRESS in a Mac's Finder, an
+  Android file manager, VLC or Kodi. Without a password (a guest is the box's user), from home
+  networks only (the private addresses); only read unless "write" is on. wsdd announces it to
+  Windows 10 and 11, nmbd to older ones.
+- DLNA, a media server (MiniDLNA): the videos, music and photos (the same folders) for TVs, VLC,
+  Kodi, BubbleUPnP and the like, which list "Ozone TV" among their media servers.
+Debian's own smbd, nmbd and minidlna services are disabled: these run them as set.
+"""
+import json
+import os
+import pwd
+import socket
+import subprocess
+import sys
+
+CONF = '/etc/ozone/share.json'
+SMB_CONF = '/etc/samba/smb.conf'
+DLNA_CONF = '/etc/ozone/minidlna.conf'
+DLNA_RUN = '/run/ozone-minidlna'
+DLNA_DB = '/var/cache/ozone-minidlna'
+WSDD_PID = '/run/ozone-wsdd.pid'
+RECORDINGS = '/mnt/nand/linux/Recordings'
+NAME, NETBIOS = 'Ozone TV', 'OZONETV'
+DEFAULTS = {'smb': False, 'dlna': False, 'write': False}
+ICON = ''
+
+
+def load():
+    s = dict(DEFAULTS)
+    try:
+        with open(CONF) as f:
+            s.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    return s
+
+
+def user():
+    return pwd.getpwuid(1000)
+
+
+def folders():
+    """(share name, path, DLNA kind) of what there is"""
+    home = user().pw_dir
+    out = [('Videos', os.path.join(home, 'Videos'), 'V'), ('Music', os.path.join(home, 'Music'), 'A'),
+           ('Pictures', os.path.join(home, 'Pictures'), 'P'), ('Downloads', os.path.join(home, 'Downloads'), ''),
+           ('TV recordings', RECORDINGS, 'V'), ('Drives', '/media', '')]
+    return [f for f in out if os.path.isdir(f[1])]
+
+
+def running(pattern):
+    return subprocess.call(['pgrep', '-f', pattern], stdout=subprocess.DEVNULL) == 0
+
+
+def status():
+    s = load()
+    on = [n for k, n in (('smb', 'folders'), ('dlna', 'media')) if s[k]]
+    return 'on: ' + ', '.join(on) if on else 'off'
+
+
+# ---- as root --------------------------------------------------------------------------------------
+
+def write_samba(s):
+    u = user().pw_name
+    lines = ['# Written by ozone-share (the Network menu\'s Sharing): changes here are lost', '[global]',
+             '   workgroup = WORKGROUP', '   netbios name = %s' % NETBIOS, '   server string = %s' % NAME,
+             '   server role = standalone server', '   map to guest = Bad User', '   guest account = %s' % u,
+             # Windows 10 and 11 speak SMB2 and newer only; SMB1 is old and unsafe
+             '   server min protocol = SMB2_02',
+             # the home network only: the private ranges
+             '   hosts allow = 127. 10. 172.16.0.0/255.240.0.0 192.168. 169.254.',
+             '   load printers = no', '   printing = bsd', '   printcap name = /dev/null', '   disable spoolss = yes',
+             '   log file = /var/log/samba/log.%m', '   max log size = 200', '   usershare max shares = 0', '']
+    for name, path, _k in folders():
+        lines += ['[%s]' % name, '   path = %s' % path, '   guest ok = yes', '   guest only = yes',
+                  '   read only = %s' % ('no' if s['write'] else 'yes'), '   force user = %s' % u,
+                  '']
+    tmp = SMB_CONF + '.tmp'
+    with open(tmp, 'w') as f:
+        f.write('\n'.join(lines))
+    os.replace(tmp, SMB_CONF)
+    # The guest (the box's user) could make no file until that user had an account of Samba's own:
+    # without one, the forced user's token got no SID and the folder's check refused every write.
+    # No password: Samba takes no empty one ("null passwords" is off), guests come in as guests.
+    if subprocess.call(['pdbedit', '-u', u], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
+        subprocess.call(['smbpasswd', '-a', '-n', u], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def write_dlna():
+    u = user()
+    for d in (DLNA_RUN, DLNA_DB):
+        os.makedirs(d, exist_ok=True)
+        os.chown(d, u.pw_uid, u.pw_gid)
+    lines = ['# Written by ozone-share (the Network menu\'s Sharing)']
+    for _name, path, k in folders():
+        lines.append('media_dir=%s%s' % (k + ',' if k else '', path))
+    lines += ['friendly_name=%s' % NAME, 'db_dir=%s' % DLNA_DB, 'log_dir=%s' % DLNA_DB, 'inotify=yes', 'port=8200',
+              'album_art_names=Cover.jpg/cover.jpg/Folder.jpg/folder.jpg/AlbumArt.jpg', 'root_container=B']
+    with open(DLNA_CONF, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+
+
+def service(name, on):
+    subprocess.call(['/etc/init.d/' + name, 'start' if on else 'stop'], stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+
+
+def apply():
+    s = load()
+    if s['smb']:
+        write_samba(s)
+        # a changed configuration: smbd reads it again
+        if running('^/usr/sbin/smbd'):
+            subprocess.call(['smbcontrol', 'smbd', 'reload-config'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        service('smbd', True)
+        service('nmbd', True)
+        # wsdd: Windows 10 and 11 find the box in their Network (no NetBIOS there any more);
+        # nobody:aid_inet, as only that group may open sockets on this kernel. A python script: the
+        # pid file alone tells whether it runs
+        subprocess.call(['start-stop-daemon', '--start', '--quiet', '--background', '--make-pidfile',
+                         '--pidfile', WSDD_PID, '--startas', '/usr/sbin/wsdd', '--', '-4', '-s', '-n', NETBIOS,
+                         '-w', 'WORKGROUP', '-u', 'nobody:aid_inet'])
+    else:
+        service('smbd', False)
+        service('nmbd', False)
+        subprocess.call(['start-stop-daemon', '--stop', '--quiet', '--oknodo', '--pidfile', WSDD_PID,
+                         '--remove-pidfile'])
+    pidfile = DLNA_RUN + '/minidlna.pid'
+    if s['dlna']:
+        write_dlna()
+        if not running('^/usr/sbin/minidlnad'):
+            # as the user, with aid_inet among its groups (start-stop-daemon sets them)
+            u = user().pw_name
+            subprocess.call(['start-stop-daemon', '--start', '--quiet', '--chuid', '%s:aid_inet' % u,
+                             '--pidfile', pidfile, '--exec', '/usr/sbin/minidlnad', '--', '-f', DLNA_CONF,
+                             '-P', pidfile])
+    else:
+        subprocess.call(['start-stop-daemon', '--stop', '--quiet', '--oknodo', '--retry', '5', '--exec',
+                         '/usr/sbin/minidlnad'])
+    return 0
+
+
+def set_root(key, value):
+    s = load()
+    if key not in DEFAULTS:
+        sys.exit('unknown setting %s' % key)
+    s[key] = value in ('1', 'on', 'true', 'yes')
+    with open(CONF + '.tmp', 'w') as f:
+        json.dump(s, f)
+    os.replace(CONF + '.tmp', CONF)
+    if key == 'write' and s['smb']:
+        write_samba(s)
+        subprocess.call(['smbcontrol', 'smbd', 'reload-config'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return apply()
+
+
+# ---- the menu -------------------------------------------------------------------------------------
+
+def addresses():
+    out = []
+    for iface in ('eth0', 'wlan0'):
+        r = subprocess.run(['ip', '-4', '-o', 'addr', 'show', iface], capture_output=True, text=True)
+        out += [w.split('/')[0] for w in r.stdout.split() if '/' in w and w[0].isdigit()]
+    return out
+
+
+def rofi(prompt, items, message=None):
+    cmd = ['rofi', '-dmenu', '-i', '-format', 'i', '-p', prompt,
+           '-theme-str', 'listview { lines: %d; }' % min(len(items), 10)]
+    if message:
+        cmd += ['-mesg', message]
+    r = subprocess.run(cmd, input='\n'.join(items), capture_output=True, text=True)
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        return None
+
+
+def sudo_set(key, value):
+    subprocess.call(['sudo', '-n', '/usr/local/bin/ozone-share', 'set', key, value])
+
+
+def menu():
+    while True:
+        s = load()
+        ips = addresses()
+        where = ips[0] if ips else socket.gethostname()
+        msg = ('Windows: \\\\%s in the Explorer (or Network).  Mac: smb://%s.  Android: a file manager\'s '
+               'network (SMB), VLC, Kodi.  TVs and players: "%s" in their media servers.' % (NETBIOS, where, NAME))
+        items = ['  Folders for computers and phones (SMB): %s' % ('on' if s['smb'] else 'off'),
+                 '  Media for TVs and players (DLNA): %s' % ('on' if s['dlna'] else 'off'),
+                 '  They may change and add files: %s' % ('yes' if s['write'] else 'no, only look and copy')]
+        i = rofi(ICON + '  Sharing', items, msg)
+        if i is None:
+            return 0
+        key = ['smb', 'dlna', 'write'][i]
+        sudo_set(key, '0' if s[key] else '1')
+        if key != 'write':
+            s = load()
+            subprocess.call(['ozone-notify', 'Sharing: %s' % status()], stderr=subprocess.DEVNULL)
+
+
+def main():
+    a = sys.argv[1:]
+    if a == ['status']:
+        print(status())
+        return 0
+    if a[:1] in (['set'], ['apply']):
+        if os.geteuid() != 0:
+            os.execvp('sudo', ['sudo', '-n', '/usr/local/bin/ozone-share'] + a)
+        return set_root(a[1], a[2]) if a[0] == 'set' and len(a) == 3 else apply()
+    if a:
+        sys.exit(__doc__)
+    return menu()
+
+
+if __name__ == '__main__':
+    sys.exit(main())
