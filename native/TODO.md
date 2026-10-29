@@ -3,7 +3,9 @@
 Collected 2026-10-21 from the stock apps on `/system` (the TV app `th.dtv`, SettingsEx,
 MoviePlayer, DLNA, Miracast, OTAUpgrade, the phone remotes), `build.prop` and the hardware, against
 what native Linux does now. Audited again on 2026-10-28 against every app in the system.img backup
-(`/system/app`, `/system/priv-app`): section 6 is what that added. Levels:
+(`/system/app`, `/system/priv-app`): section 6 is what that added. A third time on 2026-10-29,
+with SettingsEx's and the TV app's own strings and Android's part of the data partition (the only
+app installed there is SmartTube): section 7. Levels:
 
 - **Easy**: a day or less, known ground (a script, a menu, a small change to an existing tool).
 - **Medium**: a few days, or new code in amplay / ozone-tv, or something not tried on this kernel.
@@ -42,8 +44,7 @@ Tick an item off (`[x]`) when it is done and update MANUAL.md with it.
   OSD can draw them.
 - [x] **Medium or Hard**: teletext (with its language): PES decoding and a page renderer.
 - [x] **Medium or Hard**: timers from the guide (record or switch at a time, conflict checks).
-  From standby it is a timer in a daemon. From power off it can't be done for now: the RTC wake
-  alarm doesn't work (`wakealarm` gives EIO), so only the remote wakes the box.
+  From standby it is a timer in a daemon. From power off: not yet, but likely possible (section 7).
 - [ ] **Medium or Hard**: the TV interface in Ukrainian (the stock app has uk-UA).
 - [ ] **Hard / low value**: scrambled channels: BISS keys, CCcam / Newcamd / Gbox clients. Hardly
   relevant to free T2 here.
@@ -103,9 +104,10 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
 - [ ] **Easy or Medium**: small apps for the remote: clock / alarm, calculator, calendar. The
   calendar is done (`ozone-calendar`: events, birthdays, reminders, Ukraine's holidays), and the
   calculator (Qalculate!, and Maxima for real maths).
-- [ ] **Medium**: YouTube features SmartTube has and `yt` doesn't: account sign-in, subscriptions,
-  history, the home feed, channel pages, playlists, SponsorBlock, YouTube's own subtitles, speed,
-  chapters. Starting a video also takes ~10 s.
+- [ ] **Medium**: YouTube features SmartTube has and `yt` doesn't (history, recommendations and
+  playlists are done, on the box): subscriptions (channels followed, their new videos), channel
+  pages, SponsorBlock, YouTube's own subtitles, speed, chapters, account sign-in. Starting a video
+  also takes ~10 s.
 - [x] **Medium or Hard**: casting from the YouTube app on a phone (its "Cast" button, or "Link with
   TV code"): DIAL and YouTube's Lounge API (`ozone-cast`). Tested with a pretend phone so far.
 - [ ] **Medium**: settings in the interface: sound, screen, network, language in one place.
@@ -161,6 +163,25 @@ Linux doesn't:
   (`ozone-share`: Samba with wsdd, a MiniDLNA server).
 - [ ] **Low value**: e-mail (Email, Gmail: web mail in the browser does it), printing (CUPS is
   heavy), a USB webcam (Camera2), text to speech and a screen reader (PicoTts, TalkBack).
+
+## 7. Found in the third audit (2026-10-29)
+
+- [ ] **Easy**: powering on from a timer. The TV app has a "PowerOn" timer kind and checks at start
+  whether the RTC woke the box (`setRTCAlarm`, `bFromRTC`): Android sets the RTC alarm, and the
+  box's deep suspend (our power off) is the same as Android's. Our `wakealarm` failed only because
+  sysfs reads the alarm back first and aml_rtc can't (EINVAL); the `RTC_WKALM_SET` ioctl goes
+  straight to the driver and works (tried: the RTC's GPO counter took it, then cleared). To try:
+  an alarm in 3 minutes, then power off. If it wakes, a cold boot follows: ozone-tv's timers then
+  set the alarm at power off and record after the boot.
+- [ ] **Easy**: the TV app's other timer kinds: standby at a time, power on, monthly repeat (ours:
+  record or switch, once / daily / weekly). Its "Switch Channel Mode" (black or the last frame
+  while zapping) too.
+- [ ] **Low value**: the stock phone remotes' protocols: Amlogic's RC_Server (TCP and UDP, its own
+  phone app) and Google TV's Anymote (IpRemote; Google's app for it is gone). The web remote on
+  port 8080 does their job with any phone's browser.
+- [ ] **Low value**: Google's News and Weather widget (GenieWidget; the service is gone). Picture
+  settings (brightness, contrast, saturation in `/sys/class/video`): the TV library has them,
+  no menu of Android's shows them.
 
 ## Neither has it
 
