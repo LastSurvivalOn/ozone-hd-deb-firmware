@@ -23,8 +23,9 @@ start)
     if ! mountpoint -q /system; then
         if [ -x $A/bin/linker ]; then
             mount --bind $A /system && mount -o remount,ro,bind /system
-        else
+        elif [ ! -e /etc/ozone/no-android ]; then
             # not copied yet (install-android-files.sh): the stock partition, while it is there
+            # (remove-android.sh makes it Linux storage)
             mount -o ro /dev/system /system
         fi
     fi

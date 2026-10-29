@@ -131,7 +131,8 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
 - [x] **Medium**: videos of sites that need signing in (Vimeo, social networks): `yt` gives yt-dlp
   ozone-web's cookies (not for YouTube).
 - [ ] **Hard / not planned**: Android apps (Google Play, APKs) in Linux. Rebooting into Android
-  is the way.
+  is the way, where it wasn't removed (`remove-android.sh`; the user's box has none since
+  2026-10-29).
 
 ## 6. Found in the second audit (2026-10-28)
 

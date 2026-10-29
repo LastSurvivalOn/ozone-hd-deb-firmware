@@ -8,6 +8,10 @@ case "$hours" in
 *) auto="after $hours hours without a button" ;;
 esac
 
+# no Android in the menu once remove-android.sh took it off the box
+no_android() { if [ -e /etc/ozone/no-android ]; then grep -v Android; else cat; fi; }
+lines=7
+[ -e /etc/ozone/no-android ] && lines=6
 choice=$(printf '%s\n' \
     "  Sleep (a key or mouse click wakes it)" \
     "  Android (T2, SmartTube)" \
@@ -16,7 +20,8 @@ choice=$(printf '%s\n' \
     "  Reboot" \
     "  Power off (Power on the remote turns it on)" \
     "  Sleep by itself: $auto" |
-    rofi -dmenu -i -p "  Power" -theme-str 'listview { lines: 7; }')
+    no_android |
+    rofi -dmenu -i -p "  Power" -theme-str "listview { lines: $lines; }")
 
 case "$choice" in
 *"by itself"*)

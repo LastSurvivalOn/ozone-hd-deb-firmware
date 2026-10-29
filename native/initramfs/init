@@ -1,7 +1,7 @@
 #!/bin/busybox sh
 # Pure Linux initramfs: brings up NAND, mounts /data/linux/debian.img as root and hands control
 # to Debian's /sbin/init. If something goes wrong: log in /data/linux/native-boot.log, telnet on eth0
-# for 5 minutes for diagnostics, then reboot (a normal reboot = Android).
+# for 5 minutes for diagnostics, then reboot (u-boot starts the boot partition again).
 
 /bin/busybox --install -s /bin
 export PATH=/bin

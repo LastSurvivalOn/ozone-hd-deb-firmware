@@ -2,7 +2,7 @@
 
 Scripts that turn an OzoneHD T2 WiFi set-top box (Amlogic S805, Android 4.4) into a Debian 12
 media centre run with the TV remote: the box's own DVB-T2 tuner, hardware video decoding and the
-Mali GPU on its stock kernel, with Android kept for dual boot.
+Mali GPU on its stock kernel, with Android kept for dual boot or removed altogether.
 
 The box's 3.10 vendor kernel stays: NAND, WiFi and the T2 tuner have no mainline drivers. A custom
 initramfs boots Debian from an image file on the data partition, and everything Android did is
@@ -53,7 +53,7 @@ Both use the same Debian image, `/data/linux/debian.img`.
 | | [`hybrid/`](hybrid) | [`native/`](native) |
 |---|---|---|
 | What boots | Android, with Debian in a chroot beside it | Debian, from the boot partition |
-| Android | runs all the time | one reboot away (`reboot-android`) |
+| Android | runs all the time | one reboot away (`reboot-android`), or removed (`remove-android.sh`) |
 | For | a quiet Debian server next to Android | the media centre above |
 
 ## Getting started
@@ -84,8 +84,9 @@ Everything runs from a Linux computer on the same network as the box, over `adb`
 > **Warning.** This writes to the boot partitions of a device with no official recovery tool.
 > The scripts never touch the bootloader. Several kernel constraints were found by bricking or
 > hanging the box: read [CLAUDE.md](CLAUDE.md) ("Kernel and hardware constraints") before
-> changing anything low-level. If Linux doesn't start, a plain reboot lands in Android, and u-boot
-> can still load `recovery.img` from an SD card or a USB stick.
+> changing anything low-level. If u-boot can't load the boot partition, it starts the recovery
+> partition (Android, or a copy of Linux once Android is removed), and it can still load
+> `recovery.img` from an SD card or a USB stick.
 
 ## Documentation
 

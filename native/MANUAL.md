@@ -43,7 +43,7 @@ item with the arrows and Enter, or click it. Esc closes the menu.
 | Item | What it does |
 |---|---|
 | Sleep | Turns the screen off. Press any key or click a mouse button to wake it (or any button on the remote; its Power button also puts the box to sleep). Waking is instant. The network keeps working while it sleeps. Quit the video player first: it doesn't stop by itself. |
-| Android | Closes Linux and starts the original Android (the stock TV app, SmartTube). |
+| Android | Closes Linux and starts the original Android (the stock TV app, SmartTube). Not there once Android was removed from the box. |
 | Restart desktop | Restarts the graphical session. Open windows close. Use it when something hangs (see section 9). |
 | Screen size | Fits the picture to a screen that cuts off its edges, see below. |
 | Reboot | Restarts the box into Linux. |
@@ -93,6 +93,11 @@ kept across reboots, and videos fit into the same area. For another screen, adju
 
 **From Android back to Linux:** restart the box from Android, or unplug it and plug it back in.
 Linux always starts by default.
+
+**A box without Android:** Android can be removed for good (`native/remove-android.sh`, from a
+computer). Then the power menu has no Android, and its old partitions hold your Downloads and the
+programs' caches. Information → Storage shows them. It can be put back from the computer's backups
+(`remove-android.sh --undo`).
 
 ## 2. The desktop and the panel
 

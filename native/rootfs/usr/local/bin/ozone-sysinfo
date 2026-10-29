@@ -173,6 +173,11 @@ def edid():
     return ' '.join(m.group(1).strip() for m in (brand, product) if m)
 
 
+def no_android():
+    """remove-android.sh took Android off the box"""
+    return os.path.exists('/etc/ozone/no-android')
+
+
 def df(path):
     try:
         st = os.statvfs(path)
@@ -246,8 +251,9 @@ def software():
     cmdline = read('/proc/cmdline')
     modes = ', '.join('%s=%s' % kv for kv in re.findall(r'\b(hdmimode|cvbsmode)=(\S+)', cmdline))
     firmware = [
-        ('Android', '%s, build %s (%s)' % (p.get('ro.build.version.release', '?'),
-                                           p.get('ro.build.display.id', '?').split()[0], built)),
+        ('Android' + (' (removed)' if no_android() else ''),
+         '%s, build %s (%s)' % (p.get('ro.build.version.release', '?'), p.get('ro.build.display.id', '?').split()[0],
+                                built)),
         ('Kernel', '%s %s' % (m.group(1), m.group(4)) if m else ver),
         ('Kernel built', '%s by the vendor (%s, gcc %s)' % (m.group(5), m.group(2), m.group(3)) if m else '?'),
         ('Boot loader', 'the stock u-boot, untouched; it boots the "boot" partition, which holds Linux'),
@@ -320,7 +326,7 @@ HOW = [
     ('How Linux starts', [
         'The kernel is the one Android uses (3.10, with Amlogic\'s drivers). A small start-up program of '
         'ours (the initramfs) loads Android\'s NAND driver, mounts the data partition and the file '
-        '/data/linux/debian.img on it (a whole Debian system in one 2 GB file), and hands over to it. '
+        '/data/linux/debian.img on it (a whole Debian system in one 3 GB file), and hands over to it. '
         'There sysvinit starts the services, then the graphics with the panel.']),
     ('Hardware, the Android way', [
         'Android\'s own pieces drive the hardware where Linux has no driver: its WiFi module, its tool that '
@@ -341,10 +347,20 @@ HOW = [
         'debian.img can also run inside Android (a chroot), without its graphics: useful for ssh and '
         'tools while Android plays TV.']),
 ]
+# in place of the first of HOW once remove-android.sh took Android off the box
+NO_ANDROID = ('Linux only', [
+    'Android was removed from this box (remove-android.sh). The stock boot loader (u-boot) starts '
+    'Linux from the "boot" partition, with the box\'s own kernel, and a copy of it from "recovery" '
+    'if it can\'t read the first. Android\'s old system and cache partitions hold the downloads and '
+    'the programs\' caches.'])
 
 
 def how():
-    return [(title, [('text', t) for t in texts]) for title, texts in HOW]
+    how = HOW
+    if no_android():
+        how = [NO_ANDROID if title == HOW[0][0] else (title, texts) for title, texts in HOW
+               if title != 'The same Debian under Android']
+    return [(title, [('text', t) for t in texts]) for title, texts in how]
 
 
 def hardware():
@@ -430,10 +446,15 @@ def bar(label, used, total, extra='', left='free'):
 def storage():
     rows = []
     # /system is the NAND partition only before install-android-files.sh; after it, a copy in debian.img
-    nand_system = any(l.split()[:2] == ['/dev/system', '/system'] for l in read('/proc/mounts').splitlines())
+    mounts = [l.split()[:2] for l in read('/proc/mounts').splitlines()]
+    nand_system = ['/dev/system', '/system'] in mounts
     for path, label, what in (('/', 'Linux (debian.img)', ''), ('/mnt/nand', 'Data partition', ''),
-                              ('/system', 'Android system', ' (read-only)')):
-        if path == '/system' and not nand_system:
+                              ('/system', 'Android system', ' (read-only)'),
+                              # the partitions Android had, once it is removed (ozone-storage)
+                              ('/mnt/storage', 'Downloads partition', ' (Downloads, packages being installed)'),
+                              ('/mnt/cache', 'Cache partition', ' (the programs\' caches)')):
+        if path == '/system' and not nand_system or path.startswith('/mnt/') and path != '/mnt/nand' and \
+                not any(m[1] == path for m in mounts):
             continue
         d = df(path)
         if d:
@@ -451,11 +472,15 @@ def storage():
     names = {'boot': 'Linux (our image; the box boots it)', 'recovery': 'Android\'s boot image',
              'system': 'Android', 'data': 'Android\'s apps and data, and debian.img', 'cache': 'Android\'s cache',
              'logo': 'the boot logo', 'misc': 'boot flags'}
+    if no_android():
+        names.update(recovery='a copy of Linux, for when u-boot can\'t read "boot"',
+                     system='Downloads and packages being installed', data='debian.img, TV recordings, backups',
+                     cache='the programs\' caches')
     for line in read('/proc/partitions').splitlines()[2:]:
         f = line.split()
         if f and f[3] in names:
             parts.append((f[3], '%s, %s' % (size(int(f[2]) * 1024), names[f[3]])))
-    explain = [('text', 'Linux is one file, debian.img, on Android\'s data partition: the space it can '
+    explain = [('text', 'Linux is one file, debian.img, on the data partition: the space it can '
                         'grow into is the free space of that partition.')]
     return [('Space', rows), ('Drives and network folders', media or [('', 'none connected')]),
             ('NAND partitions', parts), ('', explain)]

@@ -1,0 +1,64 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          ozone-storage
+# Required-Start:    $local_fs
+# Required-Stop:
+# Default-Start:     S
+# Default-Stop:
+# Short-Description: Android's old system and cache partitions as Linux storage
+# Description:       Only on a box Android was removed from (remove-android.sh, /etc/ozone/no-android):
+#                    the system partition (1 GB) holds ~/Downloads and apt's package downloads, the
+#                    cache partition (512 MB) holds ~/.cache, bound over the folders in debian.img, so
+#                    neither a big download nor a big install fills the root filesystem.
+### END INIT INFO
+/etc/ozone/is-native || exit 0
+[ -e /etc/ozone/no-android ] || exit 0
+
+LOG=/var/log/ozone-storage.log
+HOME1000=$(getent passwd 1000 | cut -d: -f6)
+OWNER=1000:$(getent passwd 1000 | cut -d: -f4)
+
+part() {   # device mount point
+    mountpoint -q "$2" && return 0
+    mkdir -p "$2"
+    # -p fixes only what is safe without questions; 4 and up: errors left, so not mounted
+    e2fsck -p "$1" >> $LOG 2>&1
+    [ $? -lt 4 ] || { echo "$(date '+%F %T') $1: errors e2fsck -p can't fix, not mounted" >> $LOG; return 1; }
+    mount -t ext4 -o noatime "$1" "$2"
+}
+
+bind() {   # folder on a partition, folder it covers, owner
+    mountpoint -q "$2" && return 0
+    mkdir -p "$1" "$2"
+    chown "$3" "$1"
+    # what the covered folder had moves over once (the first start after remove-android.sh)
+    if [ -n "$(ls -A "$2")" ]; then
+        cp -a "$2"/. "$1"/ && find "$2" -mindepth 1 -delete || return 1
+    fi
+    mount --bind "$1" "$2"
+}
+
+case "$1" in
+start|restart|force-reload)
+    [ -n "$HOME1000" ] || exit 0
+    if part /dev/system /mnt/storage; then
+        bind /mnt/storage/downloads "$HOME1000/Downloads" "$OWNER"
+        bind /mnt/storage/apt /var/cache/apt/archives root:root
+    fi
+    if part /dev/cache /mnt/cache; then
+        bind /mnt/cache/user "$HOME1000/.cache" "$OWNER"
+    fi
+    ;;
+stop)
+    # umountfs unmounts them with the rest
+    ;;
+status)
+    grep -E ' /mnt/(storage|cache) ' /proc/mounts
+    df -h /mnt/storage /mnt/cache 2> /dev/null
+    ;;
+*)
+    echo "Usage: $0 start|status" >&2
+    exit 3
+    ;;
+esac
+exit 0

@@ -8,7 +8,8 @@ boot partition      → Linux (out/linux-recovery.img)      ← boots by default
 recovery partition  → stock Android boot.img (T2, SmartTube)
 ```
 
-- Linux → Android: `reboot-android` or the power menu on the panel.
+- Linux → Android: `reboot-android` or the power menu on the panel (not after
+  `remove-android.sh`, see [Removing Android](#removing-android)).
 - Android → Linux: any normal reboot or power cycle.
 - Login: `ssh -i ~/.ssh/id_ed25519_ozone <USER>@<BOX_IP>`. The scripts here take the box's
   address, user and key from `../.env` (a copy of `../.env.example`), or the IP as their first
@@ -34,6 +35,32 @@ recovery partition  → stock Android boot.img (T2, SmartTube)
 Flashing the image (from Android, as root): `dd if=linux-recovery.img of=/dev/block/boot`; before that, Android is
 copied to recovery: `dd if=/dev/block/boot of=/dev/block/recovery`. Backups of all partitions are in
 `~/ozone_backup/backup/`.
+
+### Removing Android
+
+`./remove-android.sh [ip]` (native Linux running, then a restart) leaves the box with Linux only:
+
+| Partition | Becomes |
+|---|---|
+| recovery | a copy of the boot partition: u-boot starts it when it can't load `boot`, as it did Android |
+| system (1 GB) | ext4, `/mnt/storage`: `~/Downloads` and apt's package downloads (`/var/cache/apt/archives`) |
+| cache (512 MB) | ext4, `/mnt/cache`: `~/.cache` |
+| data | only `linux/` stays (debian.img, TV recordings, logs, backups): ~1.3 GB freed |
+
+`/etc/init.d/ozone-storage` mounts the two partitions (after `e2fsck -p`; not mounted if errors are
+left) and binds the folders over the ones in debian.img, moving what those had at the first start.
+So a big download or install fills a partition of its own, never the root filesystem; TV recordings
+stay on the data partition, which has the most room. A whole-system backup (`--one-file-system`)
+no longer includes Downloads. `/etc/ozone/no-android` marks such a box: the power menu has no
+Android, `reboot-android` refuses, and `ozone-sysinfo` names the partitions so.
+
+The script checks the backups in `~/ozone_backup/backup` against their `md5.txt` first:
+`--undo` writes Android back from them (recovery ← `boot.img`, system, cache, Android's part of
+data) and moves Downloads back into debian.img.
+
+Without Android, a new Linux image is flashed from Linux: `dd` to `/dev/boot` (`conv=fsync`), check
+it with a read-back, restart, and only once it runs copy it to `/dev/recovery` too, so the fallback is
+always an image that booted.
 
 Boot logo: `./install-logo.sh <ip> [1920x1080 png]` (default `logo/bootup.png`) writes the picture into
 the logo partition that u-boot shows at power-on and installs the same picture as the Linux splash;
