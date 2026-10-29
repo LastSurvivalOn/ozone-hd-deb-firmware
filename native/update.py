@@ -48,7 +48,7 @@ COMPUTER = {'gpu/kernel': ('the GPU kernel modules', 'install-gpu.sh'),
             'gpu/egl-fix': ('the GPU EGL library', 'install-gpu.sh'),
             'bluetooth': ('the Bluetooth driver', 'install-bluetooth.sh'),
             'dtv': ('the TV tuner program', 'install-tv.sh'),
-            'vpn': ('wireguard-go', 'install-network.sh'),
+            'vpn': ('wireguard-go and xfrm_user.ko', 'install-network.sh'),
             'miracast': ('the Miracast wpa_supplicant', 'install-miracast.sh'),
             'webkit': ("the browser's WebKit", 'install-webkit.sh')}
 # which install scripts' parts are on the box: a file each of them puts there

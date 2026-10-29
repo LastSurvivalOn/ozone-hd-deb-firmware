@@ -149,8 +149,9 @@ Linux doesn't:
 - [x] **Easy**: choosing the wallpaper: Wallpaper (ozone-wallpaper), Photos' yellow.
 - [ ] **Easy**: the messages of the last hours in one place (Android's notification shade): now
   the panel's message is gone after 6 s.
-- [ ] **Easy**: L2TP / IPsec and PPTP VPN (Android's own VPN types), and a proxy from a PAC file
-  (ProxyHandler). Now OpenVPN, WireGuard and a plain proxy address.
+- [x] **Easy**: L2TP / IPsec and PPTP VPN (Android's own VPN types): in the VPN menu (strongSwan
+  with our xfrm_user.ko, xl2tpd, pptp). Not tried against a real server yet.
+- [ ] **Easy**: a proxy from a PAC file (ProxyHandler). Now a plain proxy address.
 - [x] **Medium**: a programs manager (Android's package installer and store): Programs
   (`ozone-apps`), picked programs by kind, a search of all of Debian, install, open, remove.
 - [x] **Medium**: text size for the whole interface: Interface size in Display and sound (a smaller

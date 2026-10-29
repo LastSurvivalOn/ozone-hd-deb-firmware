@@ -1,10 +1,18 @@
 #!/usr/bin/python3
 """ozone-vpn: VPN connections, for the remote: OpenVPN (.ovpn) and WireGuard (.conf) files from the
-VPN provider or your own server.
+VPN provider or your own server, and L2TP/IPsec and PPTP (a server, a login), as on Android.
 
-  ozone-vpn menu        connect, disconnect, add a file (from ~/VPN, Downloads or a USB drive), remove
+  ozone-vpn menu        connect, disconnect, add a file (from ~/VPN, Downloads or a USB drive) or a
+                        server, remove
   ozone-vpn status      "on: NAME" or "off"
   ozone-vpn connect NAME | disconnect | import PATH [USER PASSWORD] | remove NAME   (root)
+  ozone-vpn add l2tp|pptp NAME   (root) the server's JSON on stdin: server, user, password, psk
+
+L2TP/IPsec: strongSwan's charon (IKEv1, a pre-shared key, transport mode for UDP 1701) through the
+kernel's own IPsec, which needs xfrm_user.ko (vpn/build-xfrm-user.sh: the stock kernel has IPsec but
+not its netlink interface), then xl2tpd and pppd. PPTP: pptp under pppd, with MPPE (the kernel has
+it). Both on ppp1 (PPPoE has ppp0), the traffic through it by two half routes, its DNS servers from
+pppd's usepeerdns (Debian's ip-up.d hook puts them in resolv.conf and back).
 
 The files are kept in /etc/ozone/vpn (root only), with a login for OpenVPN files that ask for
 one. All the traffic goes through the VPN while it is on (OpenVPN as its file says; WireGuard by
@@ -27,6 +35,9 @@ LOG = '/var/log/vpn.log'
 WG = 'wg0'
 WG_GO = '/usr/local/bin/wireguard-go'
 RESOLV = '/etc/resolv.conf'
+PPP = 'ppp1'
+XFRM_USER = '/lib/modules/3.10.33/extra/xfrm_user.ko'
+IPSEC_CONF, IPSEC_SECRETS = '/etc/ipsec.conf', '/etc/ipsec.secrets'
 
 
 def sh(*args):
@@ -39,6 +50,8 @@ def log(text):
 
 
 def kind(path):
+    if path.endswith(('.l2tp', '.pptp')):
+        return path.rsplit('.', 1)[1]
     try:
         with open(path, errors='replace') as f:
             text = f.read(65536)
@@ -57,7 +70,7 @@ def configs():
     try:
         for n in sorted(os.listdir(DIR)):
             p = os.path.join(DIR, n)
-            k = kind(p) if n.endswith(('.ovpn', '.conf')) else None
+            k = kind(p) if n.endswith(('.ovpn', '.conf', '.l2tp', '.pptp')) else None
             if k:
                 out[n.rsplit('.', 1)[0]] = (p, k)
     except OSError:
@@ -230,7 +243,178 @@ def wg_down():
     sh('ip', 'link', 'del', WG)   # wireguard-go goes with its interface
 
 
-# ---- both ------------------------------------------------------------------------------------------
+# ---- L2TP/IPsec and PPTP --------------------------------------------------------------------------
+
+def load_server(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def ppp_options(c, kind_):
+    """pppd's options for the link; the password stays out of command lines"""
+    lines = ['name "%s"' % c.get('user', ''), 'password "%s"' % c.get('password', ''), 'remotename ozone-vpn',
+             'ipparam ozone-vpn', 'unit 1', 'linkname ozone-vpn', 'noauth', 'nodefaultroute', 'usepeerdns',
+             'noipdefault', 'refuse-eap', 'lcp-echo-interval 20', 'lcp-echo-failure 4', 'logfile ' + LOG]
+    if kind_ == 'pptp':
+        # MPPE needs MS-CHAPv2
+        lines += ['require-mppe-128', 'refuse-pap', 'refuse-chap', 'refuse-mschap', 'mtu 1400', 'mru 1400',
+                  'nobsdcomp', 'nodeflate']
+    else:
+        lines += ['mtu 1280', 'mru 1280', 'noccp']
+    path = RUN + '/ppp-options'
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    return path
+
+
+def server_ip(c):
+    try:
+        return socket.gethostbyname(c['server'])
+    except (OSError, KeyError):
+        return None
+
+
+def route_server(ip):
+    """The server through the usual way out, before the half routes take everything"""
+    gw, dev = way_out()
+    near = subprocess.run(['ip', 'route', 'get', ip], capture_output=True, text=True).stdout
+    if gw and ' via ' in near:
+        sh('ip', 'route', 'add', ip, 'via', gw, 'dev', dev)
+        with open(RUN + '/routes', 'w') as f:
+            f.write(ip)
+
+
+def ppp_wait(seconds=40):
+    """ppp1 with an address, then everything through it"""
+    for i in range(seconds * 2):
+        r = subprocess.run(['ip', '-4', '-o', 'addr', 'show', PPP], capture_output=True, text=True)
+        if 'inet ' in r.stdout:
+            sh('ip', 'route', 'add', '0.0.0.0/1', 'dev', PPP)
+            sh('ip', 'route', 'add', '128.0.0.0/1', 'dev', PPP)
+            return True
+        # pppd gave up (a refused login, no server): no use waiting
+        if i > 6 and sh('pgrep', '-f', 'pppd .*/run/ozone-vpn/ppp-options') != 0:
+            return False
+        time.sleep(0.5)
+    return False
+
+
+def pptp_up(path):
+    c = load_server(path)
+    ip = server_ip(c)
+    if not ip:
+        return 'The server %s is not found' % c.get('server')
+    route_server(ip)
+    opts = ppp_options(c, 'pptp')
+    subprocess.call(['pppd', 'pty', '/usr/sbin/pptp %s --nolaunchpppd --nohostroute' % ip, 'file', opts],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not ppp_wait():
+        return 'The PPTP server did not let the box in: check the server, the user name and the password'
+    return None
+
+
+def l2tp_up(path):
+    c = load_server(path)
+    ip = server_ip(c)
+    if not ip:
+        return 'The server %s is not found' % c.get('server')
+    if not os.path.exists('/sys/module/xfrm_user') and sh('insmod', XFRM_USER):
+        return 'IPsec needs %s (install-network.sh puts it there)' % XFRM_USER
+    route_server(ip)
+    with open(IPSEC_CONF, 'w') as f:
+        f.write('# Written by ozone-vpn (L2TP/IPsec)\nconfig setup\n\nconn ozone-l2tp\n'
+                '    keyexchange=ikev1\n    authby=secret\n    type=transport\n    left=%%defaultroute\n'
+                '    leftprotoport=17/1701\n    right=%s\n    rightprotoport=17/1701\n'
+                '    ike=aes256-sha1-modp2048,aes128-sha1-modp2048,aes256-sha1-modp1024,aes128-sha1-modp1024,'
+                '3des-sha1-modp1024\n'
+                '    esp=aes256-sha1,aes128-sha1,3des-sha1\n    keyingtries=1\n    auto=add\n' % ip)
+    fd = os.open(IPSEC_SECRETS, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write('%%any %s : PSK "%s"\n' % (ip, c.get('psk', '').replace('"', '')))
+    # a server that doesn't answer is given up after about 15 s, not charon's 3 minutes
+    with open('/etc/strongswan.d/ozone-vpn.conf', 'w') as f:
+        f.write('# Written by ozone-vpn\ncharon {\n    retransmit_tries = 3\n    retransmit_timeout = 2.0\n'
+                '    retransmit_base = 1.5\n}\n')
+    sh('ipsec', 'restart')
+    for _ in range(20):
+        if os.path.exists('/var/run/charon.ctl'):
+            break
+        time.sleep(0.5)
+    time.sleep(1)
+    try:
+        r = subprocess.run(['ipsec', 'up', 'ozone-l2tp'], capture_output=True, text=True, timeout=45)
+        out = r.stdout
+    except subprocess.TimeoutExpired:
+        out = 'timed out'
+    log('ipsec up: %s' % (out.strip().splitlines() or [''])[-1])
+    if 'established successfully' not in out:
+        return 'IPsec with the server failed: check the server and the pre-shared key'
+    conf = RUN + '/xl2tpd.conf'
+    with open(conf, 'w') as f:
+        f.write('[global]\nport = 1701\n\n[lac ozone]\nlns = %s\nppp debug = no\npppoptfile = %s\n'
+                'length bit = yes\n' % (ip, ppp_options(c, 'l2tp')))
+    control = RUN + '/l2tp-control'
+    subprocess.call(['xl2tpd', '-c', conf, '-p', RUN + '/xl2tpd.pid', '-C', control],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(20):
+        if os.path.exists(control):
+            break
+        time.sleep(0.25)
+    with open(control, 'w') as f:
+        f.write('c ozone\n')
+    if not ppp_wait():
+        return 'The L2TP server did not let the box in: check the user name and the password'
+    return None
+
+
+def ppp_down():
+    if os.path.exists(RUN + '/l2tp-control'):
+        try:
+            with open(RUN + '/l2tp-control', 'w') as f:
+                f.write('d ozone\n')
+        except OSError:
+            pass
+    sh('pkill', '-f', 'pppd .*/run/ozone-vpn/ppp-options')
+    sh('pkill', '-f', '^/usr/sbin/pptp ')
+    if os.path.exists(RUN + '/xl2tpd.pid'):
+        sh('start-stop-daemon', '--stop', '--quiet', '--oknodo', '--pidfile', RUN + '/xl2tpd.pid', '--remove-pidfile')
+    if os.path.exists('/var/run/charon.ctl'):
+        sh('ipsec', 'down', 'ozone-l2tp')
+        sh('ipsec', 'stop')
+    for _ in range(20):
+        if not os.path.exists('/sys/class/net/' + PPP):
+            break
+        time.sleep(0.25)
+    try:
+        with open(RUN + '/routes') as f:
+            for ip in f.read().split():
+                sh('ip', 'route', 'del', ip)
+        os.unlink(RUN + '/routes')
+    except OSError:
+        pass
+    for n in ('ppp-options', 'xl2tpd.conf', 'l2tp-control'):
+        try:
+            os.unlink(os.path.join(RUN, n))
+        except OSError:
+            pass
+
+
+def add_server(kind_, name):
+    c = json.load(sys.stdin)
+    if not c.get('server') or (kind_ == 'l2tp' and not c.get('psk')):
+        return 'A server%s is needed' % (' and a pre-shared key' if kind_ == 'l2tp' else '')
+    os.makedirs(DIR, mode=0o700, exist_ok=True)
+    base = re.sub(r'[^\w.-]+', '_', name)[:40] or kind_
+    dest = os.path.join(DIR, '%s.%s' % (base, kind_))
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump({k: c.get(k, '') for k in ('server', 'user', 'password', 'psk')}, f)
+    log('added %s (%s)' % (base, kind_))
+    return None
+
+
+# ---- all of them -----------------------------------------------------------------------------------
 
 def connect(name):
     c = configs().get(name)
@@ -240,7 +424,11 @@ def connect(name):
     os.makedirs(RUN, exist_ok=True)
     path, k = c
     log('connecting %s (%s)' % (name, k))
-    error = openvpn_up(name, path) if k == 'openvpn' else wg_up(path)
+    try:
+        error = {'openvpn': lambda: openvpn_up(name, path), 'wireguard': lambda: wg_up(path),
+                 'l2tp': lambda: l2tp_up(path), 'pptp': lambda: pptp_up(path)}[k]()
+    except Exception as e:   # whatever happened, nothing half-made stays (routes, daemons)
+        error = 'The VPN failed: %s' % e
     if error:
         log(error)
         disconnect()
@@ -265,6 +453,7 @@ def disconnect():
             time.sleep(0.25)
     if os.path.exists('/sys/class/net/' + WG):
         wg_down()
+    ppp_down()
     restore_dns()
     for n in ('name', 'openvpn.pid', 'wg.conf'):
         try:
@@ -356,10 +545,12 @@ def menu():
         names = json.loads(root('list').stdout or '[]')
         on = current()
         items = ['%s  %s%s' % ('●' if n == on else '○', n, '   (connected)' if n == on else '') for n in names]
-        extra = (['Disconnect'] if on else []) + ['Add a VPN file…'] + (['Remove one…'] if names else [])
+        extra = (['Disconnect'] if on else []) + ['Add a VPN file…', 'Add an L2TP/IPsec server…',
+                                                  'Add a PPTP server (old and unsafe)…'] + \
+            (['Remove one…'] if names else [])
         i = rofi('VPN', items + extra, 'On: %s' % on if on else
                  'OpenVPN (.ovpn) or WireGuard (.conf) files from the provider: put them in VPN or Downloads, '
-                 'or on a USB drive, and add them here')
+                 'or on a USB drive, and add them here. Or a server: L2TP/IPsec, PPTP')
         if i is None:
             return 0
         if i < len(names):
@@ -371,6 +562,21 @@ def menu():
         if action == 'Disconnect':
             root('disconnect')
             notify('VPN off')
+        elif action.startswith(('Add an L2TP', 'Add a PPTP')):
+            k = 'l2tp' if 'L2TP' in action else 'pptp'
+            c = {'server': ask('Server (address or name)')}
+            if not c['server']:
+                continue
+            if k == 'l2tp':
+                c['psk'] = ask('Pre-shared key (IPsec secret)', password=True)
+                if not c['psk']:
+                    continue
+            c['user'] = ask('User name') or ''
+            c['password'] = ask('Password', password=True) or ''
+            name = ask('A name for it') or c['server']
+            r = subprocess.run(['sudo', '-n', sys.argv[0], 'add', k, name], input=json.dumps(c),
+                               capture_output=True, text=True)
+            notify(r.stdout.strip() or r.stderr.strip() or 'VPN added: %s' % name)
         elif action.startswith('Add'):
             files = found_files()
             if not files:
@@ -399,7 +605,7 @@ def menu():
 
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else 'menu'
-    if cmd in ('connect', 'disconnect', 'import', 'remove', 'list', 'dns'):
+    if cmd in ('connect', 'disconnect', 'import', 'remove', 'list', 'dns', 'add'):
         if os.geteuid() != 0:
             sys.exit('as root')
         if cmd == 'list':
@@ -419,10 +625,15 @@ def main(argv):
         elif cmd == 'remove' and len(argv) == 3:
             if current() == argv[2]:
                 disconnect()
-            for ext in ('.ovpn', '.conf', '.auth'):
+            for ext in ('.ovpn', '.conf', '.auth', '.l2tp', '.pptp'):
                 p = os.path.join(DIR, argv[2] + ext)
                 if os.path.exists(p):
                     os.unlink(p)
+        elif cmd == 'add' and len(argv) == 4 and argv[2] in ('l2tp', 'pptp'):
+            error = add_server(argv[2], argv[3])
+            if error:
+                print(error)
+                return 1
         elif cmd == 'dns':   # OpenVPN's up / down script
             if argv[2:]:
                 save_dns([a for a in argv[2:] if re.match(r'^[\d.]+$', a)])

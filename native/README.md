@@ -764,3 +764,20 @@ it instead.
   shared with ozone-dlna's renderer (both SO_REUSEADDR).
 - Tested from the laptop: `smbclient -L` as a guest, reading, writing only when allowed, the DLNA
   server found by M-SEARCH (`Ozone TV`, port 8200).
+
+## L2TP/IPsec and PPTP (ozone-vpn)
+
+- The stock kernel has IPsec (XFRM, ESP, the transport mode, PF_KEY) but not `XFRM_USER`, which
+  strongSwan needs (Debian builds no kernel-pfkey plugin; its kernel-libipsec does tunnel mode only,
+  not L2TP's transport). `vpn/build-xfrm-user.sh` builds `xfrm_user.ko` from the btusb / GPU tree:
+  all 78 symbols it needs are in the stock kernel's, and `ip xfrm state|policy add` of a transport
+  SA and policy came back field for field; ozone-vpn loads it on the first L2TP connection.
+- L2TP/IPsec: `/etc/ipsec.conf` and `ipsec.secrets` written for the one server (IKEv1, PSK,
+  transport, `17/1701`), charon's retransmits cut to give up in ~20 s
+  (`/etc/strongswan.d/ozone-vpn.conf`), then xl2tpd (`/run/ozone-vpn/xl2tpd.conf`, `c ozone` on its
+  control pipe) and pppd on ppp1. PPTP: `pppd pty "pptp SERVER --nolaunchpppd --nohostroute"`, MPPE
+  128 with MS-CHAPv2. Both: a host route to the server through the usual gateway, then 0/1 and
+  128/1 on ppp1; DNS by `usepeerdns` and Debian's ip-up.d hook. The servers are JSON in
+  `/etc/ozone/vpn/NAME.l2tp|.pptp` (root, 600).
+- Tested: the failures (a server that doesn't answer, one that refuses) end in ~20 s / ~5 s with the
+  routes and daemons gone; not yet against a real server.

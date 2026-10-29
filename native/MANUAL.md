@@ -781,6 +781,12 @@ OpenVPN (`.ovpn`) or WireGuard (`.conf`). Put it in a **VPN** folder in your hom
 needs one). **Connect to NAME** sends all the internet through it, with its own DNS servers;
 **Disconnect** goes back to the usual way. It stays off after a restart.
 
+Without a file, **Add an L2TP/IPsec server…** asks for what the provider or the company gives for
+one (the server, the pre-shared key or IPsec secret, the user name and the password), and **Add a
+PPTP server…** for a PPTP one (the server, the user name and the password): the kinds Android's VPN
+settings have. PPTP is old and easily broken into: use it only where nothing else is offered.
+If it doesn't connect, the message says which step failed (the server, the key, the login).
+
 **The remote control on the phone**: **Remote control on the phone…** shows a QR code: point the
 phone's camera at it (or open the address shown, `http://…:8080`, in the phone's browser). The
 phone has to be on the same home WiFi as the box (or on its hotspot). The page has three tabs:

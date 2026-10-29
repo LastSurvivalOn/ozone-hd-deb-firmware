@@ -12,6 +12,8 @@ IP=$(box_ip "${1:-}")
 
 echo ">> wireguard-go (kernel 3.10 has no WireGuard), built here"
 [ -x "$HERE/out/wireguard-go" ] || "$HERE/vpn/build-wireguard-go.sh"
+echo ">> xfrm_user.ko (IPsec's netlink, for L2TP/IPsec), built here"
+[ -s "$HERE/out/vpn/xfrm_user.ko" ] || "$HERE/vpn/build-xfrm-user.sh"
 
 echo ">> packages"
 ssh_box 'set -e
@@ -20,13 +22,17 @@ ssh_box 'set -e
         wireguard-tools qrencode > /dev/null
     # sharing the box'"'"'s files (ozone-share): Samba, wsdd for Windows 10 and 11, MiniDLNA
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends samba wsdd minidlna > /dev/null
+    # L2TP/IPsec (strongSwan, xl2tpd) and PPTP, as Android has them
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends strongswan-starter \
+        strongswan-charon xl2tpd pptp-linux > /dev/null
     sudo apt-get clean
     # the hotspot, VPN and sharing start their own daemons, when chosen in the menu
-    for s in hostapd openvpn smbd nmbd samba-ad-dc minidlna; do [ -e /etc/init.d/$s ] && sudo update-rc.d $s disable > /dev/null 2>&1 || true; done
+    for s in hostapd openvpn smbd nmbd samba-ad-dc minidlna ipsec xl2tpd; do [ -e /etc/init.d/$s ] && sudo update-rc.d $s disable > /dev/null 2>&1 || true; done
     dpkg -S /sbin/init | grep -q sysvinit-core || { echo "!! /sbin/init is not sysvinit any more" >&2; exit 1; }'
 
 echo ">> files"
 cat "$HERE/out/wireguard-go" | ssh_box 'sudo install -m 755 /dev/stdin /usr/local/bin/wireguard-go'
+cat "$HERE/out/vpn/xfrm_user.ko" | ssh_box 'sudo install -m 644 /dev/stdin /lib/modules/3.10.33/extra/xfrm_user.ko'
 tar -C "$HERE/rootfs" -czf - usr/local/bin/ozone-network usr/local/bin/ozone-wifi usr/local/bin/ozone-hotspot \
     usr/local/bin/ozone-vpn usr/local/bin/ozone-phone usr/local/bin/ozone-dlna usr/local/bin/ozone-remote \
     usr/local/bin/ozone-files usr/local/bin/yt usr/local/bin/ozone-web usr/local/lib/ozone/net-apply \
