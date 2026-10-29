@@ -11,6 +11,8 @@ The settings are in /etc/ozone/display, which set-mode, sound-config and amplay 
   SOUND=auto|hdmi|analog                               where the sound goes
   PASSTHROUGH=off|auto|on   AC-3 and DTS to the HDMI receiver as they are (auto: what its EDID lists)
   EQ=0|1              the equalizer (ozone-equalizer)
+  DESKTOP=1280x720|1120x630|1024x576|960x540   the interface size: the desktop the scaler stretches
+                      to the screen, smaller is bigger (from the next desktop start: desktop script)
 A new picture mode has to be kept within 15 s, or the old one comes back: a TV that can't show
 it would otherwise leave nothing on the screen to go back with.
 """
@@ -23,7 +25,9 @@ LIB = '/usr/local/lib/ozone'
 MODE_FILE = '/sys/class/display/mode'
 BT_AUDIO = '/run/ozone-bluetooth-audio'   # Bluetooth headphones have the sound (ozone-bluetooth)
 CAP = '/sys/class/amhdmitx/amhdmitx0/disp_cap'
-DEFAULTS = {'MODE': 'auto', 'MATCH_RATE': '0', 'SOUND': 'auto', 'PASSTHROUGH': 'off', 'EQ': '0'}
+DEFAULTS = {'MODE': 'auto', 'MATCH_RATE': '0', 'SOUND': 'auto', 'PASSTHROUGH': 'off', 'EQ': '0', 'DESKTOP': '1280x720'}
+SIZES = [('1280x720', 'Normal'), ('1120x630', 'Large (+15 %)'), ('1024x576', 'Larger (+25 %)'),
+         ('960x540', 'Largest (+33 %, for a sofa far from the TV)')]
 LABELS = {
     '1080p': '1080p 60 Hz', '1080p50hz': '1080p 50 Hz', '1080i': '1080i 60 Hz', '1080i50hz': '1080i 50 Hz',
     '720p': '720p 60 Hz', '720p50hz': '720p 50 Hz', '576p': '576p 50 Hz', '480p': '480p 60 Hz',
@@ -141,6 +145,7 @@ def menu():
             'Digital sound: %s' % PASSTHROUGHS.get(s['PASSTHROUGH'], s['PASSTHROUGH']).split(':')[0],
             'Equalizer…',
             'Screen edges (overscan)…',
+            'Interface size (text, menus, windows): %s…' % dict(SIZES).get(s['DESKTOP'], s['DESKTOP']).split(' (')[0],
         ]
         i = rofi(ICON + '  Display and sound', items)
         if i is None:
@@ -164,6 +169,17 @@ def menu():
             return os.execvp('ozone-equalizer', ['ozone-equalizer'])
         elif i == 5:
             return os.execvp('ozone-screen', ['ozone-screen'])
+        elif i == 6:
+            keys = [k for k, _t in SIZES]
+            j = rofi('Interface size', [t for _k, t in SIZES], keys.index(s['DESKTOP']) if s['DESKTOP'] in keys else 0)
+            if j is None or keys[j] == s['DESKTOP']:
+                continue
+            sudo_set('DESKTOP', keys[j])
+            k = rofi('Restart the desktop now for the new size? (open windows close)',
+                     ['Restart the desktop now', 'Later (at the next start)'], 0)
+            if k == 0:
+                subprocess.call(['bspc', 'quit'])
+                return 0
 
 
 def main(argv):

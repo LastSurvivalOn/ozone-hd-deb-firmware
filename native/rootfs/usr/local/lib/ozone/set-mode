@@ -1,7 +1,8 @@
 #!/bin/sh
 # set-mode [MODE | --boot | --hdmi | --apply]: the video output's mode, and the desktop scaled into it.
 #
-# The desktop is 1280x720 (fb0); the OSD scaler stretches it into the output, inside the margins
+# The desktop is fb0, 1280x720 or smaller for a bigger interface (DESKTOP= in /etc/ozone/display,
+# set by the desktop script before X starts); the OSD scaler stretches it into the output, inside the margins
 # ozone-screen keeps (/etc/ozone/screen, in 1080p pixels, scaled here to the mode). The mode the
 # viewer chose is MODE= in /etc/ozone/display (ozone-display):
 #   auto            as u-boot picks at power-on: hdmimode= if a TV answers on HDMI, else cvbsmode=
@@ -43,8 +44,11 @@ scaler() {
     [ -r /etc/ozone/screen ] && read h v < /etc/ozone/screen
     case "$h$v" in *[!0-9]*|'') h=0 v=0 ;; esac
     h=$((h * w / 1920)) v=$((v * ht / 1080))
+    # the desktop's own size: fb0 is double height (its two buffers)
+    IFS=, read fw fh < $FB/virtual_size
+    fh=$((fh / 2))
     echo 0 > $FB/free_scale
-    echo 0 0 1279 719 > $FB/free_scale_axis
+    echo 0 0 $((fw - 1)) $((fh - 1)) > $FB/free_scale_axis
     echo $h $v $((w - 1 - h)) $((ht - 1 - v)) > $FB/window_axis
     echo 0x10001 > $FB/free_scale
 }

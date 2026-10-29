@@ -9,6 +9,17 @@ LOG=/var/log/ozone-desktop.log
 /usr/local/lib/ozone/gen-xorg-screen
 # the boot splash animation (started by ozone-hw) puts the screen back to full brightness on exit
 start-stop-daemon --stop --quiet --retry 2 --pidfile /run/ozone-splash.pid --remove-pidfile
+# The interface size (ozone-display): a smaller desktop, which the scaler stretches to the same
+# screen, makes everything bigger. ozone-hw set 1280x720 for the boot splash.
+DESKTOP=1280x720
+[ -r /etc/ozone/display ] && . /etc/ozone/display
+case "$DESKTOP" in 1280x720|1120x630|1024x576|960x540) ;; *) DESKTOP=1280x720 ;; esac
+w=${DESKTOP%x*} h=${DESKTOP#*x}
+if [ "$(cat /sys/class/graphics/fb0/virtual_size)" != "$w,$((h * 2))" ]; then
+    fbset -fb /dev/fb0 -g $w $h $w $((h * 2)) 16 -rgba 5/11,6/5,5/0,0/0
+    /usr/local/lib/ozone/set-mode --apply
+    dd if=/dev/zero of=/dev/fb0 bs=1M count=8 2> /dev/null
+fi
 su -l "$USER_NAME" -c 'exec startx -- :0 vt7 -nolisten tcp -keeptty' > $LOG 2>&1
 # X with the GPU driver crashed: the plain framebuffer from the next start on, until a reboot
 if [ -e /run/ozone-gpu-desktop ] && grep -q 'Fatal server error' $LOG; then
