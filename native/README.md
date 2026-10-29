@@ -729,3 +729,21 @@ like by section and by name.
 - Open: the package's `.desktop` file through Gio with `GTK_THEME=Adwaita:dark`, or a command of
   its in `ozone-terminal` (only for terminal programs, picked ones, or ones installed here).
 - Tested with Mines: 3.7 MB with what it needs, installed, opened, removed, the space back.
+
+## Interface size, wallpaper, screenshots
+
+- Interface size: `DESKTOP=` in `/etc/ozone/display` (ozone-display: 1280x720, 1120x630, 1024x576,
+  960x540). The desktop script sets fb0 to it before X starts (ozone-hw keeps 1280x720 for the
+  splash), and set-mode takes the scaler's source from fb0's `virtual_size` (double height), so the
+  OSD scaler stretches the smaller desktop over the same screen: everything bigger at once, as
+  Android's display size, with no app of ours changed. The Mali X driver runs at 1024x576 as at
+  1280x720. polybar's `launch.sh` starts `bar/compact` (no cpu, memory, temperature, eth) below 1280.
+- `ozone-wallpaper`: feh `--bg-fill` / `--bg-max` or `xsetroot -solid`, from
+  `~/.config/ozone/wallpaper.json` (bspwmrc runs `ozone-wallpaper apply`); a user's photo is copied
+  to `~/.local/share/wallpapers/chosen.EXT`. Choosing is `ozone-photos --wallpaper FOLDER` (its
+  thumbnails, OK sets); yellow sets one in Photos at any time. Five more pictures in
+  `/usr/local/share/ozone/wallpapers`, from `tools/wallpaper.py` with palettes (960x540: they are
+  blurred blobs, which scale up unharmed).
+- `ozone-screenshot`: fb0 itself (RGB565 through a 65 536-entry table, then GdkPixbuf's PNG): 1.7 s
+  for 1280x720. X's copy lags behind GL windows that swap straight to the framebuffer; the video
+  layer is in neither.

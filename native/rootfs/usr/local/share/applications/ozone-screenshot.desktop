@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Screenshot
+Comment=The screen into Pictures/Screenshots, 3 seconds after (the keyboard's Print key: at once)
+Exec=ozone-screenshot 3
+Icon=applets-screenshooter
+Terminal=false
+Categories=Utility;Graphics;

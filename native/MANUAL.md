@@ -57,6 +57,23 @@ keeps the box on. Then the video stops and the screen goes off; TV recordings an
 Any button wakes it. Not during an update or a backup. **Sleep by itself** in the power menu sets
 the hours, or turns it off.
 
+**Interface size** (for reading from a sofa): **Display and sound** in the app menu →
+**Interface size**: **Normal**, **Large** (+15 %), **Larger** (+25 %), **Largest** (+33 %).
+Everything grows together: the text, the menus, the panel, the windows, the browser's pages; there
+is less room on the screen for them. It takes effect when the desktop starts again (the menu offers
+to restart it now; open windows close). On the larger sizes the panel leaves out the processor,
+memory, temperature and the cable's address (System info and the Network menu still show them).
+
+**Wallpaper** in the app menu: **The box's pictures** and **One of your photos** open their
+thumbnails in Photos, where the arrows choose and **OK** sets one; **A plain colour**, **The
+original**, and whether the picture fills the screen (cut to fit) or shows whole. In Photos,
+**yellow** makes the photo on the screen (or the thumbnail chosen) the wallpaper; a photo from a USB
+drive is copied, so the drive can go.
+
+**Screenshots**: the keyboard's **Print** key, or **Screenshot** in the app menu (it waits 3
+seconds, for the menu to go away). They go to **Pictures/Screenshots**. A playing video comes out
+black there: the video is on a layer of its own that no screenshot sees.
+
 **Screen size.** Some TVs and monitors cut off the edges of the picture: the panel at the top or
 the bottom of the player is half hidden. Open ⏻ → **Screen size** (or "Screen size" in the app
 menu). A purple frame with arrows in the corners appears:

@@ -45,7 +45,8 @@ bspc rule -a Rofi state=floating
 bspc rule -a Ozone-reminder state=floating layer=above
 bspc rule -a Ozone-sleep state=floating layer=above
 
-feh --no-fehbg --bg-fill ~/.local/share/wallpapers/ozone.png
+# the wallpaper chosen in Wallpaper (ozone-wallpaper), else ours
+ozone-wallpaper apply || feh --no-fehbg --bg-fill ~/.local/share/wallpapers/ozone.png
 ~/.config/polybar/launch.sh
 # the panel over fullscreen windows: pointer at the top edge, or info on the remote
 pgrep -x ozone-panel > /dev/null || ozone-panel &

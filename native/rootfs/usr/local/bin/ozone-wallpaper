@@ -1,0 +1,132 @@
+#!/usr/bin/python3
+"""ozone-wallpaper: the desktop's picture.
+
+  ozone-wallpaper            the menu (rofi): the box's own pictures and your photos (chosen in
+                             Photos' thumbnails: OK sets one), a plain colour, how it fills the screen
+  ozone-wallpaper set FILE   that picture (a copy is kept, so a USB drive may go away)
+  ozone-wallpaper apply      put up the one chosen (bspwmrc, at every desktop start)
+
+The choice is ~/.config/ozone/wallpaper.json: {"file": ..., "colour": "#rrggbb", "fit": "fill" |
+"whole"}; the picture's copy is ~/.local/share/wallpapers/chosen.EXT. In Photos, yellow sets the
+photo on the screen as the wallpaper too.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+HOME = os.path.expanduser('~')
+CONF = os.path.join(HOME, '.config/ozone/wallpaper.json')
+MINE = os.path.join(HOME, '.local/share/wallpapers')
+ORIGINAL = os.path.join(MINE, 'ozone.png')
+BUILTIN = '/usr/local/share/ozone/wallpapers'
+COLOURS = [('#1e1e2e', 'Dark blue-grey (the panel\'s)'), ('#11111b', 'Almost black'), ('#000000', 'Black'),
+           ('#313244', 'Grey'), ('#1e3a5f', 'Navy'), ('#2d4a3e', 'Dark green'), ('#4a2d4a', 'Plum')]
+ICON = ''
+
+
+def load():
+    try:
+        with open(CONF) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save(c):
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    with open(CONF + '.tmp', 'w') as f:
+        json.dump(c, f, indent=1)
+    os.replace(CONF + '.tmp', CONF)
+
+
+def apply():
+    c = load()
+    if c.get('colour'):
+        return subprocess.call(['xsetroot', '-solid', c['colour']])
+    f = c.get('file') or ORIGINAL
+    if not os.path.isfile(f):
+        f = ORIGINAL
+    return subprocess.call(['feh', '--no-fehbg', '--bg-max' if c.get('fit') == 'whole' else '--bg-fill', f])
+
+
+def set_file(path):
+    if not os.path.isfile(path):
+        sys.exit('no such picture: %s' % path)
+    c = load()
+    if path.startswith((BUILTIN + '/', MINE + '/')) and not os.path.basename(path).startswith('chosen.'):
+        c['file'] = path
+    else:   # a copy of the user's photo: the drive or the folder may go
+        os.makedirs(MINE, exist_ok=True)
+        for old in os.listdir(MINE):
+            if old.startswith('chosen.'):
+                os.unlink(os.path.join(MINE, old))
+        ext = os.path.splitext(path)[1].lower() or '.jpg'
+        dest = os.path.join(MINE, 'chosen' + ext)
+        shutil.copyfile(path, dest)
+        c['file'] = dest
+    c.pop('colour', None)
+    save(c)
+    return apply()
+
+
+def rofi(prompt, items, selected=0, mesg=None):
+    cmd = ['rofi', '-dmenu', '-i', '-format', 'i', '-p', prompt, '-selected-row', str(selected),
+           '-theme-str', 'listview { lines: %d; }' % min(len(items), 10)]
+    if mesg:
+        cmd += ['-mesg', mesg]
+    r = subprocess.run(cmd, input='\n'.join(items), capture_output=True, text=True)
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        return None
+
+
+def menu():
+    while True:
+        c = load()
+        now = ('a plain colour' if c.get('colour') else
+               'the original' if not c.get('file') or c.get('file') == ORIGINAL else
+               os.path.splitext(os.path.basename(c['file']))[0].replace('chosen', 'a photo of yours'))
+        fit = c.get('fit', 'fill')
+        items = ['  The box\'s pictures…', '  One of your photos (Pictures)…', '  A plain colour…',
+                 '  The original', '  Fills the screen: %s' % ('yes, cut to fit' if fit == 'fill' else
+                                                                            'no, the whole picture')]
+        i = rofi(ICON + '  Wallpaper', items, mesg='Now: %s. In Photos, yellow makes the photo on the screen the '
+                                                  'wallpaper.' % now)
+        if i is None:
+            return 0
+        if i in (0, 1):
+            folder = BUILTIN if i == 0 else os.path.join(HOME, 'Pictures')
+            return os.execvp('ozone-photos', ['ozone-photos', '--wallpaper', folder])
+        if i == 2:
+            j = rofi('A plain colour', [t for _c, t in COLOURS])
+            if j is not None:
+                c['colour'] = COLOURS[j][0]
+                save(c)
+                apply()
+        elif i == 3:
+            c.pop('colour', None)
+            c['file'] = ORIGINAL
+            save(c)
+            apply()
+        elif i == 4:
+            c['fit'] = 'whole' if fit == 'fill' else 'fill'
+            save(c)
+            apply()
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ['set'] and len(args) == 2:
+        return set_file(os.path.abspath(args[1]))
+    if args == ['apply']:
+        return apply()
+    if args:
+        sys.exit(__doc__)
+    return menu()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

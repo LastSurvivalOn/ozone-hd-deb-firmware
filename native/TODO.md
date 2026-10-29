@@ -145,16 +145,16 @@ Linux doesn't:
   already wake the screen, an alarm needs a sound too.
 - [x] **Easy**: a calculator: Qalculate! (Calculator) and wxMaxima on Maxima (Maths), a computer
   algebra system with plots.
-- [ ] **Easy**: screenshots: a key (Print, or a remote combination) saves the screen into Pictures.
-- [ ] **Easy**: choosing the wallpaper (Android has a picker and live wallpapers): now one picture.
+- [x] **Easy**: screenshots: Print, or Screenshot in the apps menu, into Pictures/Screenshots.
+- [x] **Easy**: choosing the wallpaper: Wallpaper (ozone-wallpaper), Photos' yellow.
 - [ ] **Easy**: the messages of the last hours in one place (Android's notification shade): now
   the panel's message is gone after 6 s.
 - [ ] **Easy**: L2TP / IPsec and PPTP VPN (Android's own VPN types), and a proxy from a PAC file
   (ProxyHandler). Now OpenVPN, WireGuard and a plain proxy address.
 - [x] **Medium**: a programs manager (Android's package installer and store): Programs
   (`ozone-apps`), picked programs by kind, a search of all of Debian, install, open, remove.
-- [ ] **Medium**: text size for the whole interface (Android's "large text" and magnification):
-  the menus and windows have fixed sizes, small from a sofa on a big TV.
+- [x] **Medium**: text size for the whole interface: Interface size in Display and sound (a smaller
+  desktop that the scaler stretches: everything bigger).
 - [ ] **Medium**: the calendar synced with Google Calendar or a calendar's ICS address, as
   Android's Calendar with its Google sync adapter.
 - [ ] **Medium**: sharing the box's own files with the network (a DLNA media server, or a Windows

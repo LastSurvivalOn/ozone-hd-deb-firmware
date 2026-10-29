@@ -5,6 +5,7 @@
                                    nothing: the thumbnails of Pictures, as from the apps menu)
   ozone-photos --gallery FILE|FOLDER   the folder's thumbnails, the photo chosen
   ozone-photos --slideshow FILE|FOLDER a slideshow from there
+  ozone-photos --wallpaper FOLDER  the folder's thumbnails, to choose the desktop's picture: OK sets it
   ozone-photos --screensaver       the screensaver (ozone-screensaver): the photos of its folder
                                    shuffled, fading into one another, or a clock that moves about
                                    if there are none, until a key, a click or the mouse moves
@@ -31,6 +32,7 @@ import json
 import os
 import random
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -54,9 +56,11 @@ FADE_MS, SLIDE_FADE_MS = 220, 1100
 THUMB_W, THUMB_H = 216, 152   # the thumbnail inside its cell
 CELL_W, CELL_H, GAP = 232, 168, 14
 # what the keys do: under the first photo's name, and after a key that does nothing here
-PHOTO_KEYS = '← → photos   page+ page− zoom   ↑ ↓ turn   OK slideshow   blue thumbnails   info details   exit close'
+PHOTO_KEYS = ('← → photos   page+ page− zoom   ↑ ↓ turn   OK slideshow   blue thumbnails   yellow wallpaper   '
+              'info details   exit close')
 ZOOM_KEYS = 'arrows move about it   0 the whole photo   1 its pixels   exit back'
-GALLERY_KEYS = 'arrows choose   page+ page− a page   OK open   play slideshow   exit close'
+GALLERY_KEYS = 'arrows choose   page+ page− a page   OK open   play slideshow   yellow wallpaper   exit close'
+WALLPAPER_KEYS = 'arrows choose   OK this one as the wallpaper   exit back'
 HEAD_H, FOOT_H = 64, 40
 BG = (0x11 / 255, 0x11 / 255, 0x1b / 255)
 CELL_BG = (0x1e / 255, 0x1e / 255, 0x2e / 255)
@@ -261,8 +265,9 @@ def load_thumb(path):
 
 
 class App:
-    def __init__(self, files, index, mode, slideshow=False, screensaver=False):
+    def __init__(self, files, index, mode, slideshow=False, screensaver=False, wallpaper=False):
         self.files, self.index = files, index
+        self.wallpaper = wallpaper   # choosing the desktop's picture: OK sets it
         self.screensaver = screensaver
         self.from_gallery = mode == 'gallery'
         self.mode = mode
@@ -308,7 +313,7 @@ class App:
         self.foot.get_style_context().add_class('bar')
         self.foot_name = label('', ellipsize=Pango.EllipsizeMode.MIDDLE)
         self.foot.pack_start(self.foot_name, True, True, 0)
-        self.foot.pack_end(label(GALLERY_KEYS, 'hint'), False, False, 0)
+        self.foot.pack_end(label(WALLPAPER_KEYS if wallpaper else GALLERY_KEYS, 'hint'), False, False, 0)
         for w in (self.head, self.foot):
             overlay.add_overlay(w)
         self.caption = label('', 'caption', halign=Gtk.Align.CENTER, valign=Gtk.Align.END, margin_bottom=24,
@@ -400,6 +405,14 @@ class App:
         seat = Gdk.Display.get_default().get_default_seat()
         seat.grab(self.win.get_window(), Gdk.SeatCapabilities.ALL, True, None, None, None, None)
         return False
+
+    def set_wallpaper(self, path, close=False):
+        """The desktop's picture (ozone-wallpaper keeps a copy, so a drive can go)"""
+        r = subprocess.run(['ozone-wallpaper', 'set', path], capture_output=True, text=True)
+        self.say('The wallpaper: %s' % os.path.basename(path) if r.returncode == 0 else
+                 'Could not set the wallpaper: %s' % (r.stderr.strip() or r.returncode))
+        if close and r.returncode == 0:
+            GLib.timeout_add(800, lambda: self.win.destroy() and False)
 
     def on_state(self, w, ev):
         full = bool(ev.new_window_state & Gdk.WindowState.FULLSCREEN)
@@ -818,8 +831,12 @@ class App:
                      'Page_Down': cols * rows, 'Home': -len(self.files), 'End': len(self.files)}
             if k in moves:
                 self.move_sel(moves[k])
+            elif k in ('Return', 'KP_Enter') and self.wallpaper:
+                self.set_wallpaper(self.files[self.sel], close=True)
             elif k in ('Return', 'KP_Enter'):
                 self.show(self.sel, 0)
+            elif k in ('Launch3', 'w'):
+                self.set_wallpaper(self.files[self.sel])
             elif k in ('AudioPlay', 'AudioPause', 'space'):
                 self.show(self.sel, 0)
                 self.slideshow()
@@ -858,6 +875,8 @@ class App:
             self.show_info()
         elif k in ('g', 'Launch4', 'Tab'):
             self.open_gallery()
+        elif k in ('Launch3', 'w'):
+            self.set_wallpaper(self.files[self.index])
         elif not k.startswith(('Shift', 'Control', 'Alt', 'Super', 'ISO_', 'Caps', 'Num')):
             self.say(ZOOM_KEYS if zoomed else PHOTO_KEYS, 5)
         return True
@@ -948,9 +967,11 @@ class App:
 
 def main(argv):
     args = argv[1:]
-    mode, slideshow, screensaver = 'photo', False, False
+    mode, slideshow, screensaver, wallpaper = 'photo', False, False, False
     if args[:1] == ['--gallery']:
         mode, args = 'gallery', args[1:]
+    elif args[:1] == ['--wallpaper']:
+        mode, wallpaper, args = 'gallery', True, args[1:]
     elif args[:1] == ['--slideshow']:
         slideshow, args = True, args[1:]
     elif args[:1] == ['--screensaver']:
@@ -979,7 +1000,7 @@ def main(argv):
         if not os.path.isdir(target) and target not in files:
             files = [target] + files   # a file named oddly, or a hidden one: still shown
         index = files.index(target) if target in files else 0
-        App(files, index, mode, slideshow=slideshow)
+        App(files, index, mode, slideshow=slideshow, wallpaper=wallpaper)
     Gtk.main()
     return 0
 

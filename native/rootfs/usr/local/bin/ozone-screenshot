@@ -1,0 +1,56 @@
+#!/usr/bin/python3
+"""ozone-screenshot [SECONDS]: the screen into ~/Pictures/Screenshots as a PNG (after SECONDS, 3 from
+the apps menu: time for the menu to go). The keyboard's Print key takes one at once (sxhkdrc).
+
+It reads the framebuffer itself, not X's copy of it: a GL window (a game on the GPU) draws straight
+into it, and X's copy lags behind. The video player's picture is on a layer of its own, which no
+screenshot has: there the video is black.
+"""
+import os
+import sys
+import time
+
+import gi
+gi.require_version('GdkPixbuf', '2.0')
+from gi.repository import GdkPixbuf, GLib  # noqa: E402
+
+FB = '/sys/class/graphics/fb0'
+OUT = os.path.join(os.path.expanduser('~'), 'Pictures', 'Screenshots')
+
+
+def read(path):
+    with open(path) as f:
+        return f.read().strip()
+
+
+def grab():
+    w, vh = map(int, read(FB + '/virtual_size').split(','))
+    h = vh // 2
+    stride = int(read(FB + '/stride'))
+    with open('/dev/fb0', 'rb') as f:
+        data = f.read(stride * h)
+    # RGB565 to RGB888, by a table of every 16-bit value
+    table = [bytes(((v >> 11) << 3 | v >> 13, ((v >> 5) & 63) << 2 | (v >> 9) & 3, (v & 31) << 3 | (v >> 2) & 7))
+             for v in range(65536)]
+    rows = []
+    for y in range(h):
+        line = memoryview(data)[y * stride:y * stride + w * 2].cast('H')
+        rows.append(b''.join(map(table.__getitem__, line)))
+    return GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(b''.join(rows)), GdkPixbuf.Colorspace.RGB,
+                                           False, 8, w, h, w * 3)
+
+
+def main():
+    delay = float(sys.argv[1]) if len(sys.argv) > 1 else 0
+    if delay:
+        time.sleep(delay)
+    pb = grab()
+    os.makedirs(OUT, exist_ok=True)
+    path = os.path.join(OUT, time.strftime('screenshot-%Y-%m-%d-%H%M%S.png'))
+    pb.savev(path, 'png', ['compression'], ['3'])
+    os.system("ozone-notify ' Screenshot: Pictures/Screenshots' 2> /dev/null")
+    print(path)
+
+
+if __name__ == '__main__':
+    main()
