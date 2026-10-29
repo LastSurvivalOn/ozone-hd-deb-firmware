@@ -23,6 +23,7 @@ tar -C "$HERE/rootfs" -czf - \
     usr/local/bin/ozone-apps usr/local/share/applications/ozone-apps.desktop \
     usr/local/bin/ozone-wallpaper usr/local/share/applications/ozone-wallpaper.desktop usr/local/share/ozone/wallpapers \
     usr/local/bin/ozone-screenshot usr/local/share/applications/ozone-screenshot.desktop \
+    usr/local/bin/ozone-cast \
     usr/local/share/applications/ozone-math.desktop usr/local/share/ozone/wxMaxima.conf \
     etc/dpkg/dpkg.cfg.d/ozone-maxima \
     usr/local/share/applications/ozone-backup.desktop etc/init.d/ozone-system \

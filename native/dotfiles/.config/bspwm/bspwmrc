@@ -21,6 +21,8 @@ pgrep -f "^/usr/bin/python3 /usr/local/bin/ozone-bluetooth agen[t]" > /dev/null 
 pgrep -f "^/usr/bin/python3 /usr/local/bin/ozone-calendar reminder[s]" > /dev/null || ozone-calendar reminders &
 # updates: looks once a day, and says on the panel when there are some
 pgrep -f "^/usr/bin/python3 /usr/local/bin/ozone-system chec[k]" > /dev/null || ozone-system check &
+# the YouTube app's Cast button (DIAL and YouTube's Lounge): the box as a TV, unless turned off
+ozone-cast daemon &
 
 bspc monitor -d 1 2 3 4 5
 

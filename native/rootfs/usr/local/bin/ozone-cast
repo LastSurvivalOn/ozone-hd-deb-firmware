@@ -1,0 +1,716 @@
+#!/usr/bin/python3
+"""ozone-cast: the box as a TV for the YouTube app on phones (its Cast button, or "Link with TV
+code"), as YouTube's TV app is.
+
+  ozone-cast daemon     the receiver (bspwmrc starts it; it does nothing while turned off: it is
+                        on unless turned off)
+  ozone-cast menu       on / off, and a TV code for a phone (the Network menu's YouTube line)
+  ozone-cast code       a TV code to type into the phone's YouTube (Settings, Watch on TV)
+  ozone-cast status     "on" or "off"
+
+Two protocols:
+- DIAL, how the YouTube app finds TVs on the home network: an SSDP answer to its search for
+  urn:dial-multiscreen-org:service:dial:1, a device description with an Application-URL on port
+  8008, and /apps/YouTube there. The phone's POST there brings a pairing code, which this registers
+  with YouTube for this screen; from then on the phone talks to the box through YouTube.
+- YouTube's Lounge API, the "screen" side: a screen id (kept in ~/.config/ozone/cast.json) and a
+  lounge token for it, then a "bind" session: a long poll of /api/lounge/bc/bind that brings the
+  phone's commands as [index, [command, {args}]] (setPlaylist, play, pause, seekTo, setVolume, next,
+  stopVideo, getNowPlaying...), and POSTs back of what plays (nowPlaying, onStateChange,
+  onVolumeChanged), counted by ofs.
+The videos play as yt plays them (yt-dlp for the streams, H.264 up to yt's height setting), in
+amplay --control, which takes pause / play / seek on stdin and says where it is every second.
+Log: ~/.cache/ozone-cast.log.
+"""
+import http.server
+import json
+import os
+import random
+import re
+import signal
+import socket
+import socketserver
+import string
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+NAME = 'Ozone TV'
+APP = 'lb-v4'
+LOUNGE = 'https://www.youtube.com/api/lounge'
+PORT = 8008
+SSDP = ('239.255.255.250', 1900)
+DIAL_ST = 'urn:dial-multiscreen-org:service:dial:1'
+CONF = os.path.expanduser('~/.config/ozone/cast.json')
+LOG = os.path.expanduser('~/.cache/ozone-cast.log')
+YT_SETTINGS = os.path.expanduser('~/.config/ozone/yt.json')
+UA = 'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1'
+# Lounge's player states
+UNSTARTED, ENDED, PLAYING, PAUSED, BUFFERING = -1, 0, 1, 2, 3
+
+
+def log(text):
+    try:
+        with open(LOG, 'a') as f:
+            f.write('%s %s\n' % (time.strftime('%F %T'), text))
+    except OSError:
+        pass
+
+
+def notify(text):
+    subprocess.call(['ozone-notify', text], stderr=subprocess.DEVNULL)
+
+
+def load_conf():
+    try:
+        with open(CONF) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_conf(c):
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    with open(CONF + '.tmp', 'w') as f:
+        json.dump(c, f, indent=1)
+    os.replace(CONF + '.tmp', CONF)
+
+
+def zx():
+    return ''.join(random.choice(string.ascii_lowercase + string.digits) for _ in range(12))
+
+
+def fetch(url, data=None, timeout=30):
+    req = urllib.request.Request(url, data=urllib.parse.urlencode(data).encode() if data is not None else None,
+                                 headers={'User-Agent': UA, 'Origin': 'https://www.youtube.com'})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def screen():
+    """The screen id and the lounge token for it (made once, the token again before it runs out)"""
+    c = load_conf()
+    changed = False
+    if not c.get('screen_id'):
+        c['screen_id'] = fetch(LOUNGE + '/pairing/generate_screen_id').read().decode().strip()
+        changed = True
+    if not c.get('device_id'):
+        c['device_id'] = str(uuid.uuid4())
+        changed = True
+    if not c.get('token') or time.time() * 1000 > c.get('token_until', 0) - 86400000:
+        r = json.load(fetch(LOUNGE + '/pairing/get_lounge_token_batch', {'screen_ids': c['screen_id']}))
+        s = r['screens'][0]
+        c['token'] = s['loungeToken']
+        c['token_until'] = s.get('expiration') or time.time() * 1000 + int(s.get('loungeTokenLifespanMs', 1209600000))
+        changed = True
+    if changed:
+        save_conf(c)
+    return c
+
+
+def pairing_code():
+    c = screen()
+    q = {'ctx': 'pair', 'access_type': 'permanent', 'app': APP, 'lounge_token': c['token'],
+         'screen_id': c['screen_id'], 'screen_name': NAME, 'device_id': c['device_id']}
+    code = fetch(LOUNGE + '/pairing/get_pairing_code?' + urllib.parse.urlencode(q)).read().decode().strip()
+    return ' '.join(code[i:i + 3] for i in range(0, len(code), 3))
+
+
+def register_pairing(code):
+    """The phone's code from DIAL: from now on it may talk to this screen"""
+    c = screen()
+    fetch(LOUNGE + '/pairing/register_pairing_code', {
+        'access_type': 'permanent', 'app': APP, 'pairing_code': code, 'screen_id': c['screen_id'],
+        'screen_name': NAME, 'device_id': c['device_id']}).read()
+
+
+# ---- the player ------------------------------------------------------------------------------------
+
+def video_format():
+    try:
+        with open(YT_SETTINGS) as f:
+            s = json.load(f)
+    except (OSError, ValueError):
+        s = {}
+    h, fps = s.get('height', 1080), s.get('fps', 60)
+    v = '[vcodec^=avc1][height<=%d]' % h
+    return '/'.join('bv*%s%s+ba[acodec^=mp4a]/b%s%s' % (v, f, v, f) for f in ('[fps<=%d]' % fps, '')) + '/b'
+
+
+class Player:
+    """One video at a time in amplay --control; on_change(state) on every change of state"""
+
+    def __init__(self, on_change):
+        self.on_change = on_change
+        self.lock = threading.RLock()
+        self.p = None
+        self.gen = 0
+        self.video = None
+        self.state = UNSTARTED
+        self.pos = 0.0
+        self.dur = 0.0
+        self.title = ''
+
+    def load(self, video, start=0.0):
+        self.stop(quiet=True)
+        with self.lock:
+            self.gen += 1
+            gen = self.gen
+            self.video, self.pos, self.dur, self.state = video, float(start or 0), 0.0, BUFFERING
+        self.on_change()
+        threading.Thread(target=self.run, args=(video, float(start or 0), gen), daemon=True).start()
+
+    def run(self, video, start, gen):
+        url = 'https://www.youtube.com/watch?v=' + video
+        cmd = ['yt-dlp', '--no-warnings', '--no-playlist', '--print', 'title', '--print', 'duration', '-g',
+               '-f', video_format(), url]
+        if any(os.access(os.path.join(d, 'node'), os.X_OK) for d in os.environ.get('PATH', '').split(':')):
+            cmd[1:1] = ['--js-runtimes', 'node']
+        notify(' Loading the video from the phone…')
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        out = r.stdout.split('\n')
+        with self.lock:
+            if gen != self.gen:
+                return
+        if len(out) < 3 or not out[2]:
+            log('yt-dlp: %s' % (r.stderr.strip().splitlines() or ['nothing'])[-1])
+            notify('YouTube: the video could not be loaded')
+            self.finished(gen, ENDED)
+            return
+        title, video_url, audio_url = out[0], out[2], out[3] if len(out) > 3 and out[3] else None
+        try:
+            dur = float(out[1])
+        except ValueError:
+            dur = 0.0
+        args = ['amplay', '--control', '--title', title] + (['--audio', audio_url] if audio_url else []) + \
+            (['--start', '%.1f' % start] if start > 1 else []) + [video_url]
+        subprocess.call(['pkill', '-x', 'mpv'])
+        p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, bufsize=1)
+        with self.lock:
+            if gen != self.gen:
+                p.kill()
+                return
+            self.p, self.title, self.dur = p, title, dur
+        log('playing %s: %s' % (video, title))
+        for line in p.stdout:
+            f = line.split()
+            if len(f) != 4 or f[0] != 'pos':
+                continue
+            state = {'playing': PLAYING, 'paused': PAUSED}.get(f[3], BUFFERING)
+            with self.lock:
+                if gen != self.gen:
+                    break
+                self.pos = float(f[1])
+                self.dur = float(f[2]) or self.dur
+                changed = state != self.state
+                self.state = state
+            if changed:
+                self.on_change()
+        code = p.wait()
+        subprocess.call(['amplay', '--reset'])
+        self.finished(gen, ENDED if code == 0 else UNSTARTED)
+
+    def finished(self, gen, state):
+        with self.lock:
+            if gen != self.gen:
+                return
+            self.p = None
+            self.state = state
+        self.on_change(ended=True)
+
+    def command(self, line):
+        with self.lock:
+            p = self.p
+        if p and p.poll() is None:
+            try:
+                p.stdin.write(line + '\n')
+                p.stdin.flush()
+            except (OSError, ValueError):
+                pass
+
+    def play(self):
+        self.command('play')
+
+    def pause(self):
+        self.command('pause')
+
+    def seek(self, t):
+        with self.lock:
+            self.pos = t
+        self.command('seek %.1f' % t)
+
+    def stop(self, quiet=False):
+        with self.lock:
+            self.gen += 1
+            p, self.p = self.p, None
+            self.state = UNSTARTED
+        if p and p.poll() is None:
+            try:
+                p.stdin.write('quit\n')
+                p.stdin.flush()
+                p.wait(3)
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                p.kill()
+        if not quiet:
+            self.on_change()
+
+
+def volume():
+    r = subprocess.run(['amixer', 'get', 'Master'], capture_output=True, text=True)
+    m = re.search(r'\[(\d+)%\]', r.stdout)
+    return int(m.group(1)) if m else 100
+
+
+# ---- the Lounge session ----------------------------------------------------------------------------
+
+class Lounge:
+    def __init__(self):
+        self.player = Player(self.player_changed)
+        self.ofs = 0
+        self.rid = random.randint(10000, 80000)
+        self.aid = 0
+        self.sid = self.gsession = None
+        self.send_lock = threading.Lock()
+        self.playlist = []
+        self.index = 0
+        self.list_id = ''
+        self.ctt = ''
+        self.cpn = zx()[:16]
+        self.last_report = 0
+        self.phones = {}
+
+    def params(self, **extra):
+        c = screen()
+        p = {'device': 'LOUNGE_SCREEN', 'theme': 'cl', 'capabilities': 'dsp,mic,dpa', 'mdxVersion': '2',
+             'loungeIdToken': c['token'], 'name': NAME, 'app': APP, 'id': c['device_id'], 'VER': '8', 'v': '2',
+             'zx': zx(), 't': '1'}
+        p.update(extra)
+        return urllib.parse.urlencode(p)
+
+    def bind(self):
+        self.rid += 1
+        self.ofs = 0
+        self.aid = 0
+        r = fetch(LOUNGE + '/bc/bind?' + self.params(RID=self.rid, AID=0), {'count': '0'})
+        self.sid = self.gsession = None
+        for idx, msg in self.messages(r.read().decode()):
+            self.aid = max(self.aid, idx)
+            self.handle(msg)
+        if not self.sid:
+            raise RuntimeError('no session')
+        log('bound: %s' % self.sid)
+
+    @staticmethod
+    def messages(text):
+        """[index, [command, args...]] out of "LENGTH\\n[...]" chunks"""
+        dec = json.JSONDecoder()
+        i = 0
+        while i < len(text):
+            m = re.compile(r'\s*\d+\s*\n').match(text, i)
+            if not m:
+                break
+            try:
+                arr, end = dec.raw_decode(text, m.end())
+            except ValueError:
+                break
+            i = end
+            for item in arr:
+                if isinstance(item, list) and len(item) == 2:
+                    yield item[0], item[1]
+
+    def poll(self):
+        """The long poll: commands as they come, until YouTube closes it"""
+        r = fetch(LOUNGE + '/bc/bind?' + self.params(SID=self.sid, gsessionid=self.gsession, RID='rpc', CI='0',
+                                                     AID=self.aid, TYPE='xmlhttp'), timeout=300)
+        buf = ''
+        while True:
+            chunk = r.read1(65536) if hasattr(r, 'read1') else r.read(4096)
+            if not chunk:
+                return
+            buf += chunk.decode('utf-8', 'replace')
+            done = 0
+            dec = json.JSONDecoder()
+            while True:
+                m = re.compile(r'\s*\d+\s*\n').match(buf, done)
+                if not m:
+                    break
+                try:
+                    arr, end = dec.raw_decode(buf, m.end())
+                except ValueError:
+                    break   # not all of it yet
+                done = end
+                for item in arr:
+                    if isinstance(item, list) and len(item) == 2:
+                        self.aid = max(self.aid, item[0])
+                        try:
+                            self.handle(item[1])
+                        except Exception as e:   # one bad command must not end the session
+                            log('command %r: %r' % (item[1][:1], e))
+            buf = buf[done:]
+
+    def send(self, cmd, args=None):
+        if not self.sid:
+            return
+        with self.send_lock:
+            body = {'count': '1', 'ofs': str(self.ofs), 'req0__sc': cmd}
+            for k, v in (args or {}).items():
+                body['req0_' + k] = str(v)
+            self.rid += 1
+            try:
+                fetch(LOUNGE + '/bc/bind?' + self.params(SID=self.sid, gsessionid=self.gsession, RID=self.rid,
+                                                         AID=self.aid), body, timeout=15).read()
+                self.ofs += 1
+            except (OSError, urllib.error.URLError) as e:
+                log('send %s: %s' % (cmd, e))
+
+    # what plays, for the phone
+
+    def now_playing(self):
+        p = self.player
+        if not p.video:
+            return {}
+        return {'videoId': p.video, 'currentTime': '%.1f' % p.pos, 'ctt': self.ctt, 'listId': self.list_id,
+                'currentIndex': self.index, 'state': p.state, 'duration': '%.1f' % p.dur,
+                'loadedTime': '%.1f' % p.pos, 'seekableStartTime': '0', 'seekableEndTime': '%.1f' % p.dur,
+                'cpn': self.cpn}
+
+    def state_change(self):
+        p = self.player
+        self.send('onStateChange', {'currentTime': '%.1f' % p.pos, 'duration': '%.1f' % p.dur, 'cpn': self.cpn,
+                                    'loadedTime': '%.1f' % p.pos, 'state': p.state, 'seekableStartTime': '0',
+                                    'seekableEndTime': '%.1f' % p.dur})
+        self.last_report = time.time()
+
+    def player_changed(self, ended=False):
+        threading.Thread(target=self.after_change, args=(ended,), daemon=True).start()
+
+    def after_change(self, ended):
+        if ended and self.player.state == ENDED and self.index + 1 < len(self.playlist):
+            self.index += 1
+            self.player.load(self.playlist[self.index])
+            self.send('nowPlaying', self.now_playing())
+            return
+        self.state_change()
+
+    def report(self):
+        """While playing, where it is now and then (the phone's bar)"""
+        while True:
+            time.sleep(5)
+            if self.player.state == PLAYING and time.time() - self.last_report > 9:
+                self.state_change()
+
+    # the phone's commands
+
+    def handle(self, msg):
+        cmd, args = msg[0], msg[1] if len(msg) > 1 and isinstance(msg[1], dict) else {}
+        if cmd == 'c':
+            self.sid = msg[1]
+        elif cmd == 'S':
+            self.gsession = msg[1]
+        elif cmd == 'noop':
+            pass
+        else:
+            log('<- %s %s' % (cmd, json.dumps(args)[:300] if args else ''))
+        if cmd == 'remoteConnected':
+            name = args.get('name') or 'A phone'
+            self.phones[args.get('id', name)] = name
+            notify(' %s is connected (YouTube)' % name)
+        elif cmd == 'remoteDisconnected':
+            self.phones.pop(args.get('id', ''), None)
+        elif cmd == 'getNowPlaying':
+            self.send('nowPlaying', self.now_playing())
+        elif cmd == 'setPlaylist':
+            ids = [v for v in args.get('videoIds', '').split(',') if v]
+            vid = args.get('videoId') or (ids[0] if ids else '')
+            self.playlist = ids or [vid]
+            try:
+                self.index = int(args.get('currentIndex', self.playlist.index(vid) if vid in self.playlist else 0))
+            except ValueError:
+                self.index = 0
+            self.list_id = args.get('listId', '')
+            self.ctt = args.get('ctt', '')
+            self.cpn = zx()[:16]
+            if vid:
+                self.player.load(vid, float(args.get('currentTime') or 0))
+                self.send('nowPlaying', self.now_playing())
+        elif cmd == 'updatePlaylist':
+            ids = [v for v in args.get('videoIds', '').split(',') if v]
+            if ids:
+                self.playlist = ids
+                if self.player.video in ids:
+                    self.index = ids.index(self.player.video)
+        elif cmd == 'play':
+            self.player.play()
+        elif cmd == 'pause':
+            self.player.pause()
+        elif cmd == 'seekTo':
+            self.player.seek(float(args.get('newTime') or 0))
+            self.state_change()
+        elif cmd == 'stopVideo':
+            self.player.stop()
+            self.player.video = None
+            self.send('nowPlaying', {})
+        elif cmd in ('next', 'previous'):
+            j = self.index + (1 if cmd == 'next' else -1)
+            if 0 <= j < len(self.playlist):
+                self.index = j
+                self.cpn = zx()[:16]
+                self.player.load(self.playlist[j])
+                self.send('nowPlaying', self.now_playing())
+        elif cmd == 'setVolume':
+            v = max(0, min(100, int(float(args.get('volume', volume())))))
+            subprocess.call(['amixer', '-q', 'sset', 'Master', '%d%%' % v])
+            self.send('onVolumeChanged', {'volume': v, 'muted': 'false'})
+        elif cmd == 'getVolume':
+            self.send('onVolumeChanged', {'volume': volume(), 'muted': 'false'})
+        elif cmd == 'getSubtitlesTrack':
+            self.send('onSubtitlesTrackChanged', {'videoId': self.player.video or ''})
+
+    def run(self):
+        threading.Thread(target=self.report, daemon=True).start()
+        delay = 1
+        while True:
+            try:
+                if not self.sid:
+                    self.bind()
+                self.poll()
+                delay = 1
+            except urllib.error.HTTPError as e:
+                log('lounge: HTTP %s' % e.code)
+                if e.code in (400, 404, 410):   # the session is gone: a new one
+                    self.sid = None
+                elif e.code == 401:   # the token: a new one
+                    c = load_conf()
+                    c.pop('token', None)
+                    save_conf(c)
+                    self.sid = None
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+            except (OSError, urllib.error.URLError, RuntimeError, ValueError) as e:
+                log('lounge: %r' % e)
+                self.sid = None
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+
+
+# ---- DIAL: how phones find it ---------------------------------------------------------------------
+
+def local_ip(towards='8.8.8.8'):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((towards, 80))
+        return s.getsockname()[0]
+    except OSError:
+        return '127.0.0.1'
+    finally:
+        s.close()
+
+
+def udn():
+    c = load_conf()
+    return 'uuid:' + c.get('device_id', '00000000-0000-0000-0000-000000000000')
+
+
+def make_handler(lounge):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        server_version = 'ozone-cast/1'
+
+        def log_message(self, fmt, *a):
+            pass
+
+        def reply(self, code, body=b'', ctype='text/xml; charset="utf-8"', headers=()):
+            self.send_response(code)
+            self.send_header('Content-Type', ctype)
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Access-Control-Allow-Origin', '*')
+            for k, v in headers:
+                self.send_header(k, v)
+            self.end_headers()
+            if self.command != 'HEAD':
+                self.wfile.write(body)
+
+        def base(self):
+            return 'http://%s:%d' % (self.connection.getsockname()[0], PORT)
+
+        def do_GET(self):
+            path = self.path.split('?')[0]
+            if path == '/ssdp/device-desc.xml':
+                body = ('<?xml version="1.0"?><root xmlns="urn:schemas-upnp-org:device-1-0"><specVersion>'
+                        '<major>1</major><minor>0</minor></specVersion><device><deviceType>'
+                        'urn:dial-multiscreen-org:device:dial:1</deviceType><friendlyName>%s</friendlyName>'
+                        '<manufacturer>Ozone</manufacturer><modelName>OzoneHD T2</modelName><UDN>%s</UDN>'
+                        '</device></root>' % (NAME, udn())).encode()
+                self.reply(200, body, headers=[('Application-URL', self.base() + '/apps/')])
+            elif path.rstrip('/') == '/apps/YouTube':
+                running = lounge.player.video is not None
+                body = ('<?xml version="1.0" encoding="UTF-8"?><service xmlns="urn:dial-multiscreen-org:schemas:dial"'
+                        ' dialVer="2.1"><name>YouTube</name><options allowStop="true"/><state>%s</state>%s'
+                        '<additionalData><screenId>%s</screenId></additionalData></service>'
+                        % ('running' if running else 'stopped', '<link rel="run" href="run"/>' if running else '',
+                           screen()['screen_id'])).encode()
+                self.reply(200, body)
+            else:
+                self.reply(404)
+
+        do_HEAD = do_GET
+
+        def do_POST(self):
+            path = self.path.split('?')[0]
+            n = int(self.headers.get('Content-Length') or 0)
+            data = urllib.parse.parse_qs(self.rfile.read(n).decode(errors='replace')) if n else {}
+            if path.rstrip('/') != '/apps/YouTube':
+                self.reply(404)
+                return
+            code = (data.get('pairingCode') or [''])[0]
+            log('DIAL launch from %s%s' % (self.client_address[0], ' with a pairing code' if code else ''))
+            if code:
+                try:
+                    register_pairing(code)
+                except (OSError, urllib.error.URLError) as e:
+                    log('register_pairing_code: %s' % e)
+                    self.reply(503)
+                    return
+            self.reply(201, headers=[('Location', self.base() + '/apps/YouTube/run')])
+
+        def do_DELETE(self):
+            if self.path.split('?')[0].rstrip('/') == '/apps/YouTube/run':
+                lounge.player.stop()
+                self.reply(200)
+            else:
+                self.reply(404)
+
+    return Handler
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def ssdp_answer():
+    """Answers the YouTube app's searches for DIAL devices"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('', SSDP[1]))
+    joined = set()
+    while True:
+        ip = local_ip()
+        if ip not in joined and ip != '127.0.0.1':
+            try:
+                s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                             socket.inet_aton(SSDP[0]) + socket.inet_aton(ip))
+                joined.add(ip)
+            except OSError:
+                pass
+        s.settimeout(30)
+        try:
+            data, addr = s.recvfrom(4096)
+        except socket.timeout:
+            continue
+        text = data.decode(errors='replace')
+        if not text.startswith('M-SEARCH') or DIAL_ST not in text and 'ssdp:all' not in text:
+            continue
+        me = local_ip(addr[0])
+        reply = ('HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\nDATE: %s\r\nEXT:\r\n'
+                 'LOCATION: http://%s:%d/ssdp/device-desc.xml\r\nSERVER: Linux/3.10 UPnP/1.1 ozone-cast/1\r\n'
+                 'ST: %s\r\nUSN: %s::%s\r\nBOOTID.UPNP.ORG: 1\r\nCONFIGID.UPNP.ORG: 1\r\n\r\n'
+                 % (time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime()), me, PORT, DIAL_ST, udn(), DIAL_ST))
+        try:
+            s.sendto(reply.encode(), addr)
+        except OSError:
+            pass
+
+
+def daemon():
+    if not load_conf().get('enabled', True):
+        return 0
+    r = subprocess.run(['pgrep', '-f', '^/usr/bin/python3 /usr/local/bin/ozone-cast daemo[n]'], capture_output=True,
+                       text=True)
+    if [p for p in r.stdout.split() if int(p) != os.getpid()]:
+        return 0
+    signal.signal(signal.SIGTERM, lambda *a: os._exit(0))
+    log('started')
+    for _ in range(60):   # the network may not be up yet
+        try:
+            screen()
+            break
+        except (OSError, urllib.error.URLError, ValueError, KeyError) as e:
+            log('screen: %r' % e)
+            time.sleep(10)
+    lounge = Lounge()
+    srv = Server(('', PORT), make_handler(lounge))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Thread(target=ssdp_answer, daemon=True).start()
+    lounge.run()
+
+
+def running():
+    return subprocess.call(['pgrep', '-f', '^/usr/bin/python3 /usr/local/bin/ozone-cast daemo[n]'],
+                           stdout=subprocess.DEVNULL) == 0
+
+
+def rofi(prompt, items, message=None):
+    cmd = ['rofi', '-dmenu', '-i', '-format', 'i', '-p', prompt,
+           '-theme-str', 'listview { lines: %d; }' % len(items)]
+    if message:
+        cmd += ['-mesg', message]
+    r = subprocess.run(cmd, input='\n'.join(items), capture_output=True, text=True)
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        return None
+
+
+def menu():
+    while True:
+        c = load_conf()
+        on = c.get('enabled', True)
+        items = ['  YouTube from phones: %s' % ('on' if on else 'off')]
+        if on:
+            items.append('  Link a phone with a TV code…')
+        i = rofi('  Cast', items, 'On the home WiFi, the phone\'s YouTube shows "%s" under its Cast button. '
+                                       'Elsewhere (or if it doesn\'t): a TV code.' % NAME)
+        if i is None:
+            return 0
+        if i == 0:
+            c['enabled'] = not on
+            save_conf(c)
+            if c['enabled']:
+                subprocess.Popen([sys.argv[0], 'daemon'], start_new_session=True, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                notify(' YouTube from phones: on')
+            else:
+                subprocess.call(['pkill', '-f', '^/usr/bin/python3 /usr/local/bin/ozone-cast daemo[n]'])
+                notify(' YouTube from phones: off')
+        else:
+            try:
+                code = pairing_code()
+            except (OSError, urllib.error.URLError, ValueError, KeyError) as e:
+                notify('YouTube could not be reached: %s' % getattr(e, 'reason', e))
+                continue
+            rofi('TV code', ['OK'], 'In the phone\'s YouTube app: your picture → Settings → Watch on TV → Enter TV '
+                                    'code, and type:\n\n            %s\n\n(the code works for a few minutes)' % code)
+
+
+def main():
+    a = sys.argv[1:]
+    if a == ['daemon']:
+        return daemon()
+    if a == ['code']:
+        print(pairing_code())
+        return 0
+    if a == ['status']:
+        print('on' if load_conf().get('enabled', True) and running() else 'off')
+        return 0
+    if not a or a == ['menu']:
+        return menu()
+    sys.exit(__doc__)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -106,9 +106,8 @@ Not counted: the stock app's satellite features (DiSEqC, motor, LNB), as the tun
 - [ ] **Medium**: YouTube features SmartTube has and `yt` doesn't: account sign-in, subscriptions,
   history, the home feed, channel pages, playlists, SponsorBlock, YouTube's own subtitles, speed,
   chapters. Starting a video also takes ~10 s.
-- [ ] **Medium or Hard**: casting from the YouTube app on a phone (its "Cast" button, or "Link with
-  TV code"): the DIAL protocol and YouTube's Lounge API, as SmartTube does. Now a phone sends
-  YouTube to the box only by DLNA apps or by the phone remote's address box.
+- [x] **Medium or Hard**: casting from the YouTube app on a phone (its "Cast" button, or "Link with
+  TV code"): DIAL and YouTube's Lounge API (`ozone-cast`). Tested with a pretend phone so far.
 - [ ] **Medium**: settings in the interface: sound, screen, network, language in one place.
 - [ ] **Medium**: the interface in Ukrainian (Android's is uk-UA; ours is English).
 - [x] **Medium**: backup / restore of the system and settings, and a "factory reset", from the box

@@ -212,6 +212,7 @@ def menu():
                  'Remote control on the phone…',
                  'Receive videos from a phone (DLNA): %s' % tool_state('ozone-dlna'),
                  'Share the box\'s files (computers, phones, TVs): %s' % tool_state('ozone-share'),
+                 'YouTube from a phone (its Cast button): %s' % tool_state('ozone-cast'),
                  'Show a phone\'s screen (Miracast)…']
         i = rofi(ICON + '  Network', items, message='   '.join(status()))
         if i is None:
@@ -235,6 +236,8 @@ def menu():
         elif i == 8:
             subprocess.call(['ozone-share'])
         elif i == 9:
+            subprocess.call(['ozone-cast', 'menu'])
+        elif i == 10:
             return os.execvp('ozone-miracast', ['ozone-miracast'])
 
 

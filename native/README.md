@@ -781,3 +781,23 @@ it instead.
   `/etc/ozone/vpn/NAME.l2tp|.pptp` (root, 600).
 - Tested: the failures (a server that doesn't answer, one that refuses) end in ~20 s / ~5 s with the
   routes and daemons gone; not yet against a real server.
+
+## YouTube from a phone (ozone-cast)
+
+The receiver side of what the YouTube app does with TVs, without Google's Cast:
+- DIAL: an SSDP answer to `ST: urn:dial-multiscreen-org:service:dial:1` (port 1900 shared with the
+  DLNA renderer, SO_REUSEADDR), a device description with `Application-URL` on port 8008, and
+  `/apps/YouTube` (its state and the screen id). A launch POST brings `pairingCode`, which goes to
+  `/api/lounge/pairing/register_pairing_code` for this screen.
+- The Lounge API, as a `LOUNGE_SCREEN`: a screen id from `generate_screen_id` and a lounge token
+  from `get_lounge_token_batch` (two weeks; renewed a day early; `~/.config/ozone/cast.json`), then
+  `/bc/bind`: a POST with `count=0` brings the session (`c` = SID, `S` = gsessionid), a long GET
+  (`RID=rpc`, `TYPE=xmlhttp`) the commands as `LENGTH\n[[index, [command, args]], ...]` chunks
+  (parsed with `raw_decode`, not by the length), and POSTs with `count`, `ofs` and `req0_*` fields
+  send `nowPlaying`, `onStateChange` (-1 unstarted, 0 ended, 1 playing, 2 paused, 3 loading),
+  `onVolumeChanged`. A TV code is `get_pairing_code`.
+- Playing: yt-dlp with yt's format and height, then `amplay --control [--audio] [--start]`; its
+  `pos` lines give the state; the next video of the phone's queue follows at the end.
+- Tested with the Lounge API's remote side from the laptop (a script as the phone): connected,
+  `setPlaylist` played ("Me at the zoo", 12 s to start), pause, a seek and `stopVideo` reached the
+  player. Not yet with a real phone.

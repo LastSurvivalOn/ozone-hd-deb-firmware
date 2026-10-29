@@ -800,8 +800,16 @@ to" a TV: BubbleUPnP and other DLNA apps on Android, VLC, Kodi, a phone's galler
 another device", Windows' **Cast to device** (right click on a video). Videos play in the video
 player, music and photos full screen; the phone pauses, winds and stops them, and sets the volume,
 and the remote works as usual (**exit** stops). **Receive videos from a phone** turns it off or on,
-and gives it another name. (YouTube's own cast button needs Google's protocol, which the box
-doesn't have.)
+and gives it another name.
+
+**YouTube from a phone**: in the phone's YouTube app, the Cast button (a screen with waves, at the
+top) lists **Ozone TV** when the phone is on the same home WiFi: choose it, then any video plays on
+the TV. The phone stays the remote: pause, wind on the bar, next video, its volume buttons; the
+box's remote works too (**exit** stops). A video takes about 10 seconds to start. If the phone
+doesn't list the box (another network, or a phone that finds TVs only by Google's Cast), **Network →
+YouTube from a phone → Link a phone with a TV code** shows a code: in the phone's YouTube, your
+picture → **Settings** → **Watch on TV** → **Enter TV code**. A phone linked that way finds the box
+from then on, from anywhere. **YouTube from a phone** in the Network menu turns it off.
 
 **Sharing the box's files** with the computers, phones and TVs at home: **Network → Share the
 box's files**, two switches (both off at first):
