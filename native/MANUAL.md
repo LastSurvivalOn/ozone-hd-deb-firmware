@@ -63,6 +63,9 @@ Everything grows together: the text, the menus, the panel, the windows, the brow
 is less room on the screen for them. It takes effect when the desktop starts again (the menu offers
 to restart it now; open windows close). On the larger sizes the panel leaves out the processor,
 memory, temperature and the cable's address (System info and the Network menu still show them).
+**Old 4:3 TV** is for a picture tube (through the analog output or an HDMI-to-AV adapter): the
+other sizes are 16:9, which a 4:3 screen squeezes from the sides, so letters come out narrow and
+hard to read. This one is 4:3, about as tall as **Largest**, with letters a third wider.
 
 **Wallpaper** in the app menu: **The box's pictures** and **One of your photos** open their
 thumbnails in Photos, where the arrows choose and **OK** sets one; **A plain colour**, **The

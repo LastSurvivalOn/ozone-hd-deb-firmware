@@ -2537,8 +2537,10 @@ class TvWindow:
         self.right.add(self.sched)
         body.pack_start(self.right, True, True, 0)
         top.pack_start(body, True, True, 0)
-        hint = self.label('OK: watch   page ±: a page   →: the guide   blue (Menu, F2): the channel\'s menu   '
-                          'green (Tab): the next list   exit (Esc): back', 'hint')
+        # wrapped on a narrow desktop (the 4:3 one), between the hints, not inside one
+        keys = ('OK: watch', 'page ±: a page', '→: the guide', 'blue (Menu, F2): the channel\'s menu',
+                'green (Tab): the next list', 'exit (Esc): back')
+        hint = self.label('   '.join(k.replace(' ', '\u00a0') for k in keys), 'hint', wrap=True)
         hint.set_margin_start(16)
         hint.set_margin_bottom(6)
         top.pack_start(hint, False, False, 0)

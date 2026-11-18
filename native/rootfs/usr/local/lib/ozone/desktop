@@ -13,7 +13,7 @@ start-stop-daemon --stop --quiet --retry 2 --pidfile /run/ozone-splash.pid --rem
 # screen, makes everything bigger. ozone-hw set 1280x720 for the boot splash.
 DESKTOP=1280x720
 [ -r /etc/ozone/display ] && . /etc/ozone/display
-case "$DESKTOP" in 1280x720|1120x630|1024x576|960x540) ;; *) DESKTOP=1280x720 ;; esac
+case "$DESKTOP" in 1280x720|1120x630|1024x576|960x540|736x552) ;; *) DESKTOP=1280x720 ;; esac
 w=${DESKTOP%x*} h=${DESKTOP#*x}
 if [ "$(cat /sys/class/graphics/fb0/virtual_size)" != "$w,$((h * 2))" ]; then
     fbset -fb /dev/fb0 -g $w $h $w $((h * 2)) 16 -rgba 5/11,6/5,5/0,0/0
