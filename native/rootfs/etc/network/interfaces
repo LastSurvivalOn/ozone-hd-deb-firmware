@@ -2,5 +2,8 @@
 auto lo
 iface lo inet loopback
 
+# eth0 only comes up here; its address (DHCP, static or PPPoE, as in the Network menu) is netwatch's,
+# through net-apply, once the cable is in. ifupdown's own DHCP held the boot for a minute without one.
 auto eth0
-iface eth0 inet dhcp
+iface eth0 inet manual
+    up ip link set eth0 up

@@ -105,7 +105,9 @@ password the first time, and saved networks connect again by themselves. The chi
 4. A `wpa_cli` action script (`lib/ozone/wifi-event`) runs dhclient on association, with route
    metric 600, so the cable wins when both are connected.
 
-`lib/ozone/netwatch` follows the cable. Kernel 3.10 keeps using a route whose link is down, so when
+`lib/ozone/netwatch` follows the cable. At boot ifupdown only brings eth0 up (`inet manual`): its
+own DHCP waited a minute for an address without a cable, holding up the whole start. netwatch gives
+eth0 its address instead, at its first check if the cable is in. Kernel 3.10 keeps using a route whose link is down, so when
 the cable is pulled out it removes eth0's address and routes, and runs DHCP again when it comes
 back (dhclient itself: `ifdown` takes the link down, which looks like the cable going out). Once the
 cable has had an address for two checks (6 s), it disconnects WiFi (`wpa_cli disconnect`), and
@@ -122,7 +124,7 @@ root; sudo's `secure_path` has no `/usr/local/bin`, so they pass their full path
 
 - **`ozone-network`** (rofi; the panel's address and WiFi open it) keeps its settings in
   `/etc/ozone/network.json` (root, 600: the PPPoE password), and `lib/ozone/net-apply` applies them:
-  netwatch calls it when the cable comes in or out (and at start for a static address or PPPoE),
+  netwatch calls it when the cable comes in or out (a cable in at boot counts as coming in),
   wifi-event on WiFi (dis)association. DHCP is dhclient with `IF_METRIC` (100 cable, 600 WiFi);
   static is `ip addr`/`ip route` and resolv.conf. **PPPoE**: the kernel has PPP but no
   `CONFIG_PPPOE`, so it is pppd with the user-space `pppoe` as its pty (`/var/log/pppoe.log`); the

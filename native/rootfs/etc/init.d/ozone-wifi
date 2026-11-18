@@ -18,6 +18,12 @@ LIB=/usr/local/lib/ozone
 
 case "$1" in
 start)
+    # At boot, in the background: the driver takes ~7 s to come up, which the desktop (started once
+    # runlevel 2's scripts are done) has no need to wait for. Later starts (ozone-hotspot) wait.
+    if [ "$PREVLEVEL" = N ] && [ -z "$OZONE_WIFI_NOW" ]; then
+        OZONE_WIFI_NOW=1 "$0" start < /dev/null >> /var/log/ozone-wifi.log 2>&1 &
+        exit 0
+    fi
     # Power to the chip as Android's WiFi HAL does it (set_wifi_power): POWER_UP, _IO('m', 1), on
     # /dev/wifi_power. The SDIO card then shows up and the vendor driver takes it.
     python3 -c 'import fcntl, os; fcntl.ioctl(os.open("/dev/wifi_power", os.O_RDWR), 0x6d01)'

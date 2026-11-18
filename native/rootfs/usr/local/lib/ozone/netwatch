@@ -26,10 +26,9 @@ log() {
 }
 
 rm -f $PAUSED
-# a static address or PPPoE instead of the DHCP ifupdown started at boot
-grep -qE '"eth0": *\{[^}]*"mode": *"(static|pppoe)"' /etc/ozone/network.json 2> /dev/null &&
-    /usr/local/lib/ozone/net-apply eth0
-last=$(carrier) wifi_off=0 seen=0
+# ifupdown only brings eth0 up at boot (/etc/network/interfaces): a cable in from the start is
+# "cable in" at the first check, which gives it its address
+last=0 wifi_off=0 seen=0
 while true; do
     now=$(carrier)
     if [ "$now" != "$last" ]; then
