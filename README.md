@@ -1,8 +1,8 @@
 # OzoneHD T2 → Debian 12
 
 Scripts that turn an OzoneHD T2 WiFi set-top box (Amlogic S805, Android 4.4) into a Debian 12
-media centre run with the TV remote: the box's own DVB-T2 tuner, hardware video decoding and the
-Mali GPU on its stock kernel, with Android kept for dual boot or removed altogether.
+media centre run with the TV remote: the box's own DVB-T2 and cable tuner, hardware video decoding
+and the Mali GPU on its stock kernel, with Android kept for dual boot or removed altogether.
 
 The box's 3.10 vendor kernel stays: NAND, WiFi and the T2 tuner have no mainline drivers. A custom
 initramfs boots Debian from an image file on the data partition, and everything Android did is
@@ -10,9 +10,10 @@ done again in Linux (programs of this repository's own, in Python and C).
 
 ## What it does
 
-- **Television (DVB-T2):** channel scans, favourites, the guide, recording to USB, timeshift
-  (pausing live TV), timers, subtitles, teletext, radio, parental lock. The tuner runs through the
-  stock TV app's own libraries (`native/dtv`).
+- **Television (DVB-T2 and cable DVB-C):** channel scans, favourites, the guide, recording to
+  USB, timeshift (pausing live TV), timers, subtitles, teletext, radio, parental lock. The tuner
+  runs through the stock TV app's own libraries (`native/dtv`), cable too, which the stock app
+  never used.
 - **Video and music:** a player on the hardware decoder (H.264, HEVC, MPEG-2; up to 1080p),
   automatic frame rate, audio passthrough, an equalizer, a music player, photos and a slideshow
   screensaver.
@@ -40,7 +41,7 @@ DRM, Chromium (it can't start on kernel 3.10), systemd and Docker (no cgroups or
 | RAM | 1 GB (~830 MB for Linux) |
 | Storage | 8 GB NAND behind a vendor driver |
 | Network | 100 Mbit Ethernet, Realtek 8189ES WiFi |
-| Tuner | AVL6762 + MxL608 (DVB-T/T2) |
+| Tuner | AVL6762 + MxL608 (DVB-T/T2, DVB-C) |
 | Kernel | stock Amlogic 3.10.33 |
 
 Debian here is `armhf`. Programs built for arm64 / aarch64 or x86 won't run, nor will Android

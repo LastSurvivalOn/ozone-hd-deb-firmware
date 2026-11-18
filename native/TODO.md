@@ -177,24 +177,13 @@ Linux doesn't:
 - [ ] **Easy**: the TV app's other timer kinds: standby at a time, power on, monthly repeat (ours:
   record or switch, once / daily / weekly). Its "Switch Channel Mode" (black or the last frame
   while zapping) too.
-- [ ] **Medium**: cable TV (DVB-C). The AVL6762 and MxL608 do it, and libth_dtv_external_c.so has
-  the whole SDK for it, but the TV app's own layer never calls it. Found on 2026-11-18 with
-  `native/dtv/dvbc-probe.c`, on a cable network (a strong carrier on almost every UHF channel,
-  474-786 MHz, no DVB-T2 anywhere):
-  - `AVL_SetWorkMode(0)` (AVL_DVBC) loads the DVB-C firmware patch (`AVL_Demod_Patch_DVBCFw`,
-    47928 bytes, in the library) and returns 0; `AVL_SetWorkMode(2)` goes back to DVB-T/T2.
-  - `MxL608_Lock(tuner)` with mode 0 at +4 (frequency Hz at +8, bandwidth at +16) tunes the MxL608
-    in its cable mode, inside `AVL_Demod_I2CBypassOn(0)` / `Off(0)`; its PLL locks.
-  - `AVL_Demod_DVBCAutoLock(0)` (symbol rate and QAM found by the demod), then
-    `AVL_Demod_GetLockStatus(&u8, 0)`; `AVL_Demod_DVBCGetModulationInfo(&info, 0)` once locked.
-  - The board's `AVL_DVBCConfigChip0` (input path, IF Hz, symbol rate, ?, standard) is
-    {0, 36000000, 6875000, 0, 0}: a reference tuner's 36 MHz IF, while this library's MxL608 puts
-    out 5 MHz in every mode (`MxLWare608_API_CfgTunerMode`, 0x1388 kHz). It must be patched
-    before `PI_Tuner_Init`, which copies it.
-  - Still no lock in 5-8 s on six of the strongest carriers, with IF 5 MHz; the fourth field at 1
-    gives a signal strength of 0, so it isn't the spectrum inversion. Not known yet whether the
-    network carries any DVB-C (analog cable can't be shown at all: no analog demodulator).
-  Then: dtvfe `tunec`, `ozone-tv scan --cable` (an 8 MHz grid, the NIT), a system per channel.
+- [x] **Medium**: cable TV (DVB-C). The AVL6762 and MxL608 do it, and libth_dtv_external_c.so has
+  the whole SDK for it, but the TV app's own layer never calls it. Done on 2026-11-18 on a
+  Columbus network (15 multiplexes at 354-442, 498, 514 and 818 MHz, QAM-256, 6875 kS/s, ~120
+  unencrypted channels): dtvfe `tunec` (see its header: the board's DVB-C IF of 36 MHz had to be
+  5 MHz), "Cable network" in the scan dialog and `ozone-tv scan --cable` (the 8 MHz grid until
+  one locks, then the NIT's cable delivery descriptors), `"cable": true` per channel, Cable and
+  Antenna lists.
 - [ ] **Low value**: the stock phone remotes' protocols: Amlogic's RC_Server (TCP and UDP, its own
   phone app) and Google TV's Anymote (IpRemote; Google's app for it is gone). The web remote on
   port 8080 does their job with any phone's browser.

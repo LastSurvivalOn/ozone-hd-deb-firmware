@@ -258,16 +258,18 @@ backup of the stock system partition with debugfs, no root needed, into
 partitions but `data`, which holds `debian.img`. If the copy is missing, `ozone-android` mounts the
 NAND partition as before.
 
-## Television (DVB-T/T2)
+## Television (DVB-T/T2, DVB-C)
 
 `./install-tv.sh <ip>` (needs the Android NDK here, `~/Android/Sdk/ndk/*`, and amplay from
 `install-desktop.sh`). Super+T or the TV button on the panel: channel list, "Scan channels" the
-first time. What the TV does for the viewer is in [MANUAL.md](MANUAL.md#6-television-dvb-t2).
+first time. What the TV does for the viewer is in [MANUAL.md](MANUAL.md#6-television-dvb-t2-and-cable).
 
 ```sh
 ozone-tv scan                    # UHF 21..60 (474-786 MHz, 8 MHz), prints level and services per multiplex
 ozone-tv scan --freq 570000      # one multiplex (bandwidth and PLP may follow)
 ozone-tv scan --nit 570000       # the multiplexes the network table lists, from that one
+ozone-tv scan --cable            # cable (DVB-C): 114-858 MHz until one locks, then what its NIT lists
+ozone-tv scan --freq 354000 C    # C for the bandwidth: a cable multiplex (also in status and --nit)
 ozone-tv status 570000           # signal level/quality once a second: for aiming the antenna
 ozone-tv antenna on              # 5 V on the antenna input (kept in the settings)
 ozone-tv play 3                  # channel 3 of the list
@@ -287,6 +289,13 @@ reused as they are:
   `External_Init`, `PI_System_Start`, `PI_Tuner_Init`, then `PI_Tuner_DVB_T_StartLock` /
   `CheckSignalStatus` / `SetAntennaPower` (interfaces taken from the disassembly), answering
   `tune`/`status`/`antenna` on stdin.
+- Cable (`tunec`): the stock app never uses DVB-C, but the library has Availink's and MaxLinear's
+  whole SDK. dtvfe switches the demodulator to DVB-C (`AVL_SetWorkMode`, which loads its DVB-C
+  firmware), tunes the MxL608 in its cable mode (`MxL608_Lock`) and lets the demodulator find
+  the symbol rate and QAM (`AVL_Demod_DVBCAutoLock`, 1-3 s). The board's DVB-C settings name a
+  36 MHz IF, but the MxL608 puts out 5 MHz: dtvfe changes it before the demodulator starts.
+  A cable channel has `"cable": true` in channels.json. The NIT's cable delivery descriptors
+  (0x44) give the network's other multiplexes; 5 V antenna power is never on while on cable.
 - `/etc/init.d/ozone-android` puts the Android files on `/system`, read-only, and makes an empty
   KitKat property area at `/dev/__properties__` (bionic crashes without one). The files are copies
   in Debian, not the NAND partition: see "Android files" above.

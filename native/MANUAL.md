@@ -13,7 +13,7 @@ mouse work too.
 3. [Windows and workspaces](#3-windows-and-workspaces)
 4. [YouTube](#4-youtube)
 5. [The video player](#5-the-video-player)
-6. [Television (DVB-T2)](#6-television-dvb-t2)
+6. [Television (DVB-T2 and cable)](#6-television-dvb-t2-and-cable)
 7. [The browser](#7-the-browser)
 8. [Picture and sound settings](#8-picture-and-sound-settings)
 9. [When something goes wrong](#9-when-something-goes-wrong)
@@ -302,18 +302,21 @@ video (MPEG-4 ASP / DivX, VP9, AV1…) goes to the software player, which manage
 continues by itself once a few seconds are buffered. Multimedia keys (play, pause, next…) on a
 keyboard that has them do the same as the keys above.
 
-## 6. Television (DVB-T2)
+## 6. Television (DVB-T2 and cable)
 
 Open it with **Super+T**, the screen icon on the panel, or **epg**, **dvb** or **TV/radio** on the
-remote. An antenna must be connected to the box.
+remote. An antenna (DVB-T2) or a cable TV socket (digital cable, DVB-C) must be connected to the
+box's antenna input.
 The TV window opens:
 - **left:** a list of channels, with what's on now and a bar showing how far into it they are, and
   the signal level when that frequency was last tuned. Above it, which list: **All channels**,
-  your own lists (**Favourites** to begin with), **Radio**, **Recordings** and **Timers**;
+  your own lists (**Favourites** to begin with), **Radio**, **Cable** and **Antenna** (when you have
+  channels from both), **Recordings** and **Timers**;
 - **right:** the programme guide of the selected channel, by day. **NOW** marks what's on, **16+**
   an age rating, **REC** or **ALARM** a timer set on it.
 
-**The first time**, click **Scan channels** at the top right and choose **The whole band**. The scan
+**The first time**, click **Scan channels** at the top right and choose **Antenna: the whole band**
+(or **Cable network**, below). The scan
 checks 40 frequencies, about 3 minutes in all. The top of the window and the panel show the
 progress, for example "Scan 12/40: 570 MHz… (found 6)". "Nothing found" means no signal on any
 frequency: check the antenna and its cable (and the antenna power, below). Scan again if you move
@@ -322,6 +325,16 @@ the antenna or channels change: your order, names, lists, skips and locks stay.
 **One frequency**: if you know the multiplex (a UHF channel number like 27, or MHz like 522), with
 its bandwidth and, for DVB-T2, its PLP. **Network search** reads the list of frequencies a network
 announces and scans those; Zeonbud announces none, so here it finds only the frequency you give.
+Tick **Cable (DVB-C)** for a cable network's frequency.
+
+**Cable TV.** With the cable from the wall socket in the antenna input, **Cable network (DVB-C)**
+goes up from 114 MHz until it finds the first digital channel, then scans the frequencies the
+network announces: 2 to 6 minutes. Columbus here has 15 multiplexes (354-442, 498, 514 and
+818 MHz), about 120 channels, none of them encrypted. The cable must carry digital channels: an
+analog-only network (what an old TV shows without a receiver) can't be shown. The antenna power is
+always off while a cable channel is tuned, whatever the setting. Channels from both stay in **All
+channels**: with the cable plugged in, the antenna ones get no signal, so **Cable** and **Antenna**
+show one kind each.
 
 **The programme guide** comes from the broadcast itself. It fills in by itself while you watch,
 record or scan. **Update guide** visits every multiplex for about 25 s each, a minute or so in

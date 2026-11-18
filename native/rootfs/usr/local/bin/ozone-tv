@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""ozone-tv: DVB-T/T2 television in native Linux.
+"""ozone-tv: DVB-T/T2 and cable (DVB-C) television in native Linux.
 
 The frontend (AVL6762 demodulator + MxL608 tuner) is driven by dtvfe, which runs the TV app's own
 Android libraries (see ozone-dtv). Everything after the demodulator is the kernel's regular DVB
@@ -14,9 +14,12 @@ timeshift buffer; a recording is the same data written to a drive.
   ozone-tv scan [FROM TO]         scan UHF channels FROM..TO (default 21..60, 8 MHz)
   ozone-tv scan --freq KHZ [BW [PLP]]   scan one multiplex
   ozone-tv scan --nit KHZ [BW]    the multiplexes the network lists (NIT), from the one at KHZ
+  ozone-tv scan --cable [KHZ]     a cable network: the 8 MHz grid until a multiplex locks, then the
+                                  ones its NIT lists (from KHZ: that one's NIT)
   ozone-tv guide                  update the programme guide (tunes each multiplex for a while)
   ozone-tv now                    what's on every channel, from the guide
   ozone-tv status KHZ [BW]        tune and print the signal once a second (aiming the antenna)
+                                  BW, here and in --freq: 8, 7, 6, or C for cable (DVB-C)
   ozone-tv antenna on|off         the 5 V power for an active antenna (kept in the settings)
   ozone-tv log                    the frontend libraries' messages (Android log)
   ozone-tv logs                   where the session logs are, and the latest one
@@ -127,6 +130,7 @@ DEFAULTS = {
     'signals': {},                 # kHz -> [level, quality, time] last seen
 }
 ALL, RADIO, RECORDED, TIMERS_VIEW = 'All', 'Radio', 'Recordings', 'Timers'
+CABLE, ANTENNA = 'Cable', 'Antenna'
 
 
 class Log:
@@ -337,11 +341,11 @@ class Frontend:
             raise RuntimeError('frontend: ' + (' '.join(reply) or 'dtvfe died'))
         return tuple(int(x) for x in reply[1:])
 
-    def tune(self, khz, bw=8, plp=0):
-        """(locked, strength %, quality %). The driver waits up to ~2.5 s for a lock itself;
-        DVB-T2 sometimes needs a little longer"""
+    def tune(self, khz, bw=8, plp=0, cable=False):
+        """(locked, strength %, quality %). The driver waits up to ~2.5 s for a lock itself (dtvfe
+        3 s on cable); DVB-T2 sometimes needs a little longer"""
         self.khz = khz
-        st = self._ask('tune %d %d %d' % (khz, bw, plp))
+        st = self._ask('tunec %d' % khz if cable else 'tune %d %d %d' % (khz, bw, plp))
         for _ in range(3):
             if st[0]:
                 break
@@ -409,7 +413,7 @@ class TestFrontend:
                     time.sleep(max(0, start + sent * 8 / rate - time.monotonic()))
         os.close(dvr)
 
-    def tune(self, khz, bw=8, plp=0):
+    def tune(self, khz, bw=8, plp=0, cable=False):
         self.khz = khz
         return (1, 100, 100) if khz == 0 else (0, 0, 0)
 
@@ -577,8 +581,8 @@ def parse_sdt(secs):
 
 def parse_nit(secs):
     """The logical channel numbers (EACEM descriptor 0x83), service_id -> number, and the
-    multiplexes the network lists: [(kHz, bandwidth MHz, PLP)] from terrestrial (0x5a) and T2
-    (0x7f/0x04) delivery descriptors"""
+    multiplexes the network lists: [(kHz, bandwidth MHz, PLP, cable)] from terrestrial (0x5a), T2
+    (0x7f/0x04) and cable (0x44) delivery descriptors"""
     lcn, muxes = {}, []
     for s in secs:
         end = 3 + (((s[1] & 0x0f) << 8) | s[2]) - 4
@@ -592,7 +596,9 @@ def parse_nit(secs):
                         lcn[(d[j] << 8) | d[j + 1]] = ((d[j + 2] & 0x03) << 8) | d[j + 3]
                 elif tag == 0x5a and len(d) >= 5:   # centre frequency in 10 Hz
                     bw = {0: 8, 1: 7, 2: 6, 3: 5}.get(d[4] >> 5, 8)
-                    muxes.append((struct.unpack('>I', d[:4])[0] // 100, bw, 0))
+                    muxes.append((struct.unpack('>I', d[:4])[0] // 100, bw, 0, False))
+                elif tag == 0x44 and len(d) >= 4:   # BCD, in 100 Hz
+                    muxes.append((int(d[:4].hex()) // 10, 8, 0, True))
                 elif tag == 0x7f and len(d) >= 4 and d[0] == 0x04:   # T2: PLP, system, cells
                     plp = d[1]
                     if len(d) < 6:
@@ -610,7 +616,7 @@ def parse_nit(secs):
                             freqs = [struct.unpack('>I', d[j:j + 4])[0]]
                             j += 4
                         j += 1 + (d[j] if j < len(d) else 0)   # subcells
-                        muxes += [(f // 100, bw, plp) for f in freqs]
+                        muxes += [(f // 100, bw, plp, False) for f in freqs]
             i += 6 + n
     return lcn, muxes
 
@@ -869,15 +875,15 @@ class EitReader:
 
 def update_guide(fe, progress=say):
     """Every multiplex of the channel list in turn, GUIDE_SECONDS each, for the guide"""
-    muxes = sorted({(c['freq_khz'], c['bandwidth'], c['plp']) for c in load_channels()})
+    muxes = sorted({mux_of(c) for c in load_channels()})
     if not muxes:
         progress('No channels yet: scan first')
         return
     guide = Guide()
-    for n, (khz, bw, plp) in enumerate(muxes, 1):
-        progress('Guide %d/%d: %d MHz…' % (n, len(muxes), khz // 1000))
+    for n, mux in enumerate(muxes, 1):
+        progress('Guide %d/%d: %d MHz…' % (n, len(muxes), mux[0] // 1000))
         busy('updating the guide (%d/%d)' % (n, len(muxes)))
-        locked, _s, _q = fe.tune(khz, bw, plp)
+        locked, _s, _q = fe.tune(*mux)
         if not locked:
             continue
         reader = EitReader(guide)
@@ -888,7 +894,7 @@ def update_guide(fe, progress=say):
 
 # ---- scanning -------------------------------------------------------------------------------------
 
-def read_mux(khz, bw, plp):
+def read_mux(khz, bw, plp, cable):
     """The services of the multiplex the frontend is locked to, and the multiplexes its NIT lists"""
     progs = parse_pat(read_sections(0x00, 0x00))
     LOG.write('tv', 'PAT: %s' % ', '.join('service %d -> PMT 0x%x' % kv for kv in sorted(progs.items())))
@@ -903,13 +909,17 @@ def read_mux(khz, bw, plp):
             continue
         pcr, video, audio, subs, ttx = parse_pmt(secs[0])
         info = sdt.get(sid, {})
+        name = info.get('name') or 'Service %d' % sid
+        num, _sp, rest = name.partition(' ')
+        if rest and num.isdigit() and int(num) == lcn.get(sid):   # cable names: "001 1+1", LCN 1
+            name = rest
         found.append({
-            'name': info.get('name') or 'Service %d' % sid,
+            'name': name,
             'provider': info.get('provider', ''),
             'scrambled': info.get('scrambled', False),
             'type': info.get('type'),
             'radio': video is None or info.get('type') in RADIO_SERVICE_TYPES,
-            'freq_khz': khz, 'bandwidth': bw, 'plp': plp,
+            'freq_khz': khz, 'bandwidth': bw, 'plp': plp, 'cable': cable,
             'sid': sid, 'pmt_pid': pmt_pid, 'pcr_pid': pcr,
             'video': video, 'audio': audio, 'subtitles': subs, 'teletext': ttx,
             'pmt_raw': secs[0].hex(),
@@ -953,7 +963,7 @@ def record_sample(services, path, seconds=SAMPLE_SECONDS):
 
 
 def scan(fe, freqs, test=None, progress=None, signals=None):
-    """freqs: [(kHz, bandwidth MHz, PLP)]; progress(text), if given, gets the panel's messages
+    """freqs: [(kHz, bandwidth MHz, PLP, cable)]; progress(text), if given, gets the panel's messages
     too; signals, the levels found (else into the settings). Returns the new list, and the
     multiplexes the networks list (NIT)"""
     def tell(text):
@@ -969,18 +979,18 @@ def scan(fe, freqs, test=None, progress=None, signals=None):
         signals = settings['signals']
     reader = EitReader(Guide())   # the guide fills in from every multiplex that locks
     try:
-        for n, (khz, bw, plp) in enumerate(freqs, 1):
+        for n, (khz, bw, plp, cable) in enumerate(freqs, 1):
             # on the panel too: a scan of the whole band takes minutes, mostly without any signal
             tell('Scan %d/%d: %d MHz… (found %d)' % (n, len(freqs), khz // 1000, sum(1 for c in found if not c['radio'])))
             busy('a channel scan is running (%d/%d)' % (n, len(freqs)))
-            locked, strength, quality = fe.tune(khz, bw, plp)
+            locked, strength, quality = fe.tune(khz, bw, plp, cable)
             label = '%d MHz (%d/%d)' % (khz // 1000, n, len(freqs))
             if not locked:
                 say('%s: no signal, level %d%%' % (label, strength))
                 continue
             signals[str(khz)] = [strength, quality, time.time()]
             say('%s: locked, level %d%%, quality %d%%' % (label, strength, quality))
-            services, muxes = read_mux(khz, bw, plp)
+            services, muxes = read_mux(khz, bw, plp, cable)
             found += services
             listed += muxes
             if services and not test and LOG.dir:
@@ -1000,33 +1010,70 @@ def scan(fe, freqs, test=None, progress=None, signals=None):
     tv = sum(1 for c in channels if not c['radio'])
     radio = len(channels) - tv
     tell('Scan finished: %d channels%s' % (tv, ', %d radio' % radio if radio else '') if channels
-         else 'Scan finished: nothing found, check the antenna')
+         else 'Scan finished: nothing found, check the %s' % ('cable' if any(f[3] for f in freqs) else 'antenna'))
     return channels, listed
 
 
-def nit_search(fe, khz, bw=8, test=None, progress=None, signals=None):
+def listed_muxes(khz, bw, cable):
+    """The multiplexes the NIT of the one the frontend is locked to lists, that one included"""
+    secs = read_sections(0x10, 0x40, timeout=6) + read_sections(0x10, 0x41, timeout=6)
+    _lcn, muxes = parse_nit(secs)
+    muxes = sorted({m for m in muxes if m[3] == cable} | {(khz, bw, 0, cable)})
+    LOG.write('tv', 'NIT lists: %s' % muxes)
+    return muxes
+
+
+def nit_search(fe, khz, bw=8, cable=False, test=None, progress=None, signals=None):
     """The multiplexes the network information table lists, scanned; khz is one of its own"""
     def tell(text):
         notify(text)
         if progress:
             progress(text)
     tell('Network search: reading the network table at %d MHz…' % (khz // 1000))
-    locked, strength, _q = fe.tune(khz, bw)
+    locked, strength, _q = fe.tune(khz, bw, 0, cable)
     if not locked:
         tell('Network search: no signal at %d MHz (level %d%%)' % (khz // 1000, strength))
         return None
-    secs = read_sections(0x10, 0x40, timeout=6) + read_sections(0x10, 0x41, timeout=6)
-    _lcn, muxes = parse_nit(secs)
-    muxes = sorted(set(muxes) | {(khz, bw, 0)})
-    LOG.write('tv', 'NIT lists: %s' % muxes)
+    muxes = listed_muxes(khz, bw, cable)
     if len(muxes) == 1:
         tell('The network lists no other frequencies (Zeonbud\'s doesn\'t): use the full scan')
     return scan(fe, muxes, test, progress, signals)[0]
 
 
+def cable_search(fe, test=None, progress=None, signals=None):
+    """A cable network (DVB-C): the 8 MHz grid from the bottom until a multiplex locks, then the
+    multiplexes its NIT lists (cable operators' do); with no list, the rest of the grid"""
+    def tell(text):
+        notify(text)
+        if progress:
+            progress(text)
+    grid = [(0, 8, 0, True)] if test else cable_grid()
+    for n, (khz, bw, plp, cable) in enumerate(grid):
+        tell('Cable search: %d MHz… (%d/%d)' % (khz // 1000, n + 1, len(grid)))
+        busy('a cable search is running (%d/%d)' % (n + 1, len(grid)))
+        if fe.tune(khz, bw, plp, cable)[0]:
+            break
+    else:
+        tell('Cable search: no digital channels on %d–%d MHz, check the cable' % (grid[0][0] // 1000, grid[-1][0] // 1000))
+        return None
+    muxes = listed_muxes(khz, bw, cable)
+    return scan(fe, muxes if len(muxes) > 1 else grid[n:], test, progress, signals)[0]
+
+
 def uhf(first, last):
-    """UHF channel numbers to (centre kHz, 8 MHz, PLP 0): channel 21 is 474 MHz"""
-    return [(306000 + 8000 * ch, 8, 0) for ch in range(first, last + 1)]
+    """UHF channel numbers to (centre kHz, 8 MHz, PLP 0, not cable): channel 21 is 474 MHz"""
+    return [(306000 + 8000 * ch, 8, 0, False) for ch in range(first, last + 1)]
+
+
+def cable_grid():
+    """Cable channel centres, 8 MHz apart on the UHF grid: 114 MHz (S2) .. 858 (UHF 69). Ukrainian
+    networks put DVB-C at 162-450 MHz (Columbus: 354-442)"""
+    return [(khz, 8, 0, True) for khz in range(114000, 858001, 8000)]
+
+
+def mux_of(c):
+    """A channel's multiplex, as the frontend's tune() takes it (lists scanned before cable had none)"""
+    return c['freq_khz'], c['bandwidth'], c['plp'], c.get('cable', False)
 
 
 def uhf_channel(khz):
@@ -1114,16 +1161,21 @@ def lock_icon(c):
 
 
 def groups(settings, channels):
-    """The lists the viewer can switch between: all TV channels, the favourites, radio"""
+    """The lists the viewer can switch between: all TV channels, the favourites, radio; with
+    channels from both, the cable and the antenna ones (one of them gets no signal at a time)"""
     names = [ALL] + list(settings['groups'])
     if any(c['radio'] for c in channels):
         names.append(RADIO)
+    if len({bool(c.get('cable')) for c in channels}) == 2:
+        names += [CABLE, ANTENNA]
     return names
 
 
 def group_list(channels, settings, group):
     if group == RADIO:
         return [c for c in channels if c['radio']]
+    if group in (CABLE, ANTENNA):
+        return [c for c in channels if not c['radio'] and bool(c.get('cable')) == (group == CABLE)]
     if group in settings['groups']:
         by_key = {key(c): c for c in channels}
         return [by_key[k] for k in settings['groups'][group] if k in by_key]
@@ -1445,7 +1497,7 @@ def tune_until_locked(fe, ch, waiting=None, cancel=None):
     True once locked"""
     tries = 0
     while True:
-        locked, strength, _q = fe.tune(ch['freq_khz'], ch['bandwidth'], ch['plp'])
+        locked, strength, _q = fe.tune(*mux_of(ch))
         tries += 1
         if locked:
             if tries > 1:
@@ -1611,7 +1663,7 @@ class Tuner:
                 khz = self.fe.khz
                 ch = w or (self.recordings[0].ch if self.recordings else None)
                 if ch and ch['freq_khz'] == khz:
-                    locked, strength, _q = self.fe.tune(khz, ch['bandwidth'], ch['plp'])
+                    locked, strength, _q = self.fe.tune(*mux_of(ch))
                     LOG.write('signal', 'tuned again: %s, level %d%%' % ('locked' if locked else 'no lock', strength))
                     if locked:
                         unlocked = 0
@@ -1927,7 +1979,8 @@ class Watch:
         lines = ['%d  %s' % (channel_number(ch, self.index), ch['name'])]
         uhf_ch = uhf_channel(ch['freq_khz'])
         lines.append('%s · %d MHz%s%s · service %d%s' % (
-            ch.get('provider') or '-', ch['freq_khz'] // 1000, ' (UHF %d)' % uhf_ch if uhf_ch else '',
+            ch.get('provider') or '-', ch['freq_khz'] // 1000,
+            ' (cable)' if ch.get('cable') else ' (UHF %d)' % uhf_ch if uhf_ch else '',
             ', PLP %d' % ch['plp'] if ch['plp'] else '', ch['sid'], ', LCN %d' % ch['lcn'] if ch.get('lcn') else ''))
         now, nxt = self.app.guide.now_next(ch['sid'])
         if now:
@@ -2950,7 +3003,7 @@ class TvWindow:
     def new_group(self, ch):
         name = self.ask('New list', 'The name of the new list of channels:')
         s = self.app.settings
-        if not name or not name.strip() or name.strip() in s['groups'] or name.strip() in (ALL, RADIO, RECORDED, TIMERS_VIEW):
+        if not name or not name.strip() or name.strip() in s['groups'] or name.strip() in (ALL, RADIO, CABLE, ANTENNA, RECORDED, TIMERS_VIEW):
             return
         s['groups'][name.strip()] = [key(ch)]
         save_settings(s)
@@ -2983,6 +3036,7 @@ class TvWindow:
                 'Provider: %s' % (ch.get('provider') or '-'),
                 'Service: %d, type %s, LCN %s' % (ch['sid'], kinds.get(ch.get('type'), ch.get('type') or '?'),
                                                  ch.get('lcn') or '-'),
+                'Multiplex: %d MHz, cable (DVB-C)' % (ch['freq_khz'] // 1000) if ch.get('cable') else
                 'Multiplex: %d MHz%s, %d MHz wide, PLP %d' % (ch['freq_khz'] // 1000, ' (UHF %d)' % uhf_ch if uhf_ch else '',
                                                             ch['bandwidth'], ch['plp']),
                 'Signal when last tuned: %s' % ('level %d%%, quality %d%%, %s' % (sig[0], sig[1], time.strftime(
@@ -3117,10 +3171,12 @@ class TvWindow:
         box = d.get_content_area()
         box.set_spacing(8)
         box.set_border_width(16)
-        full = Gtk.RadioButton(label='The whole band: UHF 21–60 (474–786 MHz), about 3 min')
+        full = Gtk.RadioButton(label='Antenna: the whole band, UHF 21–60 (474–786 MHz), about 3 min')
+        cab = Gtk.RadioButton(label='Cable network (DVB-C): finds the network\'s frequencies itself, 2–6 min',
+                              group=full)
         one = Gtk.RadioButton(label='One frequency', group=full)
         nit = Gtk.RadioButton(label='Network search (the frequencies the network lists, from this one)', group=full)
-        for w in (full, one, nit):
+        for w in (full, cab, one, nit):
             box.add(w)
         grid = Gtk.Grid(column_spacing=12, row_spacing=6, margin_start=24)
         freq = Gtk.Entry(text='', placeholder_text='UHF channel (21–69) or MHz, e.g. 27 or 522')
@@ -3129,15 +3185,16 @@ class TvWindow:
             bw.append(b, b + ' MHz')
         bw.set_active_id('8')
         plp = Gtk.SpinButton.new_with_range(0, 255, 1)
-        for n, (text, w) in enumerate((('Frequency', freq), ('Bandwidth', bw), ('PLP (DVB-T2)', plp))):
+        cable = Gtk.CheckButton(label='Cable (DVB-C)')
+        for n, (text, w) in enumerate((('Frequency', freq), ('Bandwidth', bw), ('PLP (DVB-T2)', plp), ('', cable))):
             grid.attach(self.label(text), 0, n, 1, 1)
             grid.attach(w, 1, n, 1, 1)
         box.add(grid)
         box.add(self.label('A scan keeps the order, names and lists of the channels it finds again.', 'hint'))
         d.show_all()
         r = d.run()
-        mode = 'full' if full.get_active() else 'one' if one.get_active() else 'nit'
-        text, width, plp_id = freq.get_text().strip(), int(bw.get_active_id()), plp.get_value_as_int()
+        mode = 'full' if full.get_active() else 'cable' if cab.get_active() else 'one' if one.get_active() else 'nit'
+        text, width, plp_id, is_cable = freq.get_text().strip(), int(bw.get_active_id()), plp.get_value_as_int(), cable.get_active()
         d.destroy()
         if r != Gtk.ResponseType.OK:
             return
@@ -3145,8 +3202,12 @@ class TvWindow:
         sigs = self.app.settings['signals']
         if mode == 'full':
             LOG.write('tv', 'window: scan')
-            self.run_job('a channel scan is running', lambda fe, p: scan(fe, uhf(21, 60) if not test else [(0, 8, 0)],
+            self.run_job('a channel scan is running', lambda fe, p: scan(fe, uhf(21, 60) if not test else [(0, 8, 0, False)],
                                                                          test, p, sigs))
+            return
+        if mode == 'cable':
+            LOG.write('tv', 'window: cable search')
+            self.run_job('a cable search is running', lambda fe, p: cable_search(fe, test, p, sigs))
             return
         try:
             n = float(text.replace(',', '.'))
@@ -3156,11 +3217,13 @@ class TvWindow:
         khz = 306000 + 8000 * int(n) if n < 100 else int(n * 1000)
         if test:
             khz = 0
-        LOG.write('tv', 'window: scan %s %d kHz' % (mode, khz))
+        LOG.write('tv', 'window: scan %s %d kHz%s' % (mode, khz, ' cable' if is_cable else ''))
         if mode == 'one':
-            self.run_job('a channel scan is running', lambda fe, p: scan(fe, [(khz, width, plp_id)], test, p, sigs))
+            self.run_job('a channel scan is running',
+                         lambda fe, p: scan(fe, [(khz, width, plp_id, is_cable)], test, p, sigs))
         else:
-            self.run_job('a network search is running', lambda fe, p: nit_search(fe, khz, width, test, p, sigs))
+            self.run_job('a network search is running',
+                         lambda fe, p: nit_search(fe, khz, width, is_cable, test, p, sigs))
 
     # settings
 
@@ -3539,6 +3602,12 @@ def main(argv):
         LOG.close()
 
 
+def bw_arg(khz, bw, plp=0):
+    """A multiplex from the command line: BW is MHz, or C for cable"""
+    cable = bw.upper() == 'C'
+    return khz, 8 if cable else int(bw), plp, cable
+
+
 def run(cmd, args, test):
     if cmd in ('menu', 'play', 'timer'):
         app = TvApp(test)
@@ -3553,19 +3622,23 @@ def run(cmd, args, test):
             elif cmd == 'antenna':
                 print('antenna power', 'on' if fe.antenna(len(args) > 1 and args[1] == 'on') else 'off')
             elif cmd == 'status' and len(args) > 1:
-                print(fe.tune(int(args[1]), int(args[2]) if len(args) > 2 else 8))
+                print(fe.tune(*bw_arg(int(args[1]), args[2] if len(args) > 2 else '8')))
                 while True:
                     time.sleep(1)
                     locked, strength, quality = fe.status()
                     print('locked' if locked else 'no lock', 'level %d%%' % strength, 'quality %d%%' % quality, flush=True)
             elif cmd == 'scan':
                 if test:
-                    channels = scan(fe, [(0, 8, 0)], test)[0]
+                    channels = scan(fe, [(0, 8, 0, False)], test)[0]
+                elif len(args) > 1 and args[1] == '--cable':
+                    channels = (nit_search(fe, int(args[2]), 8, True) if len(args) > 2 else cable_search(fe)) or []
                 elif len(args) > 2 and args[1] == '--nit':
-                    channels = nit_search(fe, int(args[2]), int(args[3]) if len(args) > 3 else 8) or []
+                    khz, bw, _plp, cable = bw_arg(int(args[2]), args[3] if len(args) > 3 else '8')
+                    channels = nit_search(fe, khz, bw, cable) or []
                 elif len(args) > 2 and args[1] == '--freq':
-                    channels = scan(fe, [(int(args[2]), int(args[3]) if len(args) > 3 else 8,
-                                          int(args[4]) if len(args) > 4 else 0)])[0]
+                    khz, bw, plp, cable = bw_arg(int(args[2]), args[3] if len(args) > 3 else '8',
+                                                 int(args[4]) if len(args) > 4 else 0)
+                    channels = scan(fe, [(khz, bw, plp, cable)])[0]
                 else:
                     first, last = (int(args[1]), int(args[2])) if len(args) > 2 else (21, 60)
                     channels = scan(fe, uhf(first, last))[0]
