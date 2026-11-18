@@ -1185,6 +1185,7 @@ static void *audio_thread(void *arg)
     int carry = 0;   /* frames at the start of buf left over from the last write, < I2S_BLOCK */
     int in_rate = 0, in_format = -1, in_channels = 0;
     int pid, codec, dec_pid = -1;
+    int64_t next_pts = -1;   /* where the last frame ended */
 
     /* hold back until the video decoder has a head start, so both begin together */
     pthread_mutex_lock(&P.clk_m);
@@ -1235,6 +1236,7 @@ static void *audio_thread(void *arg)
             if (pid != dec_pid) {
                 dec_pid = pid;
                 in_rate = 0;
+                next_pts = -1;
                 if (audio_decoder(codec, NULL) < 0)
                     dec_pid = -1;
             }
@@ -1257,8 +1259,10 @@ static void *audio_thread(void *arg)
                     continue;
                 }
             }
+            /* frames after the first of a PES have no time: they follow on from the one before (the
+               audio clock, what is heard now, is the device's buffer behind that) */
             int64_t ts = frame->best_effort_timestamp;
-            int64_t pts = ts != AV_NOPTS_VALUE ? to_pts90(ts, P.atb) : P.aclock;
+            int64_t pts = ts != AV_NOPTS_VALUE ? to_pts90(ts, P.atb) : next_pts >= 0 ? next_pts : P.aclock;
             int max = swr_get_out_samples(P.swr, frame->nb_samples);
             if (carry + max > bufsamples) {
                 uint8_t *nbuf = NULL;
@@ -1278,6 +1282,7 @@ static void *audio_thread(void *arg)
             }
             int n = carry + (got > 0 ? got : 0);
             int64_t end = pts + (int64_t)frame->nb_samples * PTS_HZ / frame->sample_rate;
+            next_pts = end;
             int whole = pcm_write_blocks(buf, n);
             carry = n - whole;
             memmove(buf, buf + whole * 4, carry * 4);
@@ -2149,6 +2154,7 @@ static void *tv_demux_thread(void *arg)
     AVPacket *pkt = av_packet_alloc();
     static char seen[8192];
     memset(seen, 0, sizeof seen);
+    int64_t last_apts = -1;
     while (!P.stop) {
         r = av_read_frame(fmt, pkt);
         if (r == AVERROR(EAGAIN))
@@ -2231,7 +2237,11 @@ static void *tv_demux_thread(void *arg)
             if (pq_put(&P.vq, av_packet_clone(pkt), pid, 0) < 0)
                 break;
         } else if (pid == P.svc.apid && P.has_audio) {
-            if (P.svc.vpid && P.vfd >= 0 && (!P.vgate || pts < P.gate_pts)) {   /* before the picture */
+            /* a PES of several audio frames (HE-AAC on cable: 6) has a time on the first only, which
+               the rest go with */
+            if (pts >= 0)
+                last_apts = pts;
+            if (P.svc.vpid && P.vfd >= 0 && (!P.vgate || last_apts < P.gate_pts)) {   /* before the picture */
                 av_packet_unref(pkt);
                 continue;
             }
