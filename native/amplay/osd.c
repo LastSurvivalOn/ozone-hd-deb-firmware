@@ -369,6 +369,10 @@ static void draw_list(void)
         text(O.list_d, O.small, C_SUB, PAD + 52, y + 45, t);
     }
     XftDrawRect(O.list_d, &O.col[C_TRACK], LIST_W - 2, 0, 2, O.list_h);
+    if (O.nch > rows) {   /* a scroll bar: the list is longer than the screen (164 channels: 8 rows at 576p) */
+        int h = O.list_h * rows / O.nch, y = O.list_h * O.top_row / O.nch;
+        XftDrawRect(O.list_d, &O.col[C_FILL], LIST_W - 6, y, 6, h > 16 ? h : 16);
+    }
     XCopyArea(O.dpy, O.list_pm, O.list, O.gc, 0, 0, LIST_W, O.list_h, 0, 0);
 }
 

@@ -2485,6 +2485,7 @@ class TvWindow:
         self.Gtk, self.Pango = Gtk, Pango
         self.app = app
         self.typed, self.typed_at = '', 0   # a channel number from the remote's digits
+        self.sched_timer = None
         self.group = app.settings.get('group', ALL)
         self.win = Gtk.Window(title='TV')
         self.win.set_default_size(1280, 720)
@@ -2536,8 +2537,8 @@ class TvWindow:
         self.right.add(self.sched)
         body.pack_start(self.right, True, True, 0)
         top.pack_start(body, True, True, 0)
-        hint = self.label('OK: watch   →: the guide   blue (Menu, F2): the channel\'s menu   green (Tab): the next '
-                          'list   exit (Esc): back, close', 'hint')
+        hint = self.label('OK: watch   page ±: a page   →: the guide   blue (Menu, F2): the channel\'s menu   '
+                          'green (Tab): the next list   exit (Esc): back', 'hint')
         hint.set_margin_start(16)
         hint.set_margin_bottom(6)
         top.pack_start(hint, False, False, 0)
@@ -2706,9 +2707,29 @@ class TvWindow:
             self.rows[index].grab_focus()
 
     def on_row(self, lb, row):
+        """The guide follows the selection once it rests: built at every step (a week of
+        programmes), it held a held arrow up, and the list went on after the button was let go"""
         if row is None:
             return
-        self.fill_schedule(getattr(row, 'ch', None))
+        from gi.repository import GLib
+        if self.sched_timer:
+            GLib.source_remove(self.sched_timer)
+        self.sched_timer = GLib.timeout_add(150, self.sched_due)
+
+    def sched_due(self):
+        self.sched_timer = None
+        self.sched_now()
+        return False
+
+    def sched_now(self):
+        """The selected channel's guide, now (→ before the timer is up)"""
+        if self.sched_timer:
+            from gi.repository import GLib
+            GLib.source_remove(self.sched_timer)
+            self.sched_timer = None
+        row = self.list.get_selected_row()
+        if row is not None:
+            self.fill_schedule(getattr(row, 'ch', None))
 
     def fill_schedule(self, ch):
         Gtk, Pango = self.Gtk, self.Pango
@@ -3494,6 +3515,8 @@ class TvWindow:
             self.next_group()
             return True
         if k == 'Right' and in_list:
+            if self.sched_timer:
+                self.sched_now()
             rows = [r for r in self.sched.get_children() if r.get_selectable()]
             cur = [r for r in rows if r.get_style_context().has_class('current')]
             if rows:

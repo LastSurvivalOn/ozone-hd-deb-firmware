@@ -832,6 +832,8 @@ class Gamepads:
     def __init__(self, remote):
         self.remote = remote
         self.pads = {}            # path: (device, watch)
+        self.ignored = {}         # path: ctime of a device that isn't a gamepad (as kbd-merge does:
+                                  # opening them all every look took 0.4 s, the remote's keys waiting)
         self.held = {}            # (path, axis): the arrow it holds down
         self.games_at = 0
         self.games = False
@@ -843,11 +845,15 @@ class Gamepads:
             if path in self.pads:
                 continue
             try:
+                ctime = os.stat(path).st_ctime
+                if self.ignored.get(path) == ctime:
+                    continue
                 dev = InputDevice(path)
             except OSError:
                 continue
             caps = dev.capabilities()
             if E.BTN_SOUTH not in caps.get(E.EV_KEY, []) or dev.name.startswith(('ozone-', 'aml_')):
+                self.ignored[path] = ctime
                 dev.close()
                 continue
             log('gamepad %s (%s)' % (path, dev.name))
