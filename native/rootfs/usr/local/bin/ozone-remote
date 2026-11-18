@@ -420,6 +420,9 @@ class Remote:
         self.mouse_mode = on
         self.release_all()
         self.changed()
+        # said in words: the panel's lit icon alone went unnoticed, and the arrows and OK seemed dead
+        subprocess.Popen(['ozone-notify', 'Mouse mode: %s' % ('on' if on else 'off')],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def asleep(self):
         """True while ozone-standby runs, and for the press that wakes the box"""

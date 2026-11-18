@@ -537,6 +537,11 @@ def window(query):
     gi.require_version('GdkPixbuf', '2.0')
     from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango
 
+    global COLUMNS, PAGE
+    if Gdk.Screen.get_default().get_width() < 1000:   # the 4:3 desktop for an old TV (736 wide)
+        COLUMNS = 3
+        PAGE = 6 * COLUMNS
+
     pool = ThreadPoolExecutor(6)
 
     def scaled(data, w, h):
@@ -640,7 +645,7 @@ def window(query):
             except GLib.Error:
                 pass
             style = Gtk.CssProvider()
-            style.load_from_data(CSS)
+            style.load_from_data(CSS + (b'entry { min-width: 260px; }' if COLUMNS < 4 else b''))
             Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), style,
                                                      Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
             self.win = Gtk.Window(title='YouTube')
@@ -665,12 +670,12 @@ def window(query):
             self.entry.set_completion(completion)
             self.entry.connect('focus-in-event', lambda *_: self.offer_searches())
             header.pack_start(self.entry, False, False, 0)
-            self.status = Gtk.Label(xalign=0)
+            self.status = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
             self.status.get_style_context().add_class('status')
             header.pack_start(self.status, True, True, 0)
             # the most a video plays at
             settings = load_settings()
-            label = Gtk.Label(label='Quality')
+            label = Gtk.Label(label='Quality', no_show_all=COLUMNS < 4)   # no room on a narrow desktop
             label.get_style_context().add_class('status')
             header.pack_start(label, False, False, 0)
             self.height = Gtk.ComboBoxText(tooltip_text='Highest resolution to play')
@@ -707,7 +712,10 @@ def window(query):
             self.save_list.get_style_context().add_class('tab')
             self.save_list.connect('clicked', lambda w: self.save_remote_list())
             tabs.pack_start(self.save_list, False, False, 0)
-            hint = Gtk.Label(label='green: add to a playlist   blue / Delete: remove   yellow: next tab   exit: back', xalign=1)
+            # wrapped on a narrow desktop, between the hints, not inside one
+            keys = ('green: add to a playlist', 'blue / Delete: remove', 'yellow: next tab', 'exit: back')
+            hint = Gtk.Label(label='   '.join(k.replace(' ', '\u00a0') for k in keys), xalign=1, wrap=True,
+                             justify=Gtk.Justification.RIGHT)
             hint.get_style_context().add_class('hint')
             tabs.pack_start(hint, True, True, 0)
             top.pack_start(tabs, False, False, 0)
